@@ -53,6 +53,15 @@ def daily_order_weights(start_at: datetime, end_at: datetime) -> np.ndarray:
     return np.asarray(weights / weights.sum())
 
 
+def _sum_cents_by_order(
+    order_ids: np.ndarray, cents: np.ndarray, *, order_count: int
+) -> np.ndarray:
+    """Aggregate integer-cent values by identity without float-weighted NumPy APIs."""
+    totals = np.zeros(order_count + 1, dtype=np.int64)
+    np.add.at(totals, order_ids, cents)
+    return totals
+
+
 def _quota(config: GeneratorConfig, tiny_count: int) -> int:
     """Scale a Task 4 anchor quota while preserving the exact tiny/full contracts."""
     if config.scale is DatasetScale.TINY:
@@ -166,24 +175,24 @@ def _generate_orders_and_items(
     gross_cents = unit_price_cents * quantities
     discount_cents = gross_cents * discount_rates // 100
     net_cents = gross_cents - discount_cents
-    gross_by_order = np.bincount(item_order_ids, weights=gross_cents, minlength=config.orders + 1)
-    discount_by_order = np.bincount(
-        item_order_ids, weights=discount_cents, minlength=config.orders + 1
+    gross_by_order = _sum_cents_by_order(item_order_ids, gross_cents, order_count=config.orders)
+    discount_by_order = _sum_cents_by_order(
+        item_order_ids, discount_cents, order_count=config.orders
     )
     shipping_rng = named_rng(config.seed, "facts.orders.shipping")
     shipping_cents = shipping_rng.choice((0, 600, 1200), size=config.orders, p=(0.25, 0.60, 0.15))
-    payable_cents = gross_by_order[1:].astype(np.int64) - discount_by_order[1:].astype(np.int64)
+    payable_cents = gross_by_order[1:] - discount_by_order[1:]
     payable_cents += shipping_cents
 
     status_rng = named_rng(config.seed, "facts.orders.statuses")
     planned_statuses = status_rng.choice(
         _ORDER_STATUSES, size=config.orders, p=_ORDER_STATUS_WEIGHTS
     )
-    payment_rng = named_rng(config.seed, "facts.payments")
+    payment_outcome_rng = named_rng(config.seed, "facts.payments.outcomes")
     success_probabilities = np.select(
         [planned_statuses == "cancelled", planned_statuses == "placed"], [0.05, 0.30], default=0.97
     )
-    payment_succeeded = payment_rng.random(config.orders) < success_probabilities
+    payment_succeeded = payment_outcome_rng.random(config.orders) < success_probabilities
     payment_succeeded[anchors["refund_exceeds_payment"] - 1] = True
     final_statuses = np.where(
         payment_succeeded,
@@ -226,11 +235,12 @@ def _generate_orders_and_items(
 
 def _generate_payments(config: GeneratorConfig, orders: pd.DataFrame) -> pd.DataFrame:
     """Generate exactly one reconciled payment attempt for every order."""
-    rng = named_rng(config.seed, "facts.payments")
+    timing_rng = named_rng(config.seed, "facts.payments.timing")
+    provider_rng = named_rng(config.seed, "facts.payments.providers")
     payment_ids = np.arange(1, len(orders) + 1, dtype=int)
     succeeded = orders["status"].isin(("paid", "completed", "refunded")).to_numpy()
     ordered_at = orders["ordered_at"].tolist()
-    delays = rng.integers(60, 2 * 60 * 60, size=len(orders))
+    delays = timing_rng.integers(60, 2 * 60 * 60, size=len(orders))
     latest_paid_at = config.end_at - timedelta(seconds=1)
     paid_at = [
         min(order_time + timedelta(seconds=int(delay)), latest_paid_at) if is_succeeded else None
@@ -242,7 +252,7 @@ def _generate_payments(config: GeneratorConfig, orders: pd.DataFrame) -> pd.Data
             "payment_code": [f"PAY-{payment_id:08d}" for payment_id in payment_ids],
             "order_id": orders["order_id"].tolist(),
             "status": np.where(succeeded, "succeeded", "failed").tolist(),
-            "provider": rng.choice(_PAYMENT_PROVIDERS, size=len(orders)).tolist(),
+            "provider": provider_rng.choice(_PAYMENT_PROVIDERS, size=len(orders)).tolist(),
             "amount": orders["payable_amount"].tolist(),
             "paid_at": paid_at,
             "created_at": ordered_at,
@@ -293,7 +303,9 @@ def _generate_refunds(
             "refund_id": refund_ids.tolist(),
             "refund_code": [f"REF-{refund_id:08d}" for refund_id in refund_ids],
             "order_id": selected.tolist(),
-            "order_item_id": [int(items_by_order.loc[order_id]) for order_id in selected],
+            "order_item_id": pd.Series(
+                [int(items_by_order.loc[order_id]) for order_id in selected], dtype="Int64"
+            ),
             "status": ["succeeded"] * len(selected),
             "amount": amounts,
             "reason": rng.choice(_REFUND_REASONS, size=len(selected)).tolist(),
@@ -328,12 +340,16 @@ def _generate_web_sessions(config: GeneratorConfig, orders: pd.DataFrame) -> pd.
         config.start_at + timedelta(days=int(day_index), seconds=int(second))
         for day_index, second in zip(day_indexes, seconds, strict=True)
     ]
+    customer_ids = pd.Series(
+        orders["customer_id"].tolist() + unconverted_customer_ids, dtype="Int64"
+    )
+    nullable_order_ids = pd.Series(order_ids.tolist() + [None] * remainder, dtype="Int64")
     return pd.DataFrame(
         {
             "session_id": session_ids.tolist(),
             "session_code": [f"SES-{session_id:09d}" for session_id in session_ids],
-            "customer_id": orders["customer_id"].tolist() + unconverted_customer_ids,
-            "order_id": order_ids.tolist() + [None] * remainder,
+            "customer_id": customer_ids,
+            "order_id": nullable_order_ids,
             "channel": orders["channel"].tolist()
             + rng.choice(CHANNELS, size=remainder, p=_CHANNEL_WEIGHTS).tolist(),
             "occurred_at": converted_at + browsing_at,
@@ -388,7 +404,7 @@ def _generate_campaign_attributions(config: GeneratorConfig, orders: pd.DataFram
             )
     for attribution_id, row in enumerate(rows, start=1):
         row["attribution_id"] = attribution_id
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         rows,
         columns=[
             "attribution_id",
@@ -398,6 +414,7 @@ def _generate_campaign_attributions(config: GeneratorConfig, orders: pd.DataFram
             "attributed_at",
         ],
     )
+    return frame
 
 
 def _generate_pipeline_runs(config: GeneratorConfig) -> pd.DataFrame:
@@ -425,7 +442,7 @@ def _generate_pipeline_runs(config: GeneratorConfig) -> pd.DataFrame:
             )
     for pipeline_run_id, row in enumerate(rows, start=1):
         row["pipeline_run_id"] = pipeline_run_id
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         rows,
         columns=[
             "pipeline_run_id",
@@ -438,6 +455,8 @@ def _generate_pipeline_runs(config: GeneratorConfig) -> pd.DataFrame:
             "error_code",
         ],
     )
+    frame["row_count"] = pd.Series(frame["row_count"], dtype="Int64")
+    return frame
 
 
 def generate_base_facts(config: GeneratorConfig) -> GeneratedFacts:

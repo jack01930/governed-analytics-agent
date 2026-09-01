@@ -3,11 +3,18 @@
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
+import numpy as np
 import pandas as pd  # type: ignore[import-untyped]
 import pytest
 
 from governed_analytics.data_generation.dimensions import generate_customers, generate_products
-from governed_analytics.data_generation.facts import daily_order_weights, generate_base_facts
+from governed_analytics.data_generation.facts import (
+    _anchor_order_ids,
+    _date_for_anchor,
+    _sum_cents_by_order,
+    daily_order_weights,
+    generate_base_facts,
+)
 from governed_analytics.data_generation.models import load_generator_config
 from governed_analytics.data_generation.vocabulary import CHANNELS, REGIONS, SOUTH_REGIONS
 
@@ -146,6 +153,8 @@ def test_fact_frames_match_schema_order_counts_and_identity_order(facts) -> None
         assert frame[identity].tolist() == list(range(1, len(frame) + 1))
     for name, count in expected_counts.items():
         assert len(getattr(facts, name)) == count
+    assert str(facts.refunds["order_item_id"].dtype) == "Int64"
+    assert str(facts.pipeline_runs["row_count"].dtype) == "Int64"
 
 
 def test_fact_foreign_keys_vocabulary_and_timestamps_are_valid(config, facts) -> None:  # type: ignore[no-untyped-def]
@@ -191,7 +200,21 @@ def test_money_payment_refund_and_status_invariants_are_exact(facts) -> None:  #
     payments = facts.payments.set_index("order_id")
     refunds = facts.refunds
 
-    values = list(orders["gross_amount"]) + list(items["unit_price"]) + list(payments["amount"])
+    values = [
+        *[
+            value
+            for column in ("gross_amount", "discount_amount", "shipping_amount", "payable_amount")
+            for value in orders[column]
+        ],
+        *[
+            value
+            for column in ("unit_price", "discount_amount", "gross_amount", "net_amount")
+            for value in items[column]
+        ],
+        *list(payments["amount"]),
+        *list(refunds["amount"]),
+        *list(facts.campaign_attributions["attributed_revenue"]),
+    ]
     assert all(type(value) is Decimal and value.as_tuple().exponent == -2 for value in values)
     assert all(value >= Decimal("0.00") for value in values)
     assert (items["gross_amount"] == items["unit_price"] * items["quantity"]).all()
@@ -236,6 +259,11 @@ def test_sessions_inventory_pipeline_and_attribution_contracts(config, facts) ->
     assert converted["order_id"].is_unique
     assert set(converted["order_id"]) == set(orders.index)
     assert unconverted["order_id"].isna().all()
+    assert str(sessions["customer_id"].dtype) == "Int64"
+    assert str(sessions["order_id"].dtype) == "Int64"
+    session_csv = sessions[["customer_id", "order_id"]].head(config.orders + 1).to_csv(index=False)
+    assert ".0" not in session_csv
+    assert ",\n" in session_csv
     assert (
         converted["customer_id"].to_numpy()
         == orders.loc[converted["order_id"], "customer_id"].to_numpy()
@@ -338,12 +366,50 @@ def test_daily_order_weights_encode_the_business_seasonality(config) -> None:  #
     by_day = dict(
         zip(pd.date_range(config.start_at, config.end_at, inclusive="left"), weights, strict=True)
     )
-    assert (
-        by_day[pd.Timestamp("2025-12-05", tz="UTC")] > by_day[pd.Timestamp("2025-11-05", tz="UTC")]
+    normal_weekday = by_day[pd.Timestamp("2025-11-05", tz="UTC")]
+    december_weekday = by_day[pd.Timestamp("2025-12-03", tz="UTC")]
+    normal_weekend = by_day[pd.Timestamp("2025-11-07", tz="UTC")]
+    june_weekend = by_day[pd.Timestamp("2026-06-05", tz="UTC")]
+    december_weekend = by_day[pd.Timestamp("2025-12-05", tz="UTC")]
+    assert december_weekday / normal_weekday == pytest.approx(1.25)
+    assert normal_weekend / normal_weekday == pytest.approx(1.15)
+    assert june_weekend / normal_weekend == pytest.approx(0.92)
+    assert december_weekend / normal_weekday == pytest.approx(1.25 * 1.15)
+
+
+def test_full_anchor_plan_has_exact_disjoint_task_4_quotas() -> None:
+    """Full-scale mutation prerequisites stay testable without generating full facts."""
+    full_config = load_generator_config("data/generator/full.yaml")
+    anchors = _anchor_order_ids(full_config)
+
+    assert {name: len(ids) for name, ids in anchors.items()} == {
+        "duplicate": 2000,
+        "amount_mismatch": 1000,
+        "missing_region": 1000,
+        "category_refund": 2500,
+        "refund_exceeds_payment": 300,
+        "south_sku": 4000,
+    }
+    all_ids = [order_id for ids in anchors.values() for order_id in ids]
+    assert len(all_ids) == len(set(all_ids))
+    assert min(all_ids) == 1
+    assert max(all_ids) <= full_config.orders
+    assert len(anchors["south_sku"][: len(anchors["south_sku"]) // 2]) == 2000
+    assert len(anchors["south_sku"][len(anchors["south_sku"]) // 2 :]) == 2000
+    assert _date_for_anchor("duplicate") == date(2026, 4, 10)
+    assert _date_for_anchor("amount_mismatch") == date(2026, 3, 17)
+    assert _date_for_anchor("missing_region") == date(2026, 2, 12)
+    assert _date_for_anchor("refund_exceeds_payment") == date(2026, 5, 20)
+    assert _date_for_anchor("south_sku") == date(2026, 6, 8)
+    assert _date_for_anchor("category_refund") == date(2026, 5, 4)
+
+
+def test_integer_cent_aggregation_never_uses_float_weights() -> None:
+    """Order rollups retain int64 cents before the Decimal boundary."""
+    sums = _sum_cents_by_order(
+        np.array([1, 1, 3], dtype=np.int64),
+        np.array([199, 201, 305], dtype=np.int64),
+        order_count=3,
     )
-    assert (
-        by_day[pd.Timestamp("2025-12-05", tz="UTC")] > by_day[pd.Timestamp("2025-12-04", tz="UTC")]
-    )
-    assert (
-        by_day[pd.Timestamp("2026-06-05", tz="UTC")] < by_day[pd.Timestamp("2026-05-01", tz="UTC")]
-    )
+    assert sums.dtype == np.dtype("int64")
+    assert sums.tolist() == [0, 400, 0, 305]
