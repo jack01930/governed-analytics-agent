@@ -47,6 +47,10 @@ packages = ["src/governed_analytics"]
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
 testpaths = ["tests"]
+markers = [
+  "integration: requires local Docker services",
+  "live_model: requires explicit paid model authorization",
+]
 
 [tool.coverage.run]
 branch = true
