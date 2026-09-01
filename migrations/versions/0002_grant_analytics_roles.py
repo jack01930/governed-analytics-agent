@@ -49,10 +49,4 @@ def downgrade() -> None:
         revoke usage, select on all sequences in schema public from analytics_loader;
         revoke select, insert, update, delete, truncate on all tables in schema public
         from analytics_loader;
-
-        do $$
-        begin
-          execute format('grant temporary on database %I to public', current_database());
-        end
-        $$;
         """)

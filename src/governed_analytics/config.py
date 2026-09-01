@@ -1,11 +1,10 @@
-from typing import Self
 from urllib.parse import unquote, urlsplit
 
-from pydantic import model_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class DatabaseSettings(BaseSettings):
+class _DatabaseSettingsBase(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -13,23 +12,70 @@ class DatabaseSettings(BaseSettings):
         frozen=True,
     )
 
+
+def _validate_database_url(
+    database_url: str,
+    *,
+    expected_driver: str,
+    expected_username: str,
+) -> str:
+    parsed_url = urlsplit(database_url)
+    if parsed_url.scheme != expected_driver:
+        raise ValueError(f"database URL must use the {expected_driver} driver")
+
+    encoded_username = parsed_url.username
+    decoded_username = unquote(encoded_username) if encoded_username is not None else None
+    if decoded_username != expected_username or encoded_username != decoded_username:
+        raise ValueError(f"database URL must use the {expected_username} role")
+
+    encoded_password = parsed_url.password
+    decoded_password = unquote(encoded_password) if encoded_password is not None else None
+    if not decoded_password:
+        raise ValueError("database URL must include an explicit nonempty password")
+
+    return database_url
+
+
+class DatabaseSettings(_DatabaseSettingsBase):
+    """Read-only analytics connection settings."""
+
     database_url: str
-    migration_database_url: str
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, database_url: str) -> str:
+        return _validate_database_url(
+            database_url,
+            expected_driver="postgresql+asyncpg",
+            expected_username="analytics_readonly",
+        )
+
+
+class LoaderDatabaseSettings(_DatabaseSettingsBase):
+    """Synthetic-data loader connection settings."""
+
     loader_database_url: str
 
-    @model_validator(mode="after")
-    def require_separate_readonly_credentials(self) -> Self:
-        readonly_credentials = self._credentials(self.database_url)
-        migration_credentials = self._credentials(self.migration_database_url)
-        if readonly_credentials == migration_credentials:
-            raise ValueError(
-                "database_url and migration_database_url must use different credentials"
-            )
-        return self
+    @field_validator("loader_database_url")
+    @classmethod
+    def validate_loader_database_url(cls, database_url: str) -> str:
+        return _validate_database_url(
+            database_url,
+            expected_driver="postgresql+psycopg",
+            expected_username="analytics_loader",
+        )
 
-    @staticmethod
-    def _credentials(database_url: str) -> tuple[str | None, str | None]:
-        parsed_url = urlsplit(database_url)
-        username = unquote(parsed_url.username) if parsed_url.username is not None else None
-        password = unquote(parsed_url.password) if parsed_url.password is not None else None
-        return username, password
+
+class MigrationDatabaseSettings(_DatabaseSettingsBase):
+    """Alembic migration connection settings."""
+
+    migration_database_url: str
+
+    @field_validator("migration_database_url")
+    @classmethod
+    def validate_migration_database_url(cls, database_url: str) -> str:
+        return _validate_database_url(
+            database_url,
+            expected_driver="postgresql+psycopg",
+            expected_username="governed_admin",
+        )

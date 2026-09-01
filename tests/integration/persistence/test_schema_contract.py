@@ -26,27 +26,28 @@ def test_schema_contains_all_business_tables_and_vector_extension() -> None:
         tables = {
             row[0]
             for row in connection.execute(
-                "select tablename from pg_tables where schemaname = 'public'"
+                """
+                select tablename
+                from pg_tables
+                where schemaname = 'public' and tablename <> 'alembic_version'
+                """
             )
         }
         vector_enabled = connection.execute(
             "select exists(select 1 from pg_extension where extname = 'vector')"
         ).fetchone()
 
-    assert EXPECTED_TABLES <= tables  # noqa: SIM300
+    assert tables == EXPECTED_TABLES
     assert vector_enabled == (True,)
 
 
 @pytest.mark.integration
-def test_every_foreign_key_column_is_indexed() -> None:
-    """Require a usable index whose leading column matches every foreign key column."""
+def test_every_foreign_key_has_an_ordered_leading_index_key_prefix() -> None:
+    """Require every ordered FK tuple as the leading key prefix of a usable full index."""
     url = os.environ["MIGRATION_DATABASE_URL"].replace("+psycopg", "")
     query = """
-        select c.conrelid::regclass::text, a.attname
+        select c.conrelid::regclass::text, c.conname, c.conkey
         from pg_constraint c
-        join unnest(c.conkey) as fk_column(attnum) on true
-        join pg_attribute a
-          on a.attrelid = c.conrelid and a.attnum = fk_column.attnum
         where c.contype = 'f'
           and not exists (
             select 1
@@ -55,10 +56,15 @@ def test_every_foreign_key_column_is_indexed() -> None:
               and i.indisvalid
               and i.indisready
               and i.indpred is null
-              and i.indnkeyatts > 0
-              and i.indkey[0] = fk_column.attnum
+              and i.indnkeyatts >= cardinality(c.conkey)
+              and (
+                select array_agg(index_key.attnum order by index_key.ordinality)
+                from unnest(i.indkey::smallint[]) with ordinality
+                  as index_key(attnum, ordinality)
+                where index_key.ordinality <= cardinality(c.conkey)
+              ) = c.conkey
           )
-        order by 1, 2
+        order by 1, 2, 3
     """
     with psycopg.connect(url) as connection:
         missing = connection.execute(query).fetchall()

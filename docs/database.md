@@ -12,9 +12,25 @@
 
 Agent 查询始终使用 `analytics_readonly`，绝不使用迁移或加载角色。上表密码只用于本地开发；不得用于生产环境，也不得提交真实凭据。
 
+代码中的设置对象也按角色隔离：`DatabaseSettings` 只读取 `DATABASE_URL`，
+`LoaderDatabaseSettings` 只读取 `LOADER_DATABASE_URL`，`MigrationDatabaseSettings` 只读取
+`MIGRATION_DATABASE_URL`。三者不会互相携带其他角色的 URL。每个 URL 都会校验精确 driver、
+固定用户名和显式非空密码；用户名按 URL 语义解码后验证，同时拒绝 percent-encoded 的等价
+用户名写法。Alembic 在写入自身配置时会转义 `%`，因此密码中的 `%40`、`%25` 等编码可原样
+round-trip。
+
+Plan B 的指标查询，以及 Plan C 的 Oracle 与基线执行器，均在 `analytics_readonly` 连接上的
+显式只读事务内执行，并设置事务局部的 `statement_timeout = '10s'` 与
+`search_path = public, pg_catalog`。这些防线由真实数据库集成测试验证，不配置在通用 engine
+factory 上。
+
 ## Schema
 
 迁移 `0001` 创建以下 12 张业务表，迁移 `0002` 配置加载和只读权限：
+
+容器 bootstrap 会先从 `PUBLIC` 回收数据库 `TEMPORARY` 权限；`0002` downgrade 只回收本迁移
+授予的表、序列和默认权限，不会重新授予 `PUBLIC TEMPORARY`，因此回退到 `0001` 后两个分析
+角色仍不能创建临时表。
 
 | 领域 | 表 |
 | --- | --- |

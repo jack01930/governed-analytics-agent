@@ -542,7 +542,8 @@ git commit -m "feat: 注入可验证业务与质量异常"
 - Create: `tests/integration/data_generation/test_pipeline.py`
 
 **Interfaces:**
-- Consumes: generated dimensions, mutated facts, `LOADER_DATABASE_URL`.
+- Consumes: generated dimensions, mutated facts, and loader-only
+  `LoaderDatabaseSettings.loader_database_url` (`LOADER_DATABASE_URL`).
 - Produces: canonical CSV files, database rows, and `DatasetManifest` with per-table counts/digests.
 
 - [ ] **Step 1: Write a canonical digest test**
@@ -581,6 +582,10 @@ def write_canonical_csv(frame: pd.DataFrame, path: Path, *, sort_by: tuple[str, 
 ```
 
 - [ ] **Step 3: Implement a static COPY registry and loader**
+
+Instantiate `LoaderDatabaseSettings` inside the loader boundary; never instantiate
+`DatabaseSettings` or `MigrationDatabaseSettings` there. The loader object must not contain the
+readonly or migration URL.
 
 Define `TABLE_LOAD_ORDER` and exact CSV column tuples in `loader.py`. Accept only names from this registry. Load in this order:
 
@@ -732,6 +737,20 @@ Create integration tests that execute one fixed, parameterized query per metric 
 - money and counts are nonnegative;
 - ratios are either null for a zero denominator or in `[0, 1]`, except `campaign_roi`, which may be negative;
 - every query completes under `statement_timeout = '10s'` using `analytics_readonly`.
+
+Execute each fixed metric query inside an explicit transaction on an engine created from the
+readonly-only `DatabaseSettings.database_url`. Before the query, execute these statements on the
+same connection and in this order:
+
+```sql
+set transaction read only;
+set local statement_timeout = '10s';
+set local search_path = public, pg_catalog;
+```
+
+The real PostgreSQL integration test (not a mock) must query `current_setting` inside that same
+transaction and assert `transaction_read_only = 'on'`, `statement_timeout = '10s'`, and
+`search_path = 'public, pg_catalog'`. Do not put transaction state on the generic engine factory.
 
 - [ ] **Step 5: Run and commit the metric catalog**
 

@@ -20,6 +20,9 @@
 - Never let tests or default commands call a paid model. Live calls require both `MODEL_API_KEY` and an explicit `--live` flag.
 - Never commit `.env`, database volumes, generated full datasets, raw model responses containing secrets, or API keys.
 - The baseline database login is read-only; generated SQL also runs inside a read-only transaction with a 10-second statement timeout.
+- Metric queries, Oracle materialization, and baseline SQL execution also set the transaction-local
+  search path to `public, pg_catalog`; each integration suite asserts all three runtime defenses
+  (`transaction_read_only`, `statement_timeout`, and `search_path`) against PostgreSQL.
 - Fixed seed: `20260901`. Business data range: `[2025-01-01T00:00:00Z, 2026-07-01T00:00:00Z)`.
 - Tiny scale: 500 customers, 100 products, 3,000 orders. Full scale: 50,000 customers, 2,000 products, 300,000 orders.
 - Week 1 implements no LangGraph graph, MCP server, RAG/vector retrieval, Streamlit UI, approval flow, or arbitrary Python execution.
@@ -135,10 +138,17 @@ The canonical definitions live in these files when implemented:
 
 | Contract | Canonical file |
 |---|---|
-| `DatabaseSettings` | `src/governed_analytics/config.py` |
+| readonly-only `DatabaseSettings`, loader-only `LoaderDatabaseSettings`, migration-only `MigrationDatabaseSettings` | `src/governed_analytics/config.py` |
 | `DatasetScale`, `GeneratorConfig`, `TableDigest`, `DatasetManifest` | `src/governed_analytics/data_generation/models.py` |
 | `MetricDefinition` | `src/governed_analytics/domain/metrics.py` |
 | `GoldenCase`, `BaselineCaseResult` | `src/governed_analytics/evals/models.py` |
+
+Database settings are intentionally role-scoped secret containers. `DatabaseSettings` declares
+only `database_url`, `LoaderDatabaseSettings` only `loader_database_url`, and
+`MigrationDatabaseSettings` only `migration_database_url`; no combined compatibility settings
+object is allowed. After URL-semantic percent-decoding, each class validates an exact driver,
+explicit nonempty password, and its canonical role (`analytics_readonly`, `analytics_loader`, or
+`governed_admin`), while encoded-equivalent username spellings are rejected.
 
 ## Execution Order
 

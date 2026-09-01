@@ -3,15 +3,16 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from governed_analytics.config import DatabaseSettings
+from governed_analytics.config import MigrationDatabaseSettings
+from governed_analytics.persistence.database import set_alembic_database_url
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-settings = DatabaseSettings()  # type: ignore[call-arg]
-config.set_main_option("sqlalchemy.url", settings.migration_database_url)
+settings = MigrationDatabaseSettings()  # type: ignore[call-arg]
+set_alembic_database_url(config, settings.migration_database_url)
 
 target_metadata = None
 

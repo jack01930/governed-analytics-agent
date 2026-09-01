@@ -55,7 +55,9 @@ Deletion policy is `restrict` for business facts. Synthetic datasets are rebuilt
 
 **Interfaces:**
 - Consumes: environment variables documented in `.env.example`.
-- Produces: `DatabaseSettings`, a healthy Compose service named `db`, and roles `analytics_loader` and `analytics_readonly`.
+- Produces: readonly-only `DatabaseSettings`, loader-only `LoaderDatabaseSettings`,
+  migration-only `MigrationDatabaseSettings`, a healthy Compose service named `db`, and
+  roles `analytics_loader` and `analytics_readonly`.
 
 - [ ] **Step 1: Register Pytest markers and write failing settings tests**
 
@@ -74,30 +76,53 @@ Create `tests/unit/test_config.py`:
 import pytest
 from pydantic import ValidationError
 
-from governed_analytics.config import DatabaseSettings
+from governed_analytics.config import (
+    DatabaseSettings,
+    LoaderDatabaseSettings,
+    MigrationDatabaseSettings,
+)
 
 
-def test_database_settings_accept_three_separate_roles(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://readonly:pw@db:5432/app")
-    monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql+psycopg://admin:pw@db:5432/app")
-    monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
+def test_role_scoped_settings_load_only_their_own_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://analytics_readonly:pw@db:5432/app"
+    )
+    monkeypatch.setenv(
+        "LOADER_DATABASE_URL", "postgresql+psycopg://analytics_loader:pw@db:5432/app"
+    )
+    monkeypatch.setenv(
+        "MIGRATION_DATABASE_URL", "postgresql+psycopg://governed_admin:pw@db:5432/app"
+    )
 
-    settings = DatabaseSettings(_env_file=None)
+    assert set(DatabaseSettings(_env_file=None).model_dump()) == {"database_url"}
+    assert set(LoaderDatabaseSettings(_env_file=None).model_dump()) == {
+        "loader_database_url"
+    }
+    assert set(MigrationDatabaseSettings(_env_file=None).model_dump()) == {
+        "migration_database_url"
+    }
 
-    assert settings.database_url.startswith("postgresql+asyncpg://readonly:")
-    assert settings.migration_database_url.startswith("postgresql+psycopg://admin:")
-    assert settings.loader_database_url.startswith("postgresql+psycopg://loader:")
 
-
-def test_readonly_url_cannot_equal_migration_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    shared = "postgresql+asyncpg://admin:pw@db:5432/app"
-    monkeypatch.setenv("DATABASE_URL", shared)
-    monkeypatch.setenv("MIGRATION_DATABASE_URL", shared)
-    monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
-
-    with pytest.raises(ValidationError, match="must use different credentials"):
-        DatabaseSettings(_env_file=None)
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql+psycopg://analytics_readonly:pw@db:5432/app",
+        "postgresql+asyncpg://analytics_loader:pw@db:5432/app",
+        "postgresql+asyncpg://%61nalytics_readonly:pw@db:5432/app",
+        "postgresql+asyncpg://analytics_readonly:@db:5432/app",
+    ],
+)
+def test_readonly_settings_reject_invalid_driver_role_or_password(database_url: str) -> None:
+    with pytest.raises(ValidationError):
+        DatabaseSettings(database_url=database_url)
 ```
+
+Add equivalent swap/driver/encoded-role/missing-password rejection matrices for
+`LoaderDatabaseSettings` and `MigrationDatabaseSettings`. Parse URL credentials with URL semantics
+and percent-decode before validation, but require the canonical unescaped username spelling so an
+encoded equivalent role name is rejected. Drivers and role identities are exact:
+`postgresql+asyncpg` / `analytics_readonly`, `postgresql+psycopg` / `analytics_loader`, and
+`postgresql+psycopg` / `governed_admin`. Every URL must contain an explicit nonempty password.
 
 - [ ] **Step 2: Run the tests and verify the missing module failure**
 
@@ -107,20 +132,19 @@ Run:
 uv run pytest tests/unit/test_config.py -v
 ```
 
-Expected: collection fails with `ModuleNotFoundError: No module named 'governed_analytics.config'`.
+Expected: collection fails because the three role-scoped settings contracts do not exist yet.
 
 - [ ] **Step 3: Implement immutable database settings**
 
-Create `src/governed_analytics/config.py`:
+Create `src/governed_analytics/config.py`. Keep the shared immutable `SettingsConfigDict` and URL
+validation helper private; each public settings class declares only its own URL:
 
 ```python
-from typing import Self
-
-from pydantic import model_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class DatabaseSettings(BaseSettings):
+class _DatabaseSettingsBase(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -128,16 +152,22 @@ class DatabaseSettings(BaseSettings):
         frozen=True,
     )
 
+
+class DatabaseSettings(_DatabaseSettingsBase):
     database_url: str
-    migration_database_url: str
+
+
+class LoaderDatabaseSettings(_DatabaseSettingsBase):
     loader_database_url: str
 
-    @model_validator(mode="after")
-    def require_separate_readonly_credentials(self) -> Self:
-        if self.database_url == self.migration_database_url:
-            raise ValueError("database_url and migration_database_url must use different credentials")
-        return self
+
+class MigrationDatabaseSettings(_DatabaseSettingsBase):
+    migration_database_url: str
 ```
+
+Apply field validators through a private helper implementing the exact driver, canonical fixed
+username, and decoded nonempty-password contracts above. There is no combined compatibility
+object: no consumer may instantiate settings containing another role's secret.
 
 Extend `.env.example` with these local-only URLs:
 
@@ -188,6 +218,12 @@ revoke create on schema public from public;
 
 do $$
 begin
+  execute format('revoke temporary on database %I from public', current_database());
+end
+$$;
+
+do $$
+begin
   if not exists (select 1 from pg_roles where rolname = 'analytics_loader') then
     create role analytics_loader login password 'analytics_loader_dev' nosuperuser nocreatedb nocreaterole;
   end if;
@@ -218,7 +254,8 @@ uv run pytest tests/unit/test_config.py -v
 docker compose config --quiet
 ```
 
-Expected: two tests pass and Compose exits zero without printing validation errors.
+Expected: the role-scoped settings matrix passes and Compose exits zero without printing
+validation errors.
 
 - [ ] **Step 6: Commit the settings and Compose boundary**
 
@@ -239,29 +276,44 @@ git commit -m "chore: 建立 PostgreSQL 本地环境与角色配置"
 - Test: `tests/unit/persistence/test_database.py`
 
 **Interfaces:**
-- Consumes: `DatabaseSettings`.
-- Produces: `create_async_database_engine(settings) -> AsyncEngine` and a synchronous Alembic migration environment using `MIGRATION_DATABASE_URL`.
+- Consumes: readonly-only `DatabaseSettings` for the async application engine and
+  migration-only `MigrationDatabaseSettings` for Alembic.
+- Produces: `create_async_database_engine(settings) -> AsyncEngine`,
+  `set_alembic_database_url(config, database_url) -> None`, and a synchronous Alembic migration
+  environment using only `MIGRATION_DATABASE_URL`.
 
 - [ ] **Step 1: Write a failing engine configuration test**
 
 Create `tests/unit/persistence/test_database.py`:
 
 ```python
+from alembic.config import Config
+
 from governed_analytics.config import DatabaseSettings
-from governed_analytics.persistence.database import create_async_database_engine
+from governed_analytics.persistence.database import (
+    create_async_database_engine,
+    set_alembic_database_url,
+)
 
 
 def test_engine_uses_pool_pre_ping_and_bounded_pool() -> None:
     settings = DatabaseSettings(
-        database_url="postgresql+asyncpg://readonly:pw@localhost:5432/app",
-        migration_database_url="postgresql+psycopg://admin:pw@localhost:5432/app",
-        loader_database_url="postgresql+psycopg://loader:pw@localhost:5432/app",
+        database_url="postgresql+asyncpg://analytics_readonly:pw@localhost:5432/app",
     )
 
     engine = create_async_database_engine(settings)
 
     assert engine.pool.size() == 5
     assert engine.pool._pre_ping is True
+
+
+def test_alembic_database_url_round_trips_percent_encoded_credentials() -> None:
+    config = Config()
+    url = "postgresql+psycopg://governed_admin:p%40ss%25word@localhost:5432/app"
+
+    set_alembic_database_url(config, url)
+
+    assert config.get_main_option("sqlalchemy.url") == url
 ```
 
 - [ ] **Step 2: Run the test and verify the missing package failure**
@@ -280,6 +332,7 @@ Create `src/governed_analytics/persistence/database.py`:
 
 ```python
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from alembic.config import Config
 
 from governed_analytics.config import DatabaseSettings
 
@@ -292,6 +345,10 @@ def create_async_database_engine(settings: DatabaseSettings) -> AsyncEngine:
         max_overflow=5,
         pool_timeout=5,
     )
+
+
+def set_alembic_database_url(config: Config, database_url: str) -> None:
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 ```
 
 Create `src/governed_analytics/persistence/__init__.py` with no exports.
@@ -307,13 +364,16 @@ uv run alembic init migrations
 Set `script_location = %(here)s/migrations` in `alembic.ini`. Do not store a real URL in the file. In `migrations/env.py`, set the URL before creating the engine:
 
 ```python
-from governed_analytics.config import DatabaseSettings
+from governed_analytics.config import MigrationDatabaseSettings
+from governed_analytics.persistence.database import set_alembic_database_url
 
-settings = DatabaseSettings()
-config.set_main_option("sqlalchemy.url", settings.migration_database_url)
+settings = MigrationDatabaseSettings()
+set_alembic_database_url(config, settings.migration_database_url)
 ```
 
-Keep `target_metadata = None`; migrations in this plan are explicit SQL contracts, not ORM autogeneration.
+The helper owns the `Config.set_main_option` interpolation boundary: double `%` only while
+persisting so `Config.get_main_option` returns the original URL. Keep `target_metadata = None`;
+migrations in this plan are explicit SQL contracts, not ORM autogeneration.
 
 - [ ] **Step 5: Verify the engine and Alembic configuration**
 
@@ -324,7 +384,8 @@ uv run pytest tests/unit/persistence/test_database.py -v
 uv run alembic heads
 ```
 
-Expected: the engine test passes and `alembic heads` exits zero with no revisions yet.
+Expected: the engine and `%40`/`%25` URL round-trip tests pass, and `alembic heads` exits zero with
+no revisions yet.
 
 - [ ] **Step 6: Commit connection infrastructure**
 

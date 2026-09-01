@@ -232,7 +232,14 @@ Expected: import fails for `oracle`.
 
 - [ ] **Step 3: Implement read-only Oracle execution**
 
-Use `DatabaseSettings.database_url`, an async engine, `SET TRANSACTION READ ONLY`, and `SET LOCAL statement_timeout = '10s'`. Convert `Decimal` and timestamps to JSON strings through Pydantic serialization. Sort object keys and end JSON files with one newline.
+Use the readonly-only `DatabaseSettings.database_url` and an async engine. Every Oracle statement
+runs inside an explicit transaction after `SET TRANSACTION READ ONLY`,
+`SET LOCAL statement_timeout = '10s'`, and
+`SET LOCAL search_path = public, pg_catalog` on the same connection. Convert `Decimal` and
+timestamps to JSON strings through Pydantic serialization. Sort object keys and end JSON files with
+one newline. The real Oracle integration suite must query `current_setting` in that transaction and
+assert `transaction_read_only = 'on'`, `statement_timeout = '10s'`, and
+`search_path = 'public, pg_catalog'`.
 
 Expose a synchronous command wrapper that uses `asyncio.run` only at the CLI boundary; internal functions remain async.
 
@@ -443,12 +450,17 @@ async with engine.connect() as connection:
     async with connection.begin():
         await connection.execute(text("set transaction read only"))
         await connection.execute(text("set local statement_timeout = '10s'"))
+        await connection.execute(text("set local search_path = public, pg_catalog"))
         result = await connection.execute(text(validated_sql))
         rows = tuple(tuple(row) for row in result.fetchall())
         return QueryResult(columns=tuple(result.keys()), rows=rows)
 ```
 
-Create the engine exclusively from `DatabaseSettings.database_url`.
+Create the engine exclusively from the readonly-only `DatabaseSettings.database_url`. Do not add
+transaction state to the generic engine factory. The real PostgreSQL executor integration test
+must query `current_setting` through this executor transaction and assert
+`transaction_read_only = 'on'`, `statement_timeout = '10s'`, and
+`search_path = 'public, pg_catalog'`.
 
 - [ ] **Step 4: Prove database permissions backstop the guard**
 
