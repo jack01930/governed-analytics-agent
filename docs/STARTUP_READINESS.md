@@ -15,7 +15,7 @@
 | 项目 | 状态 | 说明 |
 |---|---:|---|
 | 项目规划 | 已就绪 | 已有完整任务契约、架构、评测和八周计划 |
-| 本地 Git 仓库 | 已就绪 | 默认分支为 `main`，尚无远程仓库 |
+| 本地 Git 仓库 | 已就绪 | 默认分支为 `main`，已连接 private `origin` |
 | Python | 已就绪 | Python 3.12.14，路径 `/opt/homebrew/bin/python3.12` |
 | 虚拟环境 | 已就绪 | 项目本地 `.venv`，不提交 Git |
 | Python 依赖管理 | 已就绪 | `uv` 0.12.8，使用 `pyproject.toml` 和 `uv.lock` |
