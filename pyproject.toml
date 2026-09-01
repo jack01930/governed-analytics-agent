@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "governed-analytics-agent"
+version = "0.1.0"
+description = "A governed analytics agent for evidence-backed ecommerce analysis."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+dependencies = [
+  "alembic",
+  "asyncpg",
+  "fastapi",
+  "httpx",
+  "langchain-openai",
+  "langgraph",
+  "mcp",
+  "openai",
+  "pandas",
+  "pgvector",
+  "plotly",
+  "psycopg[binary]",
+  "pydantic-settings",
+  "sqlalchemy[asyncio]",
+  "sqlglot",
+  "sse-starlette",
+  "streamlit",
+  "structlog",
+  "tenacity",
+  "uvicorn[standard]",
+]
+
+[dependency-groups]
+dev = [
+  "mypy",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "ruff",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/governed_analytics"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["governed_analytics"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]

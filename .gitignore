@@ -1,0 +1,40 @@
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.python-version.local
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime and generated artifacts
+artifacts/
+exports/
+logs/
+data/generated/
+evals/reports/generated/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local observability state
+.langgraph_api/
+.streamlit/secrets.toml
