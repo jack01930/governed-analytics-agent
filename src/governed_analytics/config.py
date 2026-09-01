@@ -1,5 +1,5 @@
 from typing import Self
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,4 +30,6 @@ class DatabaseSettings(BaseSettings):
     @staticmethod
     def _credentials(database_url: str) -> tuple[str | None, str | None]:
         parsed_url = urlsplit(database_url)
-        return parsed_url.username, parsed_url.password
+        username = unquote(parsed_url.username) if parsed_url.username is not None else None
+        password = unquote(parsed_url.password) if parsed_url.password is not None else None
+        return username, password

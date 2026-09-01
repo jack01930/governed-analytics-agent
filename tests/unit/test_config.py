@@ -46,3 +46,20 @@ def test_readonly_and_migration_urls_require_distinct_credentials(
 
     with pytest.raises(ValidationError, match="must use different credentials"):
         DatabaseSettings(_env_file=None)
+
+
+def test_readonly_and_migration_urls_reject_percent_encoded_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://admi%6e:p%77@readonly-db:5432/readonly_app",
+    )
+    monkeypatch.setenv(
+        "MIGRATION_DATABASE_URL",
+        "postgresql+psycopg://admin:pw@migration-db:6543/migration_app",
+    )
+    monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
+
+    with pytest.raises(ValidationError, match="must use different credentials"):
+        DatabaseSettings(_env_file=None)
