@@ -8,6 +8,8 @@ import pytest
 def test_database_is_at_expected_alembic_head() -> None:
     url = os.environ["MIGRATION_DATABASE_URL"].replace("+psycopg", "")
     with psycopg.connect(url) as connection:
-        revision = connection.execute("select version_num from alembic_version").fetchone()
+        revisions = connection.execute(
+            "select version_num from alembic_version order by version_num"
+        ).fetchall()
 
-    assert revision == ("0002",)
+    assert revisions == [("0002",)]
