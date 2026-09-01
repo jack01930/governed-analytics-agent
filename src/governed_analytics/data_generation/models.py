@@ -9,8 +9,9 @@ from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
+import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 GENERATOR_CONTRACT_VERSION = "1.0.0"
@@ -55,6 +56,14 @@ class DatasetManifest(BaseModel):
     scale: DatasetScale
     tables: tuple[TableDigest, ...]
     anomaly_manifest_path: Path
+
+
+def load_generator_config(path: str | Path) -> GeneratorConfig:
+    """Load and validate one non-empty YAML generator configuration mapping."""
+    raw: Any = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("generator configuration must be a non-empty YAML mapping")
+    return GeneratorConfig.model_validate(raw)
 
 
 def generator_config_sha256(config: GeneratorConfig) -> str:
