@@ -1,7 +1,7 @@
 """Contracts for deterministic anomaly injection and its truth manifest."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -10,12 +10,19 @@ import pytest
 
 from governed_analytics.data_generation.anomalies import (
     AnomalyManifest,
+    AnomalyRecord,
     anomaly_count_plan,
     inject_anomalies,
+    selected_keys_sha256,
+    stockout_count_plan,
 )
 from governed_analytics.data_generation.dimensions import generate_products
-from governed_analytics.data_generation.facts import generate_base_facts
-from governed_analytics.data_generation.models import dataset_id_for_config, load_generator_config
+from governed_analytics.data_generation.facts import GeneratedFacts, generate_base_facts
+from governed_analytics.data_generation.models import (
+    GeneratorConfig,
+    dataset_id_for_config,
+    load_generator_config,
+)
 from governed_analytics.data_generation.vocabulary import SOUTH_REGIONS
 
 
@@ -88,6 +95,40 @@ def test_manifest_has_stable_dataset_id_order_schema_and_lookup(config, result) 
         + "\n"
     )
     assert committed == generated
+
+
+def test_manifest_and_record_models_reject_invalid_truth_boundaries(result) -> None:  # type: ignore[no-untyped-def]
+    record = result.manifest.anomalies[0]
+    valid_dataset_id = result.manifest.dataset_id
+    record_data = record.model_dump()
+    with pytest.raises(ValueError, match="UTC-aware"):
+        AnomalyRecord.model_validate({**record_data, "start_at": datetime(2026, 6, 8)})
+    with pytest.raises(ValueError, match="UTC-aware"):
+        AnomalyRecord.model_validate(
+            {
+                **record_data,
+                "start_at": datetime(2026, 6, 8, tzinfo=timezone(timedelta(hours=8))),
+            }
+        )
+    with pytest.raises(ValueError, match="start_at must be before end_at"):
+        AnomalyRecord.model_validate(
+            {**record_data, "start_at": record.end_at, "end_at": record.start_at}
+        )
+    with pytest.raises(ValueError, match="dataset_id"):
+        AnomalyManifest(dataset_id="not-a-digest", anomalies=result.manifest.anomalies)
+    with pytest.raises(ValueError, match="exactly match"):
+        AnomalyManifest(dataset_id=valid_dataset_id, anomalies=())
+    with pytest.raises(ValueError, match="exactly match"):
+        AnomalyManifest(
+            dataset_id=valid_dataset_id,
+            anomalies=(*result.manifest.anomalies[:-1], record),
+        )
+    with pytest.raises(ValueError, match="exactly match"):
+        AnomalyManifest(
+            dataset_id=valid_dataset_id,
+            anomalies=(result.manifest.anomalies[1], record, *result.manifest.anomalies[2:]),
+        )
+    assert AnomalyManifest(dataset_id=valid_dataset_id, anomalies=result.manifest.anomalies)
 
 
 def test_quality_anomalies_have_exact_tiny_counts_and_stable_selection(base, result) -> None:  # type: ignore[no-untyped-def]
@@ -179,10 +220,22 @@ def test_conversion_stockout_and_inventory_mutations_reconcile(base, result) -> 
     affected_items = _window(
         base.order_items.merge(base_orders[["ordered_at"]], on="order_id"), "ordered_at", start, end
     )
-    target_items = affected_items[affected_items["product_id"].isin((1, 2))].sort_values(
-        "order_item_id"
-    )
-    removed = target_items.head(int(len(target_items) * 0.90))["order_item_id"].tolist()
+    target_items = affected_items[affected_items["product_id"].isin((1, 2))]
+    removed: list[int] = []
+    for product_id in (1, 2):
+        sku_scope = target_items[target_items["product_id"].eq(product_id)].sort_values(
+            "order_item_id"
+        )
+        expected_removed = sku_scope.head(int(len(sku_scope) * 0.90))["order_item_id"].tolist()
+        removed.extend(expected_removed)
+        remaining_source_ids = set(result.order_items["source_line_id"])
+        assert len(expected_removed) == 18
+        assert (
+            not set(
+                base.order_items.set_index("order_item_id").loc[expected_removed, "source_line_id"]
+            )
+            & remaining_source_ids
+        )
     surviving_source_ids = set(result.order_items["source_line_id"])
     assert (
         not set(base.order_items.set_index("order_item_id").loc[removed, "source_line_id"])
@@ -194,7 +247,7 @@ def test_conversion_stockout_and_inventory_mutations_reconcile(base, result) -> 
     final_item_totals = result.order_items.groupby("order_id")[
         ["gross_amount", "discount_amount", "net_amount"]
     ].sum()
-    affected_order_ids = set(target_items.head(int(len(target_items) * 0.90))["order_id"])
+    affected_order_ids = set(base.order_items.set_index("order_item_id").loc[removed, "order_id"])
     for order_id in affected_order_ids:
         if order_id not in final_item_totals.index:
             assert final_orders.loc[order_id, "status"] == "cancelled"
@@ -238,6 +291,106 @@ def test_conversion_stockout_and_inventory_mutations_reconcile(base, result) -> 
     ].iloc[0]
     assert pipeline.status == "failed" and pipeline.error_code is not None
     assert pipeline.watermark == datetime(2026, 6, 15, tzinfo=UTC)
+
+
+def test_stockout_rejects_refund_for_deleted_item_even_if_payment_still_succeeds(
+    config: GeneratorConfig, base: GeneratedFacts
+) -> None:
+    """A nullable FK must not disguise a succeeded refund for an erased SKU line."""
+    start = datetime(2026, 6, 8, tzinfo=UTC)
+    end = datetime(2026, 6, 15, tzinfo=UTC)
+    scoped = base.order_items.merge(base.orders[["order_id", "ordered_at"]], on="order_id")
+    target = (
+        scoped[
+            scoped["product_id"].eq(1) & scoped["ordered_at"].between(start, end, inclusive="left")
+        ]
+        .sort_values("order_item_id")
+        .iloc[0]
+    )
+    order_id = int(target["order_id"])
+    item_id = int(target["order_item_id"])
+    orders = base.orders.copy(deep=True)
+    orders.loc[orders["order_id"].eq(order_id), ["region", "status"]] = ["北京", "paid"]
+    payments = base.payments.copy(deep=True)
+    paid_at = orders.loc[orders["order_id"].eq(order_id), "ordered_at"].iloc[0] + pd.Timedelta(
+        minutes=1
+    )
+    payments.loc[payments["order_id"].eq(order_id), ["status", "paid_at"]] = [
+        "succeeded",
+        paid_at,
+    ]
+    items = base.order_items.copy(deep=True)
+    extra = items.loc[items["order_item_id"].eq(item_id)].copy()
+    extra["order_item_id"] = int(items["order_item_id"].max()) + 1
+    extra["source_line_id"] = "LINE-REFUND-SURVIVOR"
+    extra["product_id"] = 3
+    items = pd.concat((items, extra), ignore_index=True)
+    refunds = base.refunds.copy(deep=True)
+    refunds = pd.concat(
+        (
+            refunds,
+            pd.DataFrame(
+                [
+                    {
+                        "refund_id": int(refunds["refund_id"].max()) + 1,
+                        "refund_code": "REF-CONSTRUCTED",
+                        "order_id": order_id,
+                        "order_item_id": item_id,
+                        "status": "succeeded",
+                        "amount": Decimal("1.00"),
+                        "reason": "构造性退款",
+                        "refunded_at": paid_at + pd.Timedelta(minutes=1),
+                        "created_at": paid_at + pd.Timedelta(minutes=1),
+                    }
+                ]
+            ),
+        ),
+        ignore_index=True,
+    )
+    refunds["order_item_id"] = pd.Series(refunds["order_item_id"], dtype="Int64")
+    constructed = GeneratedFacts(
+        orders=orders,
+        order_items=items,
+        payments=payments,
+        refunds=refunds,
+        web_sessions=base.web_sessions,
+        inventory_snapshots=base.inventory_snapshots,
+        campaign_attributions=base.campaign_attributions,
+        pipeline_runs=base.pipeline_runs,
+    )
+    injected = inject_anomalies(config, constructed)
+    constructed_refund = injected.refunds.loc[injected.refunds["reason"].eq("构造性退款")].iloc[0]
+    assert constructed_refund["status"] == "rejected"
+    assert pd.isna(constructed_refund["order_item_id"])
+    assert pd.isna(constructed_refund["refunded_at"])
+    assert injected.payments.set_index("order_id").loc[order_id, "status"] == "succeeded"
+
+
+def test_manifest_audit_keys_are_scoped_counted_and_digestible(base, result) -> None:  # type: ignore[no-untyped-def]
+    for record in result.manifest.anomalies:
+        assert any(item.startswith("scope=") for item in record.affected_keys)
+        assert any(item.startswith("selected_count=") for item in record.affected_keys)
+        digest = next(
+            item for item in record.affected_keys if item.startswith("selected_keys_sha256=")
+        )
+        assert len(digest.removeprefix("selected_keys_sha256=")) == 64
+        assert any(item.startswith("selection=") for item in record.affected_keys)
+    start = datetime(2026, 6, 8, tzinfo=UTC)
+    end = datetime(2026, 6, 15, tzinfo=UTC)
+    orders = base.orders.set_index("order_id")
+    candidates = base.web_sessions[
+        base.web_sessions["converted"]
+        & base.web_sessions["occurred_at"].between(start, end, inclusive="left")
+        & base.web_sessions["order_id"].map(orders["region"]).isin(SOUTH_REGIONS)
+    ].sort_values("session_id")
+    selected_ids = candidates.head(int(len(candidates) * 0.35))["session_id"].tolist()
+    conversion = result.manifest.by_id("anomaly_gmv_drop_south_conversion")
+    assert f"selected_count={len(selected_ids)}" in conversion.affected_keys
+    assert f"selected_keys_sha256={selected_keys_sha256(selected_ids)}" in conversion.affected_keys
+    assert conversion.expected_signals[0].threshold != "south"
+    assert result.manifest.by_id("anomaly_refund_spike_category").expected_signals[
+        0
+    ].threshold == Decimal("2")
 
 
 def test_refund_spike_and_final_relational_contract(config, base, result) -> None:  # type: ignore[no-untyped-def]
@@ -313,4 +466,9 @@ def test_count_plan_locks_full_without_generating_full() -> None:
         "order_amount_mismatch": 1000,
         "missing_region": 1000,
         "refund_exceeds_payment": 300,
+    }
+    assert stockout_count_plan("tiny") == {"eligible_per_sku": 20, "removed_per_sku": 18}
+    assert stockout_count_plan("full") == {
+        "eligible_per_sku": 2000,
+        "removed_per_sku": 1800,
     }

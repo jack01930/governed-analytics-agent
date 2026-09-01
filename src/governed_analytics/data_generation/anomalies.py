@@ -5,13 +5,15 @@ its table by the contractual time and business scope, then uses its stable ident
 order.  The returned frames are independent copies of the clean input bundle.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 from typing import Literal
 
 import pandas as pd  # type: ignore[import-untyped]
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from governed_analytics.data_generation.dimensions import generate_products
 from governed_analytics.data_generation.facts import GeneratedFacts
@@ -28,6 +30,16 @@ _CONVERSION_END = datetime(2026, 6, 15, tzinfo=UTC)
 _REFUND_START = datetime(2026, 5, 4, tzinfo=UTC)
 _REFUND_END = datetime(2026, 5, 11, tzinfo=UTC)
 _INVENTORY_DAY = datetime(2026, 6, 15, tzinfo=UTC)
+_CONTRACT_ANOMALY_IDS = (
+    "anomaly_gmv_drop_south_conversion",
+    "anomaly_gmv_drop_stockout",
+    "anomaly_refund_spike_category",
+    "anomaly_inventory_delay",
+    "anomaly_duplicate_order_items",
+    "anomaly_order_amount_mismatch",
+    "anomaly_missing_region",
+    "anomaly_refund_exceeds_payment",
+)
 
 
 class ExpectedSignal(BaseModel):
@@ -62,14 +74,29 @@ class AnomalyRecord(BaseModel):
             raise ValueError("anomaly timestamps must be UTC-aware")
         return value
 
+    @model_validator(mode="after")
+    def validate_half_open_window(self) -> "AnomalyRecord":
+        """Reject empty and inverted truth windows at the public model boundary."""
+        if self.start_at >= self.end_at:
+            raise ValueError("start_at must be before end_at")
+        return self
+
 
 class AnomalyManifest(BaseModel):
     """The ordered source of truth for all injected anomalies."""
 
     model_config = ConfigDict(frozen=True)
 
-    dataset_id: str
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     anomalies: tuple[AnomalyRecord, ...]
+
+    @model_validator(mode="after")
+    def validate_contract_anomaly_order(self) -> "AnomalyManifest":
+        """Make manifest completeness, uniqueness and order non-optional for consumers."""
+        actual_ids = tuple(record.anomaly_id for record in self.anomalies)
+        if actual_ids != _CONTRACT_ANOMALY_IDS:
+            raise ValueError("anomaly IDs must exactly match the fixed contract order")
+        return self
 
     def by_id(self, anomaly_id: str) -> AnomalyRecord:
         """Return one record or provide an actionable unknown-ID failure."""
@@ -110,6 +137,37 @@ def anomaly_count_plan(scale: DatasetScale | str) -> dict[str, int]:
         "missing_region": 1000,
         "refund_exceeds_payment": 300,
     }
+
+
+def stockout_count_plan(scale: DatasetScale | str) -> dict[str, int]:
+    """Expose the anchored per-SKU stockout contract without building a full fact bundle."""
+    normalized = DatasetScale(scale)
+    if normalized is DatasetScale.TINY:
+        return {"eligible_per_sku": 20, "removed_per_sku": 18}
+    return {"eligible_per_sku": 2000, "removed_per_sku": 1800}
+
+
+def selected_keys_sha256(keys: list[object] | tuple[object, ...]) -> str:
+    """Hash an ordered primary/business-key cohort without expanding a manifest indefinitely."""
+    canonical = json.dumps([str(key) for key in keys], ensure_ascii=False, separators=(",", ":"))
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _audited_keys(
+    *,
+    scope: str,
+    selected_keys: list[object] | tuple[object, ...],
+    selection: str,
+    details: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Build machine-auditable scope, count and canonical-selection metadata."""
+    return (
+        f"scope={scope}",
+        *details,
+        f"selected_count={len(selected_keys)}",
+        f"selected_keys_sha256={selected_keys_sha256(selected_keys)}",
+        f"selection={selection}",
+    )
 
 
 def _in_window(frame: pd.DataFrame, column: str, start: datetime, end: datetime) -> pd.Series:
@@ -213,7 +271,15 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             start_at=_CONVERSION_START,
             end_at=_CONVERSION_END,
             root_cause="华南地区转化下降",
-            affected_keys=("web_sessions.session_id", "orders.order_id", "payments.order_id"),
+            affected_keys=_audited_keys(
+                scope=(
+                    "web_sessions.occurred_at in [2026-06-08T00:00:00Z,"
+                    "2026-06-15T00:00:00Z);orders.region in SOUTH_REGIONS="
+                    + ",".join(sorted(SOUTH_REGIONS))
+                ),
+                selected_keys=flipped["session_id"].tolist(),
+                selection="web_sessions.session_id asc after scope filter",
+            ),
             mutation={
                 "conversion_flip_ratio": 0.35,
                 "selection": "session_id_ascending",
@@ -222,26 +288,49 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             },
             mutated_rows=len(flipped),
             expected_signals=(
-                ExpectedSignal(metric_id="conversion_rate", operator="decrease", threshold="0.35"),
-                ExpectedSignal(metric_id="gmv", operator="decrease", threshold="south"),
+                ExpectedSignal(
+                    metric_id="conversion_rate",
+                    operator="decrease",
+                    threshold=(
+                        "baseline=[2026-06-01T00:00:00Z,2026-06-08T00:00:00Z);"
+                        "dimension=region:SOUTH_REGIONS;conversion_multiplier=0.65"
+                    ),
+                ),
+                ExpectedSignal(
+                    metric_id="gmv",
+                    operator="decrease",
+                    threshold=(
+                        "baseline=[2026-06-01T00:00:00Z,2026-06-08T00:00:00Z);"
+                        "dimension=region:SOUTH_REGIONS;conversion_multiplier=0.65"
+                    ),
+                ),
             ),
         )
     )
 
     # 2. Stockout: item scope is the parent order time plus the two SKU identities.
     item_order_times = orders.set_index("order_id")["ordered_at"]
-    stock_scope = order_items[
-        order_items["product_id"].isin((1, 2))
-        & order_items["order_id"]
-        .map(item_order_times)
-        .between(_CONVERSION_START, _CONVERSION_END, inclusive="left")
-    ].sort_values("order_item_id", kind="stable")
-    removed = stock_scope.iloc[: int(len(stock_scope) * 0.90)]
+    stock_scopes: dict[int, pd.DataFrame] = {}
+    removed_per_sku: dict[int, pd.DataFrame] = {}
+    for product_id in (1, 2):
+        sku_scope = order_items[
+            order_items["product_id"].eq(product_id)
+            & order_items["order_id"]
+            .map(item_order_times)
+            .between(_CONVERSION_START, _CONVERSION_END, inclusive="left")
+        ].sort_values("order_item_id", kind="stable")
+        stock_scopes[product_id] = sku_scope
+        removed_per_sku[product_id] = sku_scope.iloc[: int(len(sku_scope) * 0.90)]
+    removed = pd.concat(tuple(removed_per_sku.values()), ignore_index=False).sort_values(
+        "order_item_id", kind="stable"
+    )
     removed_item_ids = {int(value) for value in removed["order_item_id"].tolist()}
     affected_orders = {int(value) for value in removed["order_id"].tolist()}
     order_items = order_items[~order_items["order_item_id"].isin(removed_item_ids)].copy()
     removed_refund_rows = refunds["order_item_id"].isin(removed_item_ids)
+    refunds.loc[removed_refund_rows, "status"] = "rejected"
     refunds.loc[removed_refund_rows, "order_item_id"] = pd.NA
+    refunds.loc[removed_refund_rows, "refunded_at"] = pd.NaT
     refunds["order_item_id"] = refunds["order_item_id"].astype("Int64")
     inventory_scope = inventory_snapshots[
         inventory_snapshots["snapshot_at"].between(
@@ -254,6 +343,12 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
     post_stockout_payment_status = payments.set_index("order_id")["status"]
     no_longer_paid = refunds["order_id"].map(post_stockout_payment_status).ne("succeeded")
     refunds.loc[refunds["order_id"].isin(affected_orders) & no_longer_paid, "status"] = "rejected"
+    failed_payment_orders = set(payments.loc[payments["status"].eq("failed"), "order_id"])
+    succeeded_refunds_for_failed_payment = refunds["status"].eq("succeeded") & refunds[
+        "order_id"
+    ].isin(failed_payment_orders)
+    refunds.loc[succeeded_refunds_for_failed_payment, "status"] = "rejected"
+    refunds.loc[succeeded_refunds_for_failed_payment, "refunded_at"] = pd.NaT
     post_stockout_payment_amount = payments.set_index("order_id")["amount"]
     affected_refunds = refunds["order_id"].isin(affected_orders) & refunds["status"].eq("succeeded")
     exceeds_reconciled_payment = refunds["amount"] > refunds["order_id"].map(
@@ -268,17 +363,42 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             start_at=_CONVERSION_START,
             end_at=_CONVERSION_END,
             root_cause="SKU-000001 与 SKU-000002 缺货",
-            affected_keys=("order_items.order_item_id", "inventory_snapshots.product_id"),
+            affected_keys=(
+                "scope=orders.ordered_at in [2026-06-08T00:00:00Z,"
+                "2026-06-15T00:00:00Z);products.sku=SKU-000001",
+                f"sku=SKU-000001;eligible_count={len(stock_scopes[1])};"
+                f"removed_count={len(removed_per_sku[1])};"
+                f"selected_keys_sha256={selected_keys_sha256(removed_per_sku[1]['order_item_id'].tolist())}",
+                "scope=orders.ordered_at in [2026-06-08T00:00:00Z,"
+                "2026-06-15T00:00:00Z);products.sku=SKU-000002",
+                f"sku=SKU-000002;eligible_count={len(stock_scopes[2])};"
+                f"removed_count={len(removed_per_sku[2])};"
+                f"selected_keys_sha256={selected_keys_sha256(removed_per_sku[2]['order_item_id'].tolist())}",
+                f"selected_count={len(removed)}",
+                f"selected_keys_sha256={selected_keys_sha256(removed['order_item_id'].tolist())}",
+                "selection=order_items.order_item_id asc after scope filter per SKU",
+            ),
             mutation={
                 "sku_count": 2,
                 "item_suppression_ratio": 0.9,
                 "selection": "order_item_id_ascending",
                 "linked_refund_action": "removed_item_fk_cleared",
                 "linked_order_payment_action": "totals_recomputed",
+                "sku_000001_eligible_count": len(stock_scopes[1]),
+                "sku_000001_removed_count": len(removed_per_sku[1]),
+                "sku_000002_eligible_count": len(stock_scopes[2]),
+                "sku_000002_removed_count": len(removed_per_sku[2]),
             },
             mutated_rows=len(removed),
             expected_signals=(
-                ExpectedSignal(metric_id="gmv", operator="decrease", threshold="sku_stockout"),
+                ExpectedSignal(
+                    metric_id="gmv",
+                    operator="decrease",
+                    threshold=(
+                        "baseline=[2026-06-01T00:00:00Z,2026-06-08T00:00:00Z);"
+                        "dimension=sku:SKU-000001,SKU-000002;item_suppression_ratio=0.90"
+                    ),
+                ),
                 ExpectedSignal(metric_id="stockout_rate", operator="increase", threshold=2),
             ),
         )
@@ -337,11 +457,31 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             start_at=_REFUND_START,
             end_at=_REFUND_END,
             root_cause="CAT-018 商品质量问题导致退款激增",
-            affected_keys=("products.category_id", "refunds.order_id"),
-            mutation={"category_id": 18, "target_refund_coverage": 0.24, "rounding": "floor"},
+            affected_keys=_audited_keys(
+                scope=(
+                    "orders.ordered_at in [2026-05-04T00:00:00Z,2026-05-11T00:00:00Z);"
+                    "products.category_id=18;payments.status=succeeded"
+                ),
+                selected_keys=[row["order_id"] for row in additions],
+                selection="refunds.order_id asc after scope filter",
+                details=(
+                    f"eligible_order_count={len(eligible_order_ids)}",
+                    f"coverage_target_count={target_refund_coverage}",
+                ),
+            ),
+            mutation={
+                "category_id": 18,
+                "target_refund_coverage": 0.24,
+                "target_coverage_count": target_refund_coverage,
+                "existing_successful_refund_count": len(existing_refunded_orders),
+                "rounding": "floor",
+                "linked_order_action": "refunded",
+            },
             mutated_rows=len(additions),
             expected_signals=(
-                ExpectedSignal(metric_id="refund_rate", operator="increase", threshold="2x"),
+                ExpectedSignal(
+                    metric_id="refund_rate", operator="increase", threshold=Decimal("2")
+                ),
             ),
         )
     )
@@ -364,12 +504,31 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             start_at=_INVENTORY_DAY,
             end_at=_INVENTORY_DAY + timedelta(days=1),
             root_cause="库存快照延迟且库存管道失败",
-            affected_keys=("inventory_snapshots.snapshot_at", "pipeline_runs.pipeline_run_id"),
-            mutation={"snapshot_cutoff_hour_utc": 8, "pipeline_action": "status_changed"},
+            affected_keys=_audited_keys(
+                scope=(
+                    "inventory_snapshots.snapshot_at in [2026-06-15T08:00:00Z,2026-06-16T00:00:00Z)"
+                ),
+                selected_keys=[
+                    f"{snapshot_at.isoformat()}|{product_id}"
+                    for snapshot_at, product_id in zip(
+                        delayed["snapshot_at"], delayed["product_id"], strict=True
+                    )
+                ],
+                selection="inventory_snapshots.(snapshot_at,product_id) asc after scope filter",
+                details=("pipeline=inventory;pipeline_action=status_changed",),
+            ),
+            mutation={
+                "snapshot_cutoff_hour_utc": 8,
+                "pipeline_action": "status_changed",
+                "pipeline_status": "failed",
+                "watermark": "2026-06-15T00:00:00Z",
+            },
             mutated_rows=len(delayed),
             expected_signals=(
                 ExpectedSignal(
-                    metric_id="inventory_freshness", operator="stale", threshold="1_day"
+                    metric_id="inventory_freshness",
+                    operator="stale",
+                    threshold="watermark_lt=2026-06-15T00:00:00Z",
                 ),
             ),
         )
@@ -397,8 +556,16 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             start_at=duplicate_day,
             end_at=duplicate_day + timedelta(days=1),
             root_cause="模拟重跑未幂等导致订单明细重复",
-            affected_keys=("order_items.source_line_id",),
-            mutation={"copies": len(duplicate_rows), "selection": "order_item_id_ascending"},
+            affected_keys=_audited_keys(
+                scope="orders.ordered_at in [2026-04-10T00:00:00Z,2026-04-11T00:00:00Z)",
+                selected_keys=duplicate_sources["source_line_id"].tolist(),
+                selection="order_items.order_item_id asc after scope filter",
+            ),
+            mutation={
+                "copies": len(duplicate_rows),
+                "selection": "order_item_id_ascending",
+                "duplicate_key": "source_line_id",
+            },
             mutated_rows=len(duplicate_rows),
             expected_signals=(
                 ExpectedSignal(
@@ -427,8 +594,16 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             start_at=mismatch_day,
             end_at=mismatch_day + timedelta(days=1),
             root_cause="订单金额同步缺陷",
-            affected_keys=("orders.order_id",),
-            mutation={"payable_amount_delta": "10.00", "selection": "order_id_ascending"},
+            affected_keys=_audited_keys(
+                scope="orders.ordered_at in [2026-03-17T00:00:00Z,2026-03-18T00:00:00Z)",
+                selected_keys=mismatch_orders["order_id"].tolist(),
+                selection="orders.order_id asc after scope filter",
+            ),
+            mutation={
+                "payable_amount_delta": "10.00",
+                "selection": "order_id_ascending",
+                "linked_payment_action": "unchanged",
+            },
             mutated_rows=len(mismatch_orders),
             expected_signals=(
                 ExpectedSignal(
@@ -453,8 +628,16 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             start_at=missing_day,
             end_at=missing_day + timedelta(days=1),
             root_cause="上游地区映射错误",
-            affected_keys=("orders.region",),
-            mutation={"null_count": len(missing_orders), "selection": "order_id_ascending"},
+            affected_keys=_audited_keys(
+                scope="orders.ordered_at in [2026-02-12T00:00:00Z,2026-02-13T00:00:00Z)",
+                selected_keys=missing_orders["order_id"].tolist(),
+                selection="orders.order_id asc after scope filter",
+            ),
+            mutation={
+                "null_count": len(missing_orders),
+                "selection": "order_id_ascending",
+                "field": "orders.region",
+            },
             mutated_rows=len(missing_orders),
             expected_signals=(
                 ExpectedSignal(
@@ -501,8 +684,19 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             start_at=refund_day,
             end_at=refund_day + timedelta(days=1),
             root_cause="退款业务一致性错误",
-            affected_keys=("refunds.refund_id", "payments.order_id"),
-            mutation={"payment_amount_delta": "50.00", "selection": "refund_id_ascending"},
+            affected_keys=_audited_keys(
+                scope=(
+                    "refunds.refunded_at in [2026-05-20T00:00:00Z,2026-05-21T00:00:00Z);"
+                    "refunds.status=succeeded"
+                ),
+                selected_keys=violating_refunds["refund_id"].tolist(),
+                selection="refunds.refund_id asc after scope filter",
+            ),
+            mutation={
+                "payment_amount_delta": "50.00",
+                "selection": "refund_id_ascending",
+                "linked_payment_action": "unchanged",
+            },
             mutated_rows=len(violating_refunds),
             expected_signals=(
                 ExpectedSignal(
