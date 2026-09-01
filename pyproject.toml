@@ -17,12 +17,14 @@ dependencies = [
   "langchain-openai",
   "langgraph",
   "mcp",
+  "numpy",
   "openai",
   "pandas",
   "pgvector",
   "plotly",
   "psycopg[binary]",
   "pydantic-settings",
+  "pyyaml",
   "sqlalchemy[asyncio]",
   "sqlglot",
   "sse-starlette",
@@ -31,6 +33,9 @@ dependencies = [
   "tenacity",
   "uvicorn[standard]",
 ]
+
+[project.scripts]
+governed-data = "governed_analytics.data_generation.cli:main"
 
 [dependency-groups]
 dev = [
