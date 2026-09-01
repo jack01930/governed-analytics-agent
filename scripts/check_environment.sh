@@ -32,7 +32,7 @@ else
   fail 'Python 3.12 未安装或不在 PATH'
 fi
 
-if [ -d .git ]; then
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   ok '当前目录是本地 Git 仓库'
 else
   fail '当前目录尚未初始化 Git 仓库'

@@ -1,6 +1,6 @@
 PYTHON ?= python3.12
 
-.PHONY: doctor venv sync lint format typecheck test check
+.PHONY: doctor venv sync lint format typecheck test check db-up db-down migrate migration-check test-integration
 
 doctor:
 	@bash scripts/check_environment.sh
@@ -22,6 +22,22 @@ typecheck:
 	@uv run mypy
 
 test:
-	@uv run pytest
+	@uv run pytest tests/unit
+
+db-up:
+	@docker compose up -d --wait db
+
+db-down:
+	@docker compose stop db
+
+migrate:
+	@uv run alembic upgrade head
+
+migration-check:
+	@uv run alembic current
+	@uv run pytest tests/integration/persistence/test_migrations.py -q
+
+test-integration:
+	@uv run pytest tests/integration -v
 
 check: lint typecheck test

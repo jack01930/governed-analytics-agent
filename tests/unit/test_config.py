@@ -4,12 +4,17 @@ from pydantic import ValidationError
 from governed_analytics.config import DatabaseSettings
 
 
+def settings_without_dotenv() -> DatabaseSettings:
+    """Construct settings from the test environment without reading local dotenv files."""
+    return DatabaseSettings(_env_file=None)  # type: ignore[call-arg]
+
+
 def test_database_settings_accept_three_separate_roles(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://readonly:pw@db:5432/app")
     monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql+psycopg://admin:pw@db:5432/app")
     monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
 
-    settings = DatabaseSettings(_env_file=None)
+    settings = settings_without_dotenv()
 
     assert settings.database_url.startswith("postgresql+asyncpg://readonly:")
     assert settings.migration_database_url.startswith("postgresql+psycopg://admin:")
@@ -23,7 +28,7 @@ def test_readonly_url_cannot_equal_migration_url(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
 
     with pytest.raises(ValidationError, match="must use different credentials"):
-        DatabaseSettings(_env_file=None)
+        settings_without_dotenv()
 
 
 @pytest.mark.parametrize(
@@ -45,7 +50,7 @@ def test_readonly_and_migration_urls_require_distinct_credentials(
     monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
 
     with pytest.raises(ValidationError, match="must use different credentials"):
-        DatabaseSettings(_env_file=None)
+        settings_without_dotenv()
 
 
 def test_readonly_and_migration_urls_reject_percent_encoded_credentials(
@@ -62,4 +67,4 @@ def test_readonly_and_migration_urls_reject_percent_encoded_credentials(
     monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
 
     with pytest.raises(ValidationError, match="must use different credentials"):
-        DatabaseSettings(_env_file=None)
+        settings_without_dotenv()

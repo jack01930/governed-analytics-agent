@@ -43,10 +43,14 @@ cp .env.example .env
 
 当前机器的检查结果、尚缺工具和处理建议见 [启动就绪报告](docs/STARTUP_READINESS.md)。
 
+## Database
+
+本地 PostgreSQL、Alembic 迁移、最小权限角色和测试工作流已就绪。连接角色、12 张业务表、可复制的开发命令及权限边界见 [数据库开发指南](docs/database.md)。
+
 ## 当前边界
 
-- 当前没有应用代码、数据库 Schema 或 Docker Compose 服务。
-- 当前没有创建 GitHub 远程仓库，也没有公开发布任何内容。
+- 本地开发基线包含 Docker Compose PostgreSQL、Alembic `0001`/`0002` 迁移和 12 张业务表；应用功能仍按项目路线逐步实现。
+- GitHub 远程仓库已配置；未经确认，不进行云端部署或公开发布。
 - 未经确认，不创建云资源、不产生付费调用、不使用真实个人或企业数据。
 
 ## License
