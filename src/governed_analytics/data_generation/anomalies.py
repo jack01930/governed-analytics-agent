@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
+from numbers import Integral
 from typing import Literal
 
 import pandas as pd  # type: ignore[import-untyped]
@@ -149,7 +150,17 @@ def stockout_count_plan(scale: DatasetScale | str) -> dict[str, int]:
 
 def selected_keys_sha256(keys: list[object] | tuple[object, ...]) -> str:
     """Hash an ordered primary/business-key cohort without expanding a manifest indefinitely."""
-    canonical = json.dumps([str(key) for key in keys], ensure_ascii=False, separators=(",", ":"))
+    canonical_keys: list[list[str | int | bool]] = []
+    for key in keys:
+        if isinstance(key, bool):
+            canonical_keys.append(["bool", key])
+        elif isinstance(key, Integral):
+            canonical_keys.append(["int", int(key)])
+        elif isinstance(key, str):
+            canonical_keys.append(["str", key])
+        else:
+            raise TypeError(f"unsupported selected key type: {type(key).__name__}")
+    canonical = json.dumps(canonical_keys, ensure_ascii=False, separators=(",", ":"))
     return sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -328,6 +339,7 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
     affected_orders = {int(value) for value in removed["order_id"].tolist()}
     order_items = order_items[~order_items["order_item_id"].isin(removed_item_ids)].copy()
     removed_refund_rows = refunds["order_item_id"].isin(removed_item_ids)
+    linked_refund_rejected_count = int(removed_refund_rows.sum())
     refunds.loc[removed_refund_rows, "status"] = "rejected"
     refunds.loc[removed_refund_rows, "order_item_id"] = pd.NA
     refunds.loc[removed_refund_rows, "refunded_at"] = pd.NaT
@@ -382,7 +394,10 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
                 "sku_count": 2,
                 "item_suppression_ratio": 0.9,
                 "selection": "order_item_id_ascending",
-                "linked_refund_action": "removed_item_fk_cleared",
+                "linked_refund_status_action": "set_rejected",
+                "linked_refund_item_fk_action": "clear",
+                "linked_refund_timestamp_action": "clear",
+                "linked_refund_rejected_count": linked_refund_rejected_count,
                 "linked_order_payment_action": "totals_recomputed",
                 "sku_000001_eligible_count": len(stock_scopes[1]),
                 "sku_000001_removed_count": len(removed_per_sku[1]),
@@ -487,9 +502,11 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
     )
 
     # 4. Inventory delay: the clean snapshot is noon, so every post-08:00 row is stale.
+    inventory_cutoff = _INVENTORY_DAY + timedelta(hours=8)
+    inventory_day_end = _INVENTORY_DAY + timedelta(days=1)
     delayed = inventory_snapshots[
-        inventory_snapshots["snapshot_at"].dt.date.eq(_INVENTORY_DAY.date())
-        & inventory_snapshots["snapshot_at"].dt.hour.gt(8)
+        inventory_snapshots["snapshot_at"].gt(inventory_cutoff)
+        & inventory_snapshots["snapshot_at"].lt(inventory_day_end)
     ]
     inventory_snapshots = inventory_snapshots.drop(index=delayed.index).copy()
     run_mask = pipeline_runs["pipeline_name"].eq("inventory") & pipeline_runs[
@@ -506,7 +523,7 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
             root_cause="库存快照延迟且库存管道失败",
             affected_keys=_audited_keys(
                 scope=(
-                    "inventory_snapshots.snapshot_at in [2026-06-15T08:00:00Z,2026-06-16T00:00:00Z)"
+                    "inventory_snapshots.snapshot_at in (2026-06-15T08:00:00Z,2026-06-16T00:00:00Z)"
                 ),
                 selected_keys=[
                     f"{snapshot_at.isoformat()}|{product_id}"
@@ -522,13 +539,16 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
                 "pipeline_action": "status_changed",
                 "pipeline_status": "failed",
                 "watermark": "2026-06-15T00:00:00Z",
+                "comparison": "<=",
+                "as_of": "2026-06-16T00:00:00Z",
+                "cutoff_at": "2026-06-15T08:00:00Z",
             },
             mutated_rows=len(delayed),
             expected_signals=(
                 ExpectedSignal(
                     metric_id="inventory_freshness",
                     operator="stale",
-                    threshold="watermark_lt=2026-06-15T00:00:00Z",
+                    threshold="watermark_lte=2026-06-15T00:00:00Z",
                 ),
             ),
         )

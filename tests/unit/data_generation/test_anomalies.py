@@ -291,6 +291,24 @@ def test_conversion_stockout_and_inventory_mutations_reconcile(base, result) -> 
     ].iloc[0]
     assert pipeline.status == "failed" and pipeline.error_code is not None
     assert pipeline.watermark == datetime(2026, 6, 15, tzinfo=UTC)
+    freshness = result.manifest.by_id("anomaly_inventory_delay").expected_signals[0]
+    assert freshness.operator == "stale"
+    predicate, threshold = str(freshness.threshold).split("=", maxsplit=1)
+    assert predicate == "watermark_lte"
+    assert pipeline.watermark <= datetime.fromisoformat(threshold.replace("Z", "+00:00"))
+
+    removed_refunds = base.refunds[base.refunds["order_item_id"].isin(removed)]
+    stockout = result.manifest.by_id("anomaly_gmv_drop_stockout")
+    assert stockout.mutation["linked_refund_rejected_count"] == len(removed_refunds)
+    assert stockout.mutation["linked_refund_status_action"] == "set_rejected"
+    assert stockout.mutation["linked_refund_item_fk_action"] == "clear"
+    assert stockout.mutation["linked_refund_timestamp_action"] == "clear"
+    final_refunds = result.refunds.set_index("refund_id")
+    for refund_id in removed_refunds["refund_id"]:
+        after = final_refunds.loc[refund_id]
+        assert after["status"] == "rejected"
+        assert pd.isna(after["order_item_id"])
+        assert pd.isna(after["refunded_at"])
 
 
 def test_stockout_rejects_refund_for_deleted_item_even_if_payment_still_succeeds(
@@ -391,6 +409,50 @@ def test_manifest_audit_keys_are_scoped_counted_and_digestible(base, result) -> 
     assert result.manifest.by_id("anomaly_refund_spike_category").expected_signals[
         0
     ].threshold == Decimal("2")
+
+
+def test_selected_key_digest_is_type_order_and_duplicate_sensitive() -> None:
+    assert selected_keys_sha256([1]) != selected_keys_sha256(["1"])
+    assert selected_keys_sha256([1, 2]) != selected_keys_sha256([2, 1])
+    assert selected_keys_sha256([1]) != selected_keys_sha256([1, 1])
+    with pytest.raises(TypeError, match="unsupported selected key type"):
+        selected_keys_sha256([pd.NA])
+
+
+def test_inventory_delay_uses_strict_complete_timestamp_cutoff(config, base) -> None:  # type: ignore[no-untyped-def]
+    cutoff = datetime(2026, 6, 15, 8, tzinfo=UTC)
+    snapshots = base.inventory_snapshots.copy(deep=True)
+    boundary_rows = pd.DataFrame(
+        [
+            {
+                "inventory_snapshot_id": int(snapshots["inventory_snapshot_id"].max()) + 1,
+                "snapshot_at": cutoff,
+                "product_id": 1,
+                "available_qty": 10,
+                "reserved_qty": 0,
+            },
+            {
+                "inventory_snapshot_id": int(snapshots["inventory_snapshot_id"].max()) + 2,
+                "snapshot_at": cutoff + timedelta(minutes=1),
+                "product_id": 2,
+                "available_qty": 10,
+                "reserved_qty": 0,
+            },
+        ]
+    )
+    constructed = GeneratedFacts(
+        orders=base.orders,
+        order_items=base.order_items,
+        payments=base.payments,
+        refunds=base.refunds,
+        web_sessions=base.web_sessions,
+        inventory_snapshots=pd.concat((snapshots, boundary_rows), ignore_index=True),
+        campaign_attributions=base.campaign_attributions,
+        pipeline_runs=base.pipeline_runs,
+    )
+    injected = inject_anomalies(config, constructed)
+    assert injected.inventory_snapshots["snapshot_at"].eq(cutoff).any()
+    assert not injected.inventory_snapshots["snapshot_at"].eq(cutoff + timedelta(minutes=1)).any()
 
 
 def test_refund_spike_and_final_relational_contract(config, base, result) -> None:  # type: ignore[no-untyped-def]
