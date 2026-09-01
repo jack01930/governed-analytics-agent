@@ -5,7 +5,7 @@ Only the CSV boundary serializes those values as two-decimal-place text.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
@@ -38,8 +38,15 @@ class GeneratorConfig(BaseModel):
     def validate_interval(self) -> Self:
         if self.start_at.tzinfo is None or self.end_at.tzinfo is None:
             raise ValueError("start_at and end_at must be timezone-aware")
+        if self.start_at.utcoffset() != timedelta(0) or self.end_at.utcoffset() != timedelta(0):
+            raise ValueError("start_at and end_at must use UTC offset (+00:00)")
         if self.end_at <= self.start_at:
             raise ValueError("end_at must be after start_at")
+        if self.campaigns * timedelta(days=14) > self.end_at - self.start_at:
+            raise ValueError(
+                "campaigns exceed 14-day non-overlapping campaign capacity "
+                "for the configured interval"
+            )
         return self
 
 

@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,8 @@ def test_tiny_config_is_frozen_and_exact() -> None:
     assert config.orders == 3000
     assert config.campaigns == 6
     assert config.start_at.tzinfo is not None
+    assert config.start_at.utcoffset() == timedelta(0)
+    assert config.end_at.utcoffset() == timedelta(0)
     with pytest.raises(ValidationError):
         config.orders = 1
 
@@ -41,6 +44,7 @@ def test_full_config_has_fixed_counts_and_interval() -> None:
     assert config.orders == 300000
     assert config.campaigns == 30
     assert config.end_at > config.start_at
+    assert config.campaigns * timedelta(days=14) <= config.end_at - config.start_at
 
 
 @pytest.mark.parametrize(
@@ -57,6 +61,23 @@ def test_config_rejects_naive_or_non_increasing_intervals(start_at: str, end_at:
     raw["end_at"] = end_at
 
     with pytest.raises(ValidationError):
+        GeneratorConfig.model_validate(raw)
+
+
+def test_config_rejects_non_utc_offsets() -> None:
+    raw = yaml.safe_load(Path("data/generator/tiny.yaml").read_text(encoding="utf-8"))
+    raw["start_at"] = "2025-01-01T00:00:00+08:00"
+    raw["end_at"] = "2026-07-01T00:00:00+08:00"
+
+    with pytest.raises(ValidationError, match="UTC offset"):
+        GeneratorConfig.model_validate(raw)
+
+
+def test_config_rejects_campaigns_beyond_14_day_non_overlapping_capacity() -> None:
+    raw = yaml.safe_load(Path("data/generator/tiny.yaml").read_text(encoding="utf-8"))
+    raw["campaigns"] = 40
+
+    with pytest.raises(ValidationError, match="14-day non-overlapping campaign capacity"):
         GeneratorConfig.model_validate(raw)
 
 

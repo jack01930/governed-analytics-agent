@@ -18,8 +18,77 @@ from governed_analytics.data_generation.vocabulary import (
     CATEGORY_NAMES,
     CHANNELS,
     CUSTOMER_SEGMENTS,
+    REGION_WEIGHTS,
     REGIONS,
+    SOUTH_REGIONS,
 )
+
+
+def test_fixed_business_vocabulary_is_an_independent_contract() -> None:
+    """Lock fixed business vocabulary without deriving expectations from production values."""
+    assert CHANNELS == ("organic", "search", "social", "affiliate", "email")
+    assert CUSTOMER_SEGMENTS == ("new", "regular", "vip")
+    assert REGIONS == (
+        "北京",
+        "上海",
+        "广州",
+        "深圳",
+        "杭州",
+        "南京",
+        "成都",
+        "重庆",
+        "武汉",
+        "西安",
+        "苏州",
+        "天津",
+        "长沙",
+        "郑州",
+        "青岛",
+        "宁波",
+        "佛山",
+        "东莞",
+        "厦门",
+        "福州",
+        "南宁",
+        "海口",
+        "昆明",
+        "合肥",
+    )
+    expected_south_regions = frozenset(
+        {"广州", "深圳", "佛山", "东莞", "厦门", "福州", "南宁", "海口"}
+    )
+    assert expected_south_regions == SOUTH_REGIONS
+    assert CATEGORY_NAMES == (
+        "手机数码",
+        "电脑办公",
+        "家用电器",
+        "服饰内衣",
+        "鞋靴箱包",
+        "美妆护肤",
+        "个护清洁",
+        "母婴用品",
+        "食品饮料",
+        "生鲜食品",
+        "家居日用",
+        "家具建材",
+        "运动户外",
+        "图书文娱",
+        "宠物生活",
+        "汽车用品",
+        "珠宝钟表",
+        "医药保健",
+        "玩具乐器",
+        "旅行用品",
+    )
+    assert len(CATEGORY_NAMES) == 20
+    assert len(set(CATEGORY_NAMES)) == len(CATEGORY_NAMES)
+    assert all(
+        name.strip() and any("\u4e00" <= character <= "\u9fff" for character in name)
+        for name in CATEGORY_NAMES
+    )
+    assert len(REGION_WEIGHTS) == len(REGIONS)
+    assert all(weight > 0 for weight in REGION_WEIGHTS)
+    assert sum(REGION_WEIGHTS) == pytest.approx(1.0)
 
 
 def test_tiny_dimensions_have_stable_keys_counts_and_schema_order() -> None:
@@ -97,6 +166,7 @@ def test_customer_vocabulary_and_registration_window_are_valid() -> None:
     assert set(customers["segment"]) <= set(CUSTOMER_SEGMENTS)
     assert set(customers["region"]) <= set(REGIONS)
     assert customers["registered_at"].dt.tz is not None
+    assert customers["registered_at"].iloc[0].utcoffset() == timedelta(0)
     assert customers["registered_at"].min() >= config.start_at - timedelta(days=730)
     assert customers["registered_at"].max() < config.start_at
     assert customers["registered_at"].max() < config.end_at
@@ -132,6 +202,15 @@ def test_campaigns_are_non_organic_non_overlapping_and_in_business_window() -> N
     following_starts = campaigns["start_at"].iloc[1:].reset_index(drop=True)
     preceding_ends = campaigns["end_at"].iloc[:-1].reset_index(drop=True)
     assert (following_starts >= preceding_ends).all()
+
+
+def test_full_campaigns_fit_entirely_in_the_business_window() -> None:
+    """The accepted full configuration must generate no campaign beyond its end time."""
+    config = load_generator_config("data/generator/full.yaml")
+    campaigns = generate_campaigns(config)
+
+    assert len(campaigns) == 30
+    assert campaigns.iloc[-1]["end_at"] <= config.end_at
 
 
 def test_load_generator_config_rejects_empty_or_non_mapping_yaml(tmp_path: Path) -> None:
