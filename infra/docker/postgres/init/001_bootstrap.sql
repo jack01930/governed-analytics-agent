@@ -3,6 +3,12 @@ revoke create on schema public from public;
 
 do $$
 begin
+  execute format('revoke temporary on database %I from public', current_database());
+end
+$$;
+
+do $$
+begin
   if not exists (select 1 from pg_roles where rolname = 'analytics_loader') then
     create role analytics_loader login password 'analytics_loader_dev' nosuperuser nocreatedb nocreaterole;
   end if;

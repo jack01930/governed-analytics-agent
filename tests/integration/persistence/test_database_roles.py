@@ -32,6 +32,12 @@ def test_readonly_role_can_select_but_cannot_mutate_or_define_schema() -> None:
             connection.execute("create table forbidden_readonly_table (id bigint)")
         connection.rollback()
 
+        try:
+            with pytest.raises(InsufficientPrivilege):
+                connection.execute("create temp table forbidden_readonly_temp_table (id bigint)")
+        finally:
+            connection.rollback()
+
         with pytest.raises(InsufficientPrivilege):
             connection.execute("alter table categories add column forbidden_readonly_column bigint")
         connection.rollback()
@@ -56,6 +62,12 @@ def test_loader_role_can_mutate_but_cannot_define_schema() -> None:
         with pytest.raises(InsufficientPrivilege):
             connection.execute("create table forbidden_loader_table (id bigint)")
         connection.rollback()
+
+        try:
+            with pytest.raises(InsufficientPrivilege):
+                connection.execute("create temp table forbidden_loader_temp_table (id bigint)")
+        finally:
+            connection.rollback()
 
         with pytest.raises(InsufficientPrivilege):
             connection.execute(

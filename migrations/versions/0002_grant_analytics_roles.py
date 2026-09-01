@@ -16,6 +16,12 @@ depends_on = None
 def upgrade() -> None:
     """Grant loader DML and readonly query access without DDL rights."""
     op.execute("""
+        do $$
+        begin
+          execute format('revoke temporary on database %I from public', current_database());
+        end
+        $$;
+
         grant usage on schema public to analytics_loader, analytics_readonly;
         grant select, insert, update, delete, truncate on all tables in schema public
         to analytics_loader;
@@ -43,4 +49,10 @@ def downgrade() -> None:
         revoke usage, select on all sequences in schema public from analytics_loader;
         revoke select, insert, update, delete, truncate on all tables in schema public
         from analytics_loader;
+
+        do $$
+        begin
+          execute format('grant temporary on database %I to public', current_database());
+        end
+        $$;
         """)
