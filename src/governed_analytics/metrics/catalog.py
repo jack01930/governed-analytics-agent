@@ -38,6 +38,28 @@ _DIMENSIONS = frozenset(
 _CORE_CATALOG_PATH = Path(__file__).resolve().parents[3] / "data" / "metrics" / "core.yaml"
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """Safe YAML loader that rejects silently overwritten mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"duplicate YAML key: {key}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+
+
 def _validate_expression(expression_sql: str) -> None:
     """Accept exactly one PostgreSQL SELECT projection without command nodes."""
     try:
@@ -45,9 +67,24 @@ def _validate_expression(expression_sql: str) -> None:
         parsed = sqlglot.parse_one(f"SELECT {expression_sql}", read="postgres")
     except sqlglot.errors.ParseError as error:
         raise ValueError("invalid expression_sql") from error
-    if len(statements) != 1 or not isinstance(parsed, exp.Select) or len(parsed.expressions) != 1:
+    if (
+        len(statements) != 1
+        or not isinstance(parsed, exp.Select)
+        or len(parsed.expressions) != 1
+        or parsed.args.get("from")
+        or parsed.args.get("joins")
+        or parsed.args.get("into")
+        or parsed.args.get("locks")
+    ):
         raise ValueError("expression_sql must form a single SELECT projection")
-    prohibited = (exp.DDL, exp.DML, exp.Command)
+    prohibited = tuple(
+        node_type
+        for name in (
+            "DDL", "DML", "Command", "Into", "Lock", "Copy", "Transaction",
+            "Commit", "Rollback", "Set", "Pragma",
+        )
+        if isinstance((node_type := getattr(exp, name, None)), type)
+    )
     if any(isinstance(node, prohibited) for node in parsed.walk()):
         raise ValueError("expression_sql must form a single SELECT projection")
 
@@ -94,7 +131,7 @@ def _validate_raw_metric(raw: Mapping[str, Any]) -> MetricDefinition:
 
 def load_metric_catalog(path: str | Path) -> dict[str, MetricDefinition]:
     """Load a non-empty ordered YAML list of safe immutable metric definitions."""
-    raw: Any = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    raw: Any = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader)
     if not isinstance(raw, list) or not raw:
         raise ValueError("metric catalog must be a non-empty YAML list")
     catalog: dict[str, MetricDefinition] = {}

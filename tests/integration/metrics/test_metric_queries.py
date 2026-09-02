@@ -1,4 +1,5 @@
 """Readonly semantic sanity checks for the first governed metric catalog."""
+# ruff: noqa: E501
 
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -6,14 +7,28 @@ from time import perf_counter
 from typing import Any
 
 import pytest
+import sqlglot
 from sqlalchemy import text
 
 from governed_analytics.config import DatabaseSettings
+from governed_analytics.metrics.catalog import load_metric_catalog
 from governed_analytics.persistence.database import create_async_database_engine
 
 WINDOW = {
     "start": datetime(2026, 6, 1, tzinfo=UTC),
     "end": datetime(2026, 7, 1, tzinfo=UTC),
+}
+FULL_WINDOW = {
+    "start": datetime(2025, 1, 1, tzinfo=UTC),
+    "end": datetime(2026, 7, 1, tzinfo=UTC),
+}
+FULL_SCALAR_WINDOW = {"start_at": FULL_WINDOW["start"], "end_at": FULL_WINDOW["end"]}
+TRUSTED_COMPLEX_EXPRESSIONS = {
+    "net_revenue": """(with order_payments as (select p.order_id, sum(p.amount) as amount from payments p join orders o on o.order_id = p.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and p.status = 'succeeded' group by p.order_id), order_refunds as (select r.order_id, sum(r.amount) as amount from refunds r join orders o on o.order_id = r.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and r.status = 'succeeded' group by r.order_id) select coalesce((select sum(amount) from order_payments), 0) - coalesce((select sum(amount) from order_refunds), 0))""",
+    "refund_rate": """(with order_payments as (select p.order_id, sum(p.amount) as amount from payments p join orders o on o.order_id = p.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and p.status = 'succeeded' group by p.order_id), order_refunds as (select r.order_id, sum(r.amount) as amount from refunds r join orders o on o.order_id = r.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and r.status = 'succeeded' group by r.order_id) select coalesce((select sum(amount) from order_refunds), 0) / nullif((select sum(amount) from order_payments), 0))""",
+    "repeat_purchase_rate": """(with active_customers as (select distinct o.customer_id from orders o where o.ordered_at >= :start_at and o.ordered_at < :end_at and o.status in ('paid', 'completed', 'refunded')), lifetime_orders as (select o.customer_id from orders o where o.ordered_at < :end_at and o.status in ('paid', 'completed', 'refunded') group by o.customer_id having count(distinct o.order_id) >= 2) select count(lo.customer_id)::numeric / nullif(count(ac.customer_id), 0) from active_customers ac left join lifetime_orders lo on lo.customer_id = ac.customer_id)""",
+    "customer_acquisition_cost": """(with interval_attributions as (select distinct a.campaign_id, o.customer_id from campaign_attributions a join orders o on o.order_id = a.order_id where a.attributed_at >= :start_at and a.attributed_at < :end_at), campaign_spend as (select mc.campaign_id, mc.spend from marketing_campaigns mc join (select distinct campaign_id from interval_attributions) ia on ia.campaign_id = mc.campaign_id) select coalesce((select sum(spend) from campaign_spend), 0) / nullif((select count(distinct customer_id) from interval_attributions), 0))""",
+    "campaign_roi": """(with interval_revenue as (select a.campaign_id, sum(a.attributed_revenue) as amount from campaign_attributions a where a.attributed_at >= :start_at and a.attributed_at < :end_at group by a.campaign_id), campaign_spend as (select mc.campaign_id, mc.spend from marketing_campaigns mc join interval_revenue ir on ir.campaign_id = mc.campaign_id) select (coalesce((select sum(amount) from interval_revenue), 0) - coalesce((select sum(spend) from campaign_spend), 0)) / nullif((select sum(spend) from campaign_spend), 0))""",
 }
 
 METRIC_QUERIES = {
@@ -206,6 +221,7 @@ async def test_each_metric_query_is_parameterized_and_readonly(metric_id: str) -
     engine = create_async_database_engine(settings)
     try:
         async with engine.connect() as connection:
+            transaction = await connection.begin()
             try:
                 await _readonly_connection_state(connection)
                 started = perf_counter()
@@ -215,7 +231,7 @@ async def test_each_metric_query_is_parameterized_and_readonly(metric_id: str) -
                 assert elapsed < 10
                 _assert_metric_value(metric_id, value)
             finally:
-                await connection.rollback()
+                await transaction.rollback()
     finally:
         await engine.dispose()
 
@@ -227,8 +243,8 @@ async def test_campaign_spend_is_preaggregated_before_cac_and_roi() -> None:
     engine = create_async_database_engine(settings)
     comparison_query = text("""
         with interval_attributions as (
-            select a.campaign_id
-            from campaign_attributions a
+            select a.campaign_id, a.attributed_revenue, o.customer_id
+            from campaign_attributions a join orders o on o.order_id = a.order_id
             where a.attributed_at >= :start and a.attributed_at < :end
         ), preaggregated as (
             select coalesce(sum(mc.spend), 0) as spend
@@ -240,17 +256,76 @@ async def test_campaign_spend_is_preaggregated_before_cac_and_roi() -> None:
             from marketing_campaigns mc join interval_attributions ia
               on ia.campaign_id = mc.campaign_id
         )
-        select preaggregated.spend, multiplied.spend from preaggregated cross join multiplied
+        select preaggregated.spend, multiplied.spend,
+          (select sum(attributed_revenue) from interval_attributions),
+          (select count(distinct customer_id) from interval_attributions),
+          (select count(distinct campaign_id) from interval_attributions),
+          (select count(*) from interval_attributions)
+        from preaggregated cross join multiplied
     """)
     try:
         async with engine.connect() as connection:
+            transaction = await connection.begin()
             try:
                 await _readonly_connection_state(connection)
-                result = await connection.execute(comparison_query, WINDOW)
-                preaggregated, multiplied = result.one()
-                assert preaggregated >= 0
-                assert multiplied >= preaggregated
+                result = await connection.execute(comparison_query, FULL_WINDOW)
+                preaggregated, multiplied, revenue, customers, campaigns, attributions = result.one()
+                assert campaigns > 0
+                assert attributions > campaigns
+                assert customers > 0
+                assert multiplied > preaggregated
+                fixed_cac = (await connection.execute(text(METRIC_QUERIES["customer_acquisition_cost"]), FULL_WINDOW)).scalar_one()
+                fixed_roi = (await connection.execute(text(METRIC_QUERIES["campaign_roi"]), FULL_WINDOW)).scalar_one()
+                assert abs(fixed_cac - preaggregated / customers) < Decimal("0.0000000000000001")
+                assert abs(fixed_roi - (revenue - preaggregated) / preaggregated) < Decimal(
+                    "0.0000000000000001"
+                )
             finally:
-                await connection.rollback()
+                await transaction.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_trusted_catalog_scalars_match_fixed_queries_in_nonempty_window() -> None:
+    catalog = load_metric_catalog("data/metrics/core.yaml")
+    for metric_id, trusted_expression in TRUSTED_COMPLEX_EXPRESSIONS.items():
+        expected = sqlglot.parse_one(f"select {trusted_expression}", read="postgres")
+        actual = sqlglot.parse_one(f"select {catalog[metric_id].expression_sql}", read="postgres")
+        assert actual == expected
+
+    engine = create_async_database_engine(DatabaseSettings())  # type: ignore[call-arg]
+    try:
+        async with engine.connect() as connection:
+            transaction = await connection.begin()
+            try:
+                await _readonly_connection_state(connection)
+                for metric_id, trusted_expression in TRUSTED_COMPLEX_EXPRESSIONS.items():
+                    scalar = await connection.execute(
+                        text(f"select {trusted_expression} as value"), FULL_SCALAR_WINDOW
+                    )
+                    fixed = await connection.execute(text(METRIC_QUERIES[metric_id]), FULL_WINDOW)
+                    assert scalar.scalar_one() == fixed.scalar_one()
+            finally:
+                await transaction.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_june_campaign_metrics_are_null_at_zero_denominator() -> None:
+    engine = create_async_database_engine(DatabaseSettings())  # type: ignore[call-arg]
+    try:
+        async with engine.connect() as connection:
+            transaction = await connection.begin()
+            try:
+                await _readonly_connection_state(connection)
+                for metric_id in ("customer_acquisition_cost", "campaign_roi"):
+                    result = await connection.execute(text(METRIC_QUERIES[metric_id]), WINDOW)
+                    assert result.scalar_one() is None
+            finally:
+                await transaction.rollback()
     finally:
         await engine.dispose()

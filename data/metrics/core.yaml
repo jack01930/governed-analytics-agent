@@ -27,8 +27,8 @@
 - metric_id: net_revenue
   name_zh: 净收入
   name_en: Net Revenue
-  description: 同一订单窗口内成功支付额减成功退款额；支付与退款须先按订单预聚合，避免连接产生倍增。
-  expression_sql: "(select coalesce(sum(p.amount), 0) from payments p where p.status = 'succeeded') - (select coalesce(sum(r.amount), 0) from refunds r where r.status = 'succeeded')"
+  description: 标量表达式在绑定窗口内以订单时间过滤，成功支付与退款先按订单预聚合后相减，避免连接倍增；按维度分组由未来查询规划器处理。
+  expression_sql: "(with order_payments as (select p.order_id, sum(p.amount) as amount from payments p join orders o on o.order_id = p.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and p.status = 'succeeded' group by p.order_id), order_refunds as (select r.order_id, sum(r.amount) as amount from refunds r join orders o on o.order_id = r.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and r.status = 'succeeded' group by r.order_id) select coalesce((select sum(amount) from order_payments), 0) - coalesce((select sum(amount) from order_refunds), 0))"
   time_field: o.ordered_at
   default_filters: ["payment and refund amounts are pre-aggregated by order", "p.status = 'succeeded'", "r.status = 'succeeded'"]
   dimensions: [region, channel, category, product]
@@ -92,8 +92,8 @@
 - metric_id: refund_rate
   name_zh: 退款率
   name_en: Refund Rate
-  description: 匹配订单的成功退款额除以成功支付额；两个金额必须先按订单预聚合，比例以0到1表示。
-  expression_sql: "(select coalesce(sum(r.amount), 0) from refunds r where r.status = 'succeeded') / nullif((select sum(p.amount) from payments p where p.status = 'succeeded'), 0)"
+  description: 标量表达式在绑定订单窗口内以匹配订单的成功退款额除以成功支付额，两个金额先按订单预聚合；按维度分组由未来查询规划器处理。
+  expression_sql: "(with order_payments as (select p.order_id, sum(p.amount) as amount from payments p join orders o on o.order_id = p.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and p.status = 'succeeded' group by p.order_id), order_refunds as (select r.order_id, sum(r.amount) as amount from refunds r join orders o on o.order_id = r.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and r.status = 'succeeded' group by r.order_id) select coalesce((select sum(amount) from order_refunds), 0) / nullif((select sum(amount) from order_payments), 0))"
   time_field: o.ordered_at
   default_filters: ["payment and refund amounts are pre-aggregated by order", "p.status = 'succeeded'", "r.status = 'succeeded'"]
   dimensions: [category, product, region]
@@ -131,8 +131,8 @@
 - metric_id: repeat_purchase_rate
   name_zh: 复购率
   name_en: Repeat Purchase Rate
-  description: 截至窗口结束累计至少两笔有效订单的窗口活跃客户数，除以窗口活跃客户数，比例以0到1表示。
-  expression_sql: "count(distinct o.customer_id) filter (where o.status in ('paid', 'completed', 'refunded'))::numeric / nullif(count(distinct o.customer_id), 0)"
+  description: 标量表达式以绑定窗口的活跃客户为分母，以截至窗口结束累计至少两笔有效订单的活跃客户为分子；按维度分组由未来查询规划器处理。
+  expression_sql: "(with active_customers as (select distinct o.customer_id from orders o where o.ordered_at >= :start_at and o.ordered_at < :end_at and o.status in ('paid', 'completed', 'refunded')), lifetime_orders as (select o.customer_id from orders o where o.ordered_at < :end_at and o.status in ('paid', 'completed', 'refunded') group by o.customer_id having count(distinct o.order_id) >= 2) select count(lo.customer_id)::numeric / nullif(count(ac.customer_id), 0) from active_customers ac left join lifetime_orders lo on lo.customer_id = ac.customer_id)"
   time_field: o.ordered_at
   default_filters: ["numerator uses lifetime valid orders through interval end", "denominator uses interval active customers"]
   dimensions: [region, segment]
@@ -144,8 +144,8 @@
 - metric_id: customer_acquisition_cost
   name_zh: 客户获取成本
   name_en: Customer Acquisition Cost
-  description: 窗口内有归因的活动支出先按活动唯一预聚合，再除以归因订单的去重客户数；不得使用sum(distinct spend)。
-  expression_sql: "(select sum(mc.spend) from marketing_campaigns mc where exists (select 1 from campaign_attributions a where a.campaign_id = mc.campaign_id)) / nullif((select count(distinct o.customer_id) from campaign_attributions a join orders o on o.order_id = a.order_id), 0)"
+  description: 标量表达式以绑定归因窗口中参与活动的每活动一次支出除以去重归因客户数，禁止sum(distinct spend)；按维度分组由未来查询规划器处理。
+  expression_sql: "(with interval_attributions as (select distinct a.campaign_id, o.customer_id from campaign_attributions a join orders o on o.order_id = a.order_id where a.attributed_at >= :start_at and a.attributed_at < :end_at), campaign_spend as (select mc.campaign_id, mc.spend from marketing_campaigns mc join (select distinct campaign_id from interval_attributions) ia on ia.campaign_id = mc.campaign_id) select coalesce((select sum(spend) from campaign_spend), 0) / nullif((select count(distinct customer_id) from interval_attributions), 0))"
   time_field: a.attributed_at
   default_filters: ["campaign spend is pre-aggregated once per campaign", "attribution falls in interval"]
   dimensions: [campaign, channel]
@@ -183,8 +183,8 @@
 - metric_id: campaign_roi
   name_zh: 活动投资回报率
   name_en: Campaign Return on Investment
-  description: 窗口内归因收入减按活动唯一预聚合的活动支出，再除以活动支出；零支出返回空值，结果可为负或大于1。
-  expression_sql: "((select sum(a.attributed_revenue) from campaign_attributions a) - (select sum(mc.spend) from marketing_campaigns mc)) / nullif((select sum(mc.spend) from marketing_campaigns mc), 0)"
+  description: 标量表达式先按绑定窗口的活动聚合归因收入，活动支出每活动只计一次；零支出返回空值，结果可为负或大于1，按维度分组由未来查询规划器处理。
+  expression_sql: "(with interval_revenue as (select a.campaign_id, sum(a.attributed_revenue) as amount from campaign_attributions a where a.attributed_at >= :start_at and a.attributed_at < :end_at group by a.campaign_id), campaign_spend as (select mc.campaign_id, mc.spend from marketing_campaigns mc join interval_revenue ir on ir.campaign_id = mc.campaign_id) select (coalesce((select sum(amount) from interval_revenue), 0) - coalesce((select sum(spend) from campaign_spend), 0)) / nullif((select sum(spend) from campaign_spend), 0))"
   time_field: a.attributed_at
   default_filters: ["campaign spend is pre-aggregated once per campaign", "attribution falls in interval", "zero spend returns null"]
   dimensions: [campaign, channel]
