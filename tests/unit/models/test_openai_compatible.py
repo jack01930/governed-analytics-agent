@@ -124,6 +124,12 @@ async def test_live_adapter_makes_exactly_one_call_and_sanitizes_sdk_failures() 
         (_response(content='{"sql":"select 1","assumptions":[],"extra":true}'), "invalid_content"),
         (_response(content='{"sql":" select 1","assumptions":[]}'), "invalid_content"),
         (_response(content='{"sql":"delete from orders","assumptions":[]}'), "invalid_content"),
+        (_response(content='{"sql":"selective_not_a_query","assumptions":[]}'), "invalid_content"),
+        (
+            _response(content='{"sql":"withholding_not_a_query","assumptions":[]}'),
+            "invalid_content",
+        ),
+        (_response(content='{"sql":"SELECTive_not_a_query","assumptions":[]}'), "invalid_content"),
         (_response(content='{"sql":"select 1","assumptions":[1]}'), "invalid_content"),
         (_response(content='{"sql":"select 1","assumptions":[" "]}'), "invalid_content"),
         (
@@ -181,6 +187,22 @@ def test_live_adapter_rejects_invalid_requested_model(model: object) -> None:
 def test_model_settings_reject_invalid_or_credentialed_urls(base_url: str) -> None:
     with pytest.raises(ValidationError):
         ModelSettings(model_base_url=base_url, _env_file=None)  # type: ignore[call-arg]
+
+
+def test_model_settings_do_not_echo_rejected_url_credentials() -> None:
+    username = "model-user"
+    password = "leaked-password"
+    rejected_url = f"https://{username}:{password}@provider.example/v1"
+
+    with pytest.raises(ValidationError) as error:
+        ModelSettings(model_base_url=rejected_url, _env_file=None)  # type: ignore[call-arg]
+
+    public_error = str(error.value)
+    assert username not in public_error
+    assert password not in public_error
+    assert rejected_url not in public_error
+    assert username not in str(error.value.errors())
+    assert password not in error.value.json()
 
 
 def test_model_settings_are_frozen_and_allow_local_http_without_unwrapping_secret() -> None:

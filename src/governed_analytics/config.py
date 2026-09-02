@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from urllib.parse import unquote, urlsplit
 
 from pydantic import SecretStr, field_validator, model_validator
@@ -89,6 +90,7 @@ class ModelSettings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
+        hide_input_in_errors=True,
     )
 
     model_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -96,33 +98,53 @@ class ModelSettings(BaseSettings):
     model_name: str = "qwen3.7-plus"
     eval_model_name: str = "qwen3.7-plus-2026-05-26"
 
+    @model_validator(mode="before")
+    @classmethod
+    def redact_invalid_model_base_url(cls, data: object) -> object:
+        if not isinstance(data, Mapping) or "model_base_url" not in data:
+            return data
+        if _model_base_url_error(data["model_base_url"]) is None:
+            return data
+        sanitized_data = dict(data)
+        sanitized_data["model_base_url"] = "<invalid model base URL>"
+        return sanitized_data
+
     @field_validator("model_base_url")
     @classmethod
     def validate_model_base_url(cls, model_base_url: str) -> str:
-        try:
-            parsed_url = urlsplit(model_base_url)
-            hostname = parsed_url.hostname
-            _ = parsed_url.port
-        except ValueError as error:
-            raise ValueError("model base URL must be valid") from error
-        if (
-            not hostname
-            or parsed_url.username is not None
-            or parsed_url.password is not None
-            or parsed_url.query
-            or parsed_url.fragment
-            or "?" in model_base_url
-            or "#" in model_base_url
-        ):
-            raise ValueError("model base URL must not include credentials, query, or fragment")
-        if parsed_url.scheme == "https":
-            return model_base_url
-        if parsed_url.scheme == "http" and hostname.lower() in {"localhost", "127.0.0.1", "::1"}:
-            return model_base_url
-        raise ValueError("model base URL must use HTTPS except for loopback HTTP")
+        error = _model_base_url_error(model_base_url)
+        if error is not None:
+            raise ValueError(error)
+        return model_base_url
 
     @model_validator(mode="after")
     def validate_model_names(self) -> "ModelSettings":
         if not self.model_name.strip() or not self.eval_model_name.strip():
             raise ValueError("model names must not be blank")
         return self
+
+
+def _model_base_url_error(model_base_url: object) -> str | None:
+    if not isinstance(model_base_url, str):
+        return "model base URL must be a string"
+    try:
+        parsed_url = urlsplit(model_base_url)
+        hostname = parsed_url.hostname
+        _ = parsed_url.port
+    except ValueError:
+        return "model base URL must be valid"
+    if (
+        not hostname
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or parsed_url.query
+        or parsed_url.fragment
+        or "?" in model_base_url
+        or "#" in model_base_url
+    ):
+        return "model base URL must not include credentials, query, or fragment"
+    if parsed_url.scheme == "https":
+        return None
+    if parsed_url.scheme == "http" and hostname.lower() in {"localhost", "127.0.0.1", "::1"}:
+        return None
+    return "model base URL must use HTTPS except for loopback HTTP"

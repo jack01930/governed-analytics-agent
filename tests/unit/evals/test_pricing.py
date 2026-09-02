@@ -112,3 +112,16 @@ def test_pricing_loader_is_cwd_independent_and_sanitizes_unreadable_inputs(
     with pytest.raises(PricingContractError, match="unreadable") as error:
         load_model_pricing(broken)
     assert "utf" not in str(error.value).lower()
+
+
+def test_pricing_loader_sanitizes_unhashable_yaml_mapping_keys(tmp_path: Path) -> None:
+    path = tmp_path / "unhashable-key.yaml"
+    path.write_text("? [a, b]\n: value\n", encoding="utf-8")
+
+    with pytest.raises(
+        PricingContractError, match=r"^pricing metadata (invalid|malformed)$"
+    ) as error:
+        load_model_pricing(path)
+
+    assert error.value.__cause__ is None
+    assert "unhashable" not in str(error.value).lower()

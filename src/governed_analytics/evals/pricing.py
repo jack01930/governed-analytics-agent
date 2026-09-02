@@ -127,7 +127,7 @@ def load_model_pricing(path: str | Path) -> ModelPricing:
         document = yaml.load(raw_text, Loader=_UniqueKeySafeLoader)
     except _DuplicatePricingKeyError:
         raise PricingContractError("pricing metadata duplicate keys") from None
-    except yaml.YAMLError:
+    except (TypeError, yaml.YAMLError):
         raise PricingContractError("pricing metadata malformed") from None
     if not isinstance(document, Mapping):
         raise PricingContractError("pricing metadata invalid")

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from time import monotonic
 
+import sqlglot
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError, field_validator
+from sqlglot import exp
 
 from governed_analytics.evals.models import GeneratedSql
 from governed_analytics.models.prompts import BASELINE_SYSTEM_PROMPT_V1, build_baseline_user_prompt
@@ -28,7 +31,7 @@ class _ProviderSqlResponse(BaseModel):
     @field_validator("sql")
     @classmethod
     def validate_sql(cls, sql: str) -> str:
-        if not sql.strip() or not sql.lower().startswith(("select", "with")):
+        if not _is_single_postgres_query(sql):
             raise ValueError("invalid SQL")
         return sql
 
@@ -42,6 +45,17 @@ class _ProviderSqlResponse(BaseModel):
 
 def _error(category: str) -> ModelAdapterError:
     return ModelAdapterError(category)
+
+
+def _is_single_postgres_query(sql: str) -> bool:
+    """Keep malformed provider SQL at the adapter boundary, before the SQL guard."""
+    if re.match(r"(?i)^(?:select|with)\b", sql) is None:
+        return False
+    try:
+        statements = sqlglot.parse(sql, read="postgres")
+    except sqlglot.errors.SqlglotError:
+        return False
+    return len(statements) == 1 and isinstance(statements[0], exp.Query)
 
 
 def _strict_positive_integer(value: object) -> int | None:
