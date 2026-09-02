@@ -12,7 +12,7 @@ from governed_analytics.evals.models import GeneratedSql
 class SqlGenerationRequest(BaseModel):
     """Immutable, fully specified input to a SQL generator."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     case_id: str = Field(pattern=r"^G[0-9]{3}$")
     question: str = Field(min_length=1)

@@ -18,6 +18,10 @@ _EXPECTED_CASE_IDS = tuple(f"G{number:03d}" for number in range(1, 21))
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
+class FixtureContractError(ValueError):
+    """Stable, sanitized public error for invalid offline fixture contracts."""
+
+
 def _resolve_from_repository(path: str | Path) -> Path:
     candidate = Path(path)
     return candidate if candidate.is_absolute() else _REPOSITORY_ROOT / candidate
@@ -27,7 +31,7 @@ def _reject_duplicate_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
     object_value: dict[str, Any] = {}
     for key, value in pairs:
         if key in object_value:
-            raise ValueError("invalid fixture: duplicate JSON key")
+            raise FixtureContractError("invalid fixture: duplicate JSON key")
         object_value[key] = value
     return object_value
 
@@ -37,35 +41,48 @@ def _read_fixture(path: Path) -> Mapping[str, Any]:
         parsed = json.loads(
             path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys
         )
-    except OSError as error:
-        raise ValueError("invalid fixture: unreadable") from error
+    except (OSError, UnicodeDecodeError) as error:
+        raise FixtureContractError("invalid fixture: unreadable") from error
     except json.JSONDecodeError as error:
-        raise ValueError("invalid fixture: malformed JSON") from error
+        raise FixtureContractError("invalid fixture: malformed JSON") from error
     if not isinstance(parsed, dict):
-        raise ValueError("invalid fixture: top level must be an object")
+        raise FixtureContractError("invalid fixture: top level must be an object")
     return parsed
 
 
 def _parse_query(sql: str) -> exp.Query:
     if not sql.strip():
-        raise ValueError("invalid fixture: invalid SQL")
+        raise FixtureContractError("invalid fixture: invalid SQL")
+    if sql.lstrip() != sql or not sql.lower().startswith(("select", "with")):
+        raise FixtureContractError("invalid fixture: SQL must begin with select or with")
     try:
         statements = sqlglot.parse(sql, read="postgres")
     except sqlglot.errors.ParseError as error:
-        raise ValueError("invalid fixture: invalid SQL") from error
+        raise FixtureContractError("invalid fixture: invalid SQL") from error
     if len(statements) != 1 or not isinstance(statements[0], exp.Query):
-        raise ValueError("invalid fixture: invalid SQL")
+        raise FixtureContractError("invalid fixture: invalid SQL")
     return statements[0]
 
 
-def _canonical_oracle_query(case_id: str) -> exp.Query:
+def _canonical_oracle_body(case_id: str) -> str:
     path = _REPOSITORY_ROOT / "evals" / "datasets" / "golden" / "sql" / f"{case_id}.sql"
     try:
-        statements = sqlglot.parse(path.read_text(encoding="utf-8"), read="postgres")
-    except (OSError, sqlglot.errors.ParseError) as error:
-        raise ValueError("invalid fixture: canonical Oracle unavailable") from error
+        canonical_sql = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise FixtureContractError("invalid fixture: canonical Oracle unavailable") from error
+    split_sql = canonical_sql.split("\n", 1)
+    if len(split_sql) != 2:
+        raise FixtureContractError("invalid fixture: canonical Oracle unavailable")
+    return split_sql[1]
+
+
+def _canonical_oracle_query(case_id: str) -> exp.Query:
+    try:
+        statements = sqlglot.parse(_canonical_oracle_body(case_id), read="postgres")
+    except sqlglot.errors.ParseError as error:
+        raise FixtureContractError("invalid fixture: canonical Oracle unavailable") from error
     if len(statements) != 1 or not isinstance(statements[0], exp.Query):
-        raise ValueError("invalid fixture: canonical Oracle unavailable")
+        raise FixtureContractError("invalid fixture: canonical Oracle unavailable")
     return statements[0]
 
 
@@ -79,14 +96,16 @@ def _normalized_query_sql(query: exp.Query) -> str:
 
 def _validate_full_fixture(sql_by_case_id: Mapping[str, Any]) -> dict[str, str]:
     if tuple(sql_by_case_id) != _EXPECTED_CASE_IDS:
-        raise ValueError("invalid fixture: case IDs must be exactly G001 through G020")
+        raise FixtureContractError("invalid fixture: case IDs must be exactly G001 through G020")
 
     validated: dict[str, str] = {}
     for case_id in _EXPECTED_CASE_IDS:
         sql = sql_by_case_id[case_id]
         if not isinstance(sql, str):
-            raise ValueError("invalid fixture: invalid SQL")
+            raise FixtureContractError("invalid fixture: invalid SQL")
         fixture_query = _parse_query(sql)
+        if sql != _canonical_oracle_body(case_id):
+            raise FixtureContractError("invalid fixture: Oracle body mismatch")
         if _normalized_query_sql(fixture_query) != _normalized_query_sql(
             _canonical_oracle_query(case_id)
         ):
@@ -121,7 +140,7 @@ class FixtureSqlGenerator:
         try:
             sql = self._sql_by_case_id[request.case_id]
         except KeyError as error:
-            raise ValueError("fixture SQL unavailable") from error
+            raise FixtureContractError("fixture SQL unavailable") from error
         return GeneratedSql(
             sql=sql,
             assumptions=(),

@@ -10,6 +10,8 @@ BASELINE_SYSTEM_PROMPT_V1 = (
     "Use only tables and columns in SCHEMA CONTEXT and metric rules in METRIC CONTEXT.\n"
     "Use half-open UTC time intervals. Do not invent columns or metrics.\n"
     'Return one JSON object with keys "sql" and "assumptions".\n'
+    "Do not provide chain-of-thought or hidden reasoning. "
+    "Assumptions may contain only short business assumptions.\n"
     "The SQL must be one SELECT or WITH query. Do not include Markdown fences."
 )
 

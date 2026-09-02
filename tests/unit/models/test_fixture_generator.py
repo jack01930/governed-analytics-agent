@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from sqlglot import exp
 
 from governed_analytics.evals.golden import load_golden_cases
-from governed_analytics.models.fixtures import FixtureSqlGenerator
+from governed_analytics.models.fixtures import FixtureContractError, FixtureSqlGenerator
 from governed_analytics.models.prompts import (
     BASELINE_PROMPT_VERSION,
     BASELINE_SYSTEM_PROMPT_V1,
@@ -70,6 +70,11 @@ def test_request_is_frozen_strict_and_rejects_blank_versioned_fields() -> None:
             SqlGenerationRequest.model_validate({**request.model_dump(), field: " \t "})
     with pytest.raises(ValidationError, match="pattern"):
         SqlGenerationRequest.model_validate({**request.model_dump(), "case_id": "G1"})
+    for field in ("case_id", "question", "schema_context", "metric_context"):
+        with pytest.raises(ValidationError, match="string_type"):
+            SqlGenerationRequest.model_validate({**request.model_dump(), field: b"G001"})
+        with pytest.raises(ValidationError, match="string_type"):
+            SqlGenerationRequest.model_validate({**request.model_dump(), field: 1})
 
 
 def test_prompt_is_pinned_and_deterministic() -> None:
@@ -81,6 +86,8 @@ def test_prompt_is_pinned_and_deterministic() -> None:
         "Use only tables and columns in SCHEMA CONTEXT and metric rules in METRIC CONTEXT.\n"
         "Use half-open UTC time intervals. Do not invent columns or metrics.\n"
         'Return one JSON object with keys "sql" and "assumptions".\n'
+        "Do not provide chain-of-thought or hidden reasoning. "
+        "Assumptions may contain only short business assumptions.\n"
         "The SQL must be one SELECT or WITH query. Do not include Markdown fences."
     )
     assert build_baseline_user_prompt(request) == (
@@ -103,6 +110,7 @@ def test_fixture_has_exact_coverage_and_normalized_ast_equality_to_oracles() -> 
         fixture_sql = fixture[case.case_id]
         oracle_sql = case.oracle_sql_path.read_text(encoding="utf-8")
         assert fixture_sql.lower().startswith(("select", "with"))
+        assert fixture_sql == oracle_sql.split("\n", 1)[1]
         fixture_ast = sqlglot.parse_one(fixture_sql, read="postgres")
         oracle_ast = sqlglot.parse_one(oracle_sql, read="postgres")
         assert _normalized_sql(fixture_ast) == _normalized_sql(oracle_ast)
@@ -129,7 +137,7 @@ def test_fixture_generator_satisfies_sql_generator_protocol() -> None:
         (_invalid_full_fixture(""), "invalid SQL"),
         (_invalid_full_fixture(1), "invalid SQL"),
         (_invalid_full_fixture("select 1; select 2"), "invalid SQL"),
-        (_invalid_full_fixture("delete from orders"), "invalid SQL"),
+        (_invalid_full_fixture("delete from orders"), "must begin with select or with"),
         ("{", "malformed JSON"),
     ],
 )
@@ -139,10 +147,34 @@ def test_fixture_loader_rejects_invalid_contracts_without_echoing_contents(
     fixture_path = tmp_path / "fixture.json"
     fixture_path.write_text(content, encoding="utf-8")
 
-    with pytest.raises(ValueError, match=message) as error:
+    with pytest.raises(FixtureContractError, match=message) as error:
         FixtureSqlGenerator.from_path(fixture_path)
 
     assert "select 2" not in str(error.value)
+
+
+@pytest.mark.parametrize("preamble", ("-- injected comment\n", " \n\t"))
+def test_fixture_loader_rejects_comment_and_whitespace_preambles(
+    tmp_path: Path, preamble: str
+) -> None:
+    fixture = json.loads(Path(FIXTURE_PATH).read_text(encoding="utf-8"))
+    fixture["G001"] = preamble + fixture["G001"]
+    fixture_path = tmp_path / "preamble.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    with pytest.raises(FixtureContractError, match="must begin with select or with"):
+        FixtureSqlGenerator.from_path(fixture_path)
+
+
+def test_fixture_loader_sanitizes_non_utf8_content(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "non-utf8.json"
+    fixture_path.write_bytes(b'{"G001": "\xff"}')
+
+    with pytest.raises(FixtureContractError, match="unreadable") as error:
+        FixtureSqlGenerator.from_path(fixture_path)
+
+    assert "utf" not in str(error.value).lower()
+    assert "\\xff" not in str(error.value)
 
 
 def test_fixture_loader_is_cwd_independent_and_rejects_oracle_drift(
@@ -157,7 +189,7 @@ def test_fixture_loader_is_cwd_independent_and_rejects_oracle_drift(
     fixture_path = tmp_path / "drift.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Oracle equivalence"):
+    with pytest.raises(FixtureContractError, match="Oracle body mismatch"):
         FixtureSqlGenerator.from_path(fixture_path)
 
 
