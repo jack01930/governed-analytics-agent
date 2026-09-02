@@ -72,6 +72,12 @@ def _has_forbidden_content(query: exp.Query) -> bool:
     for node in query.walk():
         if isinstance(node, _FORBIDDEN_NODE_TYPES):
             return True
+        if (
+            isinstance(node, exp.Fetch)
+            and isinstance(node.args.get("limit_options"), exp.LimitOptions)
+            and node.args["limit_options"].args.get("with_ties") is True
+        ):
+            return True
         if isinstance(node, exp.Func) and node.name.lower() in _DANGEROUS_FUNCTIONS:
             return True
     return False

@@ -102,6 +102,25 @@ def test_guard_preserves_offset_with_safe_outer_fetch_cap() -> None:
     assert "OFFSET 3" in validated
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select 'unique-fetch-ties-secret' as value order by value fetch first 1 row with ties",
+        "select 1 fetch next 500 rows with ties",
+        "select 1 fetch first 501 rows with ties",
+        "select 1 fetch next $1 rows with ties",
+    ],
+)
+def test_guard_rejects_every_outer_fetch_with_ties_without_leaking_sql(sql: str) -> None:
+    with pytest.raises(SqlRejected) as raised:
+        validate_baseline_sql(sql)
+
+    assert type(raised.value) is SqlRejected
+    assert str(raised.value) == "baseline SQL rejected"
+    assert "unique-fetch-ties-secret" not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
 def test_guard_output_reparses_as_one_capped_query_without_forbidden_nodes() -> None:
     validated = validate_baseline_sql(
         "with ids as (select category_id from categories limit 5) select * from ids"

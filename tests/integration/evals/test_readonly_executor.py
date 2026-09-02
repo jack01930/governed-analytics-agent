@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.exc import DBAPIError
 
 from governed_analytics.evals import executor
+from governed_analytics.evals.sql_guard import SqlRejected
 
 
 @pytest.mark.integration
@@ -35,6 +36,12 @@ async def test_readonly_executor_sets_all_runtime_defenses_and_caps_rows() -> No
         "select generate_series(1, 1000) as value fetch first 10 rows only"
     )
     assert len(fetched_rows.rows) == 10
+
+    with pytest.raises(SqlRejected, match=r"^baseline SQL rejected$"):
+        await executor.execute_readonly_sql(
+            "select 1 as value from generate_series(1, 1000) order by value "
+            "fetch first 1 row with ties"
+        )
 
 
 @pytest.mark.integration
