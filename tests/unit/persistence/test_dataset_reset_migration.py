@@ -1,5 +1,6 @@
 """Static guardrails for the privileged dataset reset migration."""
 
+import re
 from pathlib import Path
 
 
@@ -25,7 +26,17 @@ def test_reset_function_is_fixed_scope_and_defensive() -> None:
     assert "create function public.reset_analytics_dataset()" in migration
     assert "security definer" in migration
     assert "set search_path = pg_catalog" in migration
-    assert all(table in migration for table in expected_tables)
+    truncate = re.search(
+        r"truncate\s+table\s+(?P<relations>.*?)\s+restart\s+identity",
+        migration,
+        flags=re.DOTALL,
+    )
+    assert truncate is not None
+    relations = tuple(
+        re.sub(r"\s+", " ", relation).strip()
+        for relation in truncate.group("relations").split(",")
+    )
+    assert relations == expected_tables
     assert "restart identity" in migration
     assert "cascade" not in migration
     assert "execute format" not in migration

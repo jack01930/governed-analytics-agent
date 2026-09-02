@@ -8,7 +8,11 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd  # type: ignore[import-untyped]
+
+CSV_NULL = r"\N"
+_FILE_HASH_CHUNK_SIZE = 1024 * 1024
 
 
 def _format_datetime(value: datetime) -> str:
@@ -20,10 +24,18 @@ def _format_datetime(value: datetime) -> str:
     return value.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _format_value(value: object) -> object:
+def _format_value(value: object, *, string_null: bool = False) -> object:
     """Return a CSV-safe scalar while preserving the dataset type contract."""
     if value is None or value is pd.NA or value is pd.NaT:
-        return ""
+        return CSV_NULL
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, (float, np.floating)):
+        if string_null and np.isnan(value):
+            return CSV_NULL
+        raise ValueError("float values are not canonical; use Decimal or an integer")
+    if isinstance(value, str) and value == CSV_NULL:
+        raise ValueError("string value equals reserved NULL sentinel \\N")
     if isinstance(value, pd.Timestamp):
         return _format_datetime(value.to_pydatetime())
     if isinstance(value, datetime):
@@ -33,11 +45,18 @@ def _format_value(value: object) -> object:
         if rounded != value:
             raise ValueError("Decimal values must have at most two decimal places")
         return format(rounded, ".2f")
-    if isinstance(value, bool):
-        return "True" if value else "False"
     if pd.isna(value):
-        return ""
+        return CSV_NULL
     return value
+
+
+def sha256_file(path: Path) -> str:
+    """Return a file digest while keeping the peak extra memory bounded to one MiB."""
+    digest = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(_FILE_HASH_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def write_canonical_csv(
@@ -63,13 +82,21 @@ def write_canonical_csv(
         raise ValueError("CSV output columns must be unique")
 
     canonical = frame.sort_values(list(sort_by), kind="stable")
+    string_nulls = tuple(
+        isinstance(canonical[column].dtype, pd.StringDtype) for column in output_columns
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as target:
         output = csv.writer(target, lineterminator="\n")
         output.writerow(output_columns)
         for row in canonical.loc[:, output_columns].itertuples(index=False, name=None):
-            output.writerow([_format_value(value) for value in row])
-    return sha256(path.read_bytes()).hexdigest()
+            output.writerow(
+                [
+                    _format_value(value, string_null=string_null)
+                    for value, string_null in zip(row, string_nulls, strict=True)
+                ]
+            )
+    return sha256_file(path)
 
 
 def write_canonical_json(value: Any, path: Path) -> str:

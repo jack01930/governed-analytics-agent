@@ -14,6 +14,7 @@ from psycopg import sql
 
 from governed_analytics.config import LoaderDatabaseSettings
 from governed_analytics.data_generation.models import TableDigest
+from governed_analytics.data_generation.writer import CSV_NULL
 
 _COPY_CHUNK_SIZE = 1024 * 1024
 
@@ -197,8 +198,10 @@ def _table_identifier(spec: TableSpec) -> sql.Identifier:
 
 def _copy_from_csv(connection: psycopg.Connection[Any], spec: TableSpec, csv_path: Path) -> None:
     _validate_csv_header(csv_path, spec)
-    statement = sql.SQL("COPY {} ({}) FROM STDIN WITH (FORMAT CSV, HEADER TRUE)").format(
-        _table_identifier(spec), sql.SQL(", ").join(map(sql.Identifier, spec.columns))
+    statement = sql.SQL("COPY {} ({}) FROM STDIN WITH (FORMAT CSV, HEADER TRUE, NULL {})").format(
+        _table_identifier(spec),
+        sql.SQL(", ").join(map(sql.Identifier, spec.columns)),
+        sql.Literal(CSV_NULL),
     )
     with (
         connection.cursor() as cursor,
@@ -215,7 +218,9 @@ def _database_digest(connection: psycopg.Connection[Any], spec: TableSpec) -> Ta
     query = sql.SQL("SELECT {} FROM {} ORDER BY {}").format(
         columns, table, sql.Identifier(spec.identity_column)
     )
-    copy_statement = sql.SQL("COPY ({}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)").format(query)
+    copy_statement = sql.SQL("COPY ({}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE, NULL {})").format(
+        query, sql.Literal(CSV_NULL)
+    )
     digest = sha256()
     with connection.cursor() as cursor, cursor.copy(copy_statement) as copy:
         for chunk in copy:

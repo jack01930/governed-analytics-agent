@@ -4,6 +4,7 @@ import json
 from hashlib import sha256
 from pathlib import Path
 
+import pandas as pd  # type: ignore[import-untyped]
 import psycopg
 import pytest
 from psycopg import sql
@@ -12,10 +13,12 @@ from governed_analytics.config import LoaderDatabaseSettings
 from governed_analytics.data_generation.loader import (
     TABLE_LOAD_ORDER,
     TABLE_SPECS,
+    _copy_from_csv,
     _psycopg_dsn,
     load_csvs,
 )
 from governed_analytics.data_generation.pipeline import generate_and_load
+from governed_analytics.data_generation.writer import CSV_NULL, write_canonical_csv
 
 
 def _scalar(statement: str) -> int:
@@ -36,9 +39,9 @@ def _database_digest(table_name: str) -> str:
     table = sql.Identifier("public", table_name)
     columns = sql.SQL(", ").join(map(sql.Identifier, spec.columns))
     statement = sql.SQL(
-        "COPY (SELECT {} FROM {} ORDER BY {}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)"
+        "COPY (SELECT {} FROM {} ORDER BY {}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE, NULL {})"
     ).format(
-        columns, table, sql.Identifier(spec.identity_column)
+        columns, table, sql.Identifier(spec.identity_column), sql.Literal(CSV_NULL)
     )
     digest = sha256()
     settings = LoaderDatabaseSettings()  # type: ignore[call-arg]
@@ -118,3 +121,42 @@ def test_failed_copy_rolls_back_to_prior_dataset(tmp_path: Path) -> None:
         load_csvs(csv_paths)
 
     assert _scalar("SELECT count(*) FROM public.categories") == prior_categories
+
+
+@pytest.mark.integration
+def test_copy_preserves_empty_text_and_null_sentinel_in_one_rolled_back_transaction(
+    tmp_path: Path,
+) -> None:
+    csv_path = tmp_path / "pipeline_runs.csv"
+    frame = pd.DataFrame(
+        {
+            "pipeline_name": ["empty-error-code", "null-error-code"],
+            "started_at": [
+                "2025-01-01T00:00:00Z",
+                "2025-01-01T00:01:00Z",
+            ],
+            "finished_at": [None, None],
+            "status": ["succeeded", "succeeded"],
+            "watermark": [None, None],
+            "row_count": pd.Series([None, None], dtype="Int64"),
+            "error_code": ["", None],
+        }
+    )
+    write_canonical_csv(frame, csv_path, sort_by=("pipeline_name",))
+
+    settings = LoaderDatabaseSettings()  # type: ignore[call-arg]
+    with psycopg.connect(_psycopg_dsn(settings.loader_database_url)) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL search_path = public, pg_catalog")
+            cursor.execute("SET LOCAL TIME ZONE 'UTC'")
+            cursor.execute("SELECT public.reset_analytics_dataset()")
+        _copy_from_csv(connection, TABLE_SPECS["pipeline_runs"], csv_path)
+        rows = connection.execute(
+            """
+            select pipeline_name, error_code, error_code is null
+            from public.pipeline_runs
+            order by pipeline_name
+            """
+        ).fetchall()
+        assert rows == [("empty-error-code", "", False), ("null-error-code", None, True)]
+        connection.rollback()
