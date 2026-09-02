@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -54,6 +55,26 @@ class BaselineCaseResult(_FrozenWireModel):
     estimated_cost_cny: Decimal = Field(ge=0)
     error_type: str | None = None
 
+    @model_validator(mode="after")
+    def _validate_status_contract(self) -> BaselineCaseResult:
+        if self.status == "passed" and self.score != Decimal("1"):
+            raise ValueError("passed cases must have score 1")
+        if self.status == "wrong_answer" and self.score >= Decimal("1"):
+            raise ValueError("wrong_answer cases must have score below 1")
+        is_error = self.status in {"invalid_sql", "execution_error"}
+        if is_error and self.score != Decimal("0"):
+            raise ValueError("error cases must have score 0")
+        if is_error and self.error_type is None:
+            raise ValueError("error cases require an error_type category")
+        if not is_error and self.error_type is not None:
+            raise ValueError("non-error cases cannot have an error_type")
+        if (
+            self.error_type is not None
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", self.error_type) is None
+        ):
+            raise ValueError("error_type must be a stable safe category")
+        return self
+
 
 class GeneratedSql(_FrozenWireModel):
     sql: str = Field(min_length=1)
@@ -78,9 +99,9 @@ class QueryResult(_FrozenWireModel):
 
 
 class BaselineRunReport(_FrozenWireModel):
-    run_id: str = Field(min_length=1)
+    run_id: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
     mode: Literal["fixture", "live"]
-    dataset_id: str = Field(min_length=1)
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     model: str = Field(min_length=1)
     prompt_version: str = Field(min_length=1)
     requested_model: str = Field(min_length=1)
@@ -92,9 +113,16 @@ class BaselineRunReport(_FrozenWireModel):
     cases: tuple[BaselineCaseResult, ...]
 
     @model_validator(mode="after")
-    def _validate_resolved_models(self) -> BaselineRunReport:
+    def _validate_report_contract(self) -> BaselineRunReport:
+        if self.model != self.requested_model:
+            raise ValueError("model must equal requested_model")
         if tuple(sorted(set(self.resolved_models))) != self.resolved_models:
             raise ValueError("resolved_models must be a sorted, unique tuple")
         if any(not model for model in self.resolved_models):
             raise ValueError("resolved_models cannot contain empty values")
+        if not self.cases:
+            raise ValueError("baseline reports require at least one case")
+        case_ids = tuple(case.case_id for case in self.cases)
+        if len(set(case_ids)) != len(case_ids):
+            raise ValueError("baseline reports cannot contain duplicate case IDs")
         return self
