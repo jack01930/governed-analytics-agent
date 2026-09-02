@@ -12,4 +12,4 @@ def test_database_is_at_expected_alembic_head() -> None:
             "select version_num from alembic_version order by version_num"
         ).fetchall()
 
-    assert revisions == [("0002",)]
+    assert revisions == [("0003",)]
