@@ -26,6 +26,8 @@ class GoldenCase(_FrozenWireModel):
 
     @model_validator(mode="after")
     def _validate_comparison_metadata(self) -> GoldenCase:
+        if not self.question.strip() or not self.category.strip():
+            raise ValueError("question and category must not be blank")
         if len(set(self.key_columns)) != len(self.key_columns):
             raise ValueError("key_columns must not contain duplicates")
         if len(set(self.numeric_columns)) != len(self.numeric_columns):

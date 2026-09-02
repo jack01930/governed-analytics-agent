@@ -77,7 +77,10 @@ def test_critical_oracles_preserve_governed_metric_semantics() -> None:
         for case_id in ("G006", "G009", "G016", "G019", "G020")
     }
 
-    assert "current_value - previous_value as delta" in sql_by_id["G006"]
+    assert (
+        "coalesce(sku_gmv.current_value, 0) - coalesce(sku_gmv.previous_value, 0)"
+        in sql_by_id["G006"]
+    )
     assert all(
         token in sql_by_id["G006"] for token in ("south_conversion", "SKU-000001", "SKU-000002")
     )
@@ -92,6 +95,25 @@ def test_critical_oracles_preserve_governed_metric_semantics() -> None:
     assert "nullif(q2_campaigns.spend, 0)" in sql_by_id["G016"]
     assert "oit.item_net_amount + o.shipping_amount" in sql_by_id["G019"]
     assert "r.refunded_at >= timestamptz '2026-05-20T00:00:00Z'" in sql_by_id["G020"]
+
+
+def test_g006_has_fixed_evidence_keys_and_governed_g015_g017_shapes() -> None:
+    sql_by_id = {
+        case_id: (Path("evals/datasets/golden/sql") / f"{case_id}.sql").read_text(encoding="utf-8")
+        for case_id in ("G006", "G015", "G017")
+    }
+
+    assert (
+        "values ('south_conversion', 1), ('SKU-000001', 2), ('SKU-000002', 3)" in sql_by_id["G006"]
+    )
+    assert "left join sku_gmv" in sql_by_id["G006"]
+    assert "coalesce(sku_gmv.previous_value, 0)" in sql_by_id["G006"]
+    assert "active_customers as" in sql_by_id["G015"]
+    assert "o.ordered_at >= timestamptz '2026-06-01T00:00:00Z'" in sql_by_id["G015"]
+    assert "lifetime_orders as" in sql_by_id["G015"]
+    assert "count(lifetime_orders.customer_id)::numeric" in sql_by_id["G015"]
+    assert "coalesce((select" in sql_by_id["G017"]
+    assert "), true) as is_stale" in sql_by_id["G017"]
 
 
 def test_registry_is_independent_of_current_working_directory(
@@ -138,6 +160,35 @@ def test_registry_rejects_invalid_case_metadata(
         load_golden_cases(cases_path)
 
 
+@pytest.mark.parametrize(
+    "invalid_text",
+    [
+        "- case_id: G001\n  category: metric\n  category: secret-category\n",
+        "- case_id: G001\n  metadata:\n    version: 1\n    version: secret-version\n",
+    ],
+)
+def test_registry_rejects_duplicate_yaml_mapping_keys(tmp_path: Path, invalid_text: str) -> None:
+    cases_path = tmp_path / "cases.yaml"
+    cases_path.write_text(invalid_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid golden registry YAML") as error:
+        load_golden_cases(cases_path)
+
+    assert "secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("field", ["question", "category"])
+def test_registry_rejects_blank_versioned_text(tmp_path: Path, field: str) -> None:
+    payload = yaml.safe_load(Path(CASES_PATH).read_text(encoding="utf-8"))
+    assert isinstance(payload, list)
+    payload[0][field] = " \t "
+    cases_path = tmp_path / "cases.yaml"
+    cases_path.write_text(yaml.safe_dump(payload, allow_unicode=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not be blank"):
+        load_golden_cases(cases_path)
+
+
 def test_registry_rejects_oracle_with_multiple_statements(tmp_path: Path) -> None:
     source_payload = yaml.safe_load(Path(CASES_PATH).read_text(encoding="utf-8"))
     assert isinstance(source_payload, list)
@@ -166,5 +217,39 @@ def test_registry_rejects_select_into(tmp_path: Path) -> None:
     cases_path = tmp_path / "cases.yaml"
     cases_path.write_text(yaml.safe_dump(source_payload, allow_unicode=True), encoding="utf-8")
 
-    with pytest.raises(ValueError, match=r"read-only Query|SELECT INTO"):
+    with pytest.raises(ValueError, match="forbidden node"):
         load_golden_cases(cases_path)
+
+
+def test_registry_rejects_data_modifying_cte_and_missing_key_tie_breaker(tmp_path: Path) -> None:
+    source_payload = yaml.safe_load(Path(CASES_PATH).read_text(encoding="utf-8"))
+    assert isinstance(source_payload, list)
+    dml_path = tmp_path / "G001.sql"
+    dml_path.write_text(
+        "-- G001 metric_version=1.0.0\n"
+        "with changed as (delete from orders returning order_id) select 1 as gmv;\n",
+        encoding="utf-8",
+    )
+    source_payload[0]["oracle_sql_path"] = str(dml_path)
+    dml_cases_path = tmp_path / "dml-cases.yaml"
+    dml_cases_path.write_text(yaml.safe_dump(source_payload, allow_unicode=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="forbidden node"):
+        load_golden_cases(dml_cases_path)
+
+    source_payload = yaml.safe_load(Path(CASES_PATH).read_text(encoding="utf-8"))
+    assert isinstance(source_payload, list)
+    unordered_path = tmp_path / "G003.sql"
+    unordered_path.write_text(
+        "-- G003 metric_version=1.0.0\n"
+        "select 'north' as region, 1 as gmv_loss order by gmv_loss desc;\n",
+        encoding="utf-8",
+    )
+    source_payload[2]["oracle_sql_path"] = str(unordered_path)
+    unordered_cases_path = tmp_path / "unordered-cases.yaml"
+    unordered_cases_path.write_text(
+        yaml.safe_dump(source_payload, allow_unicode=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="ORDER BY must cover key columns"):
+        load_golden_cases(unordered_cases_path)

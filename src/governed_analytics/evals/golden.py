@@ -18,6 +18,52 @@ _MULTI_ROW_CASE_IDS = frozenset(
     {"G003", "G004", "G005", "G006", "G009", "G010", "G011", "G012", "G016"}
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+_FORBIDDEN_QUERY_NODES = (
+    exp.Alter,
+    exp.Command,
+    exp.Commit,
+    exp.Copy,
+    exp.Create,
+    exp.Delete,
+    exp.Drop,
+    exp.Grant,
+    exp.Insert,
+    exp.Into,
+    exp.Lock,
+    exp.Merge,
+    exp.Revoke,
+    exp.Rollback,
+    exp.Set,
+    exp.Transaction,
+    exp.Update,
+)
+
+
+class _DuplicateKeySafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """Safe YAML loader that rejects duplicate keys at every mapping depth."""
+
+
+def _construct_unique_mapping(
+    loader: _DuplicateKeySafeLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "duplicate mapping key",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_DuplicateKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
 
 
 def _resolve_from_repository(path: str | Path) -> Path:
@@ -28,9 +74,13 @@ def _resolve_from_repository(path: str | Path) -> Path:
 def _read_registry(path: str | Path) -> list[dict[str, Any]]:
     resolved_path = _resolve_from_repository(path)
     try:
-        parsed = yaml.safe_load(resolved_path.read_text(encoding="utf-8"))
+        parsed = yaml.load(
+            resolved_path.read_text(encoding="utf-8"), Loader=_DuplicateKeySafeLoader
+        )
     except OSError as error:
         raise ValueError(f"cannot read golden registry: {resolved_path}") from error
+    except (TypeError, yaml.YAMLError) as error:
+        raise ValueError("invalid golden registry YAML") from error
     if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
         raise ValueError("golden registry must be a YAML list of mappings")
     return parsed
@@ -44,7 +94,11 @@ def _parse_case(raw_case: dict[str, Any]) -> GoldenCase:
     try:
         return GoldenCase.model_validate(case_data)
     except ValidationError as error:
-        raise ValueError(str(error)) from error
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in issue['loc'])}: {issue['msg']}"
+            for issue in error.errors(include_context=False, include_input=False, include_url=False)
+        )
+        raise ValueError(f"invalid golden case metadata: {details}") from error
 
 
 def _validate_raw_case_ids(raw_cases: list[dict[str, Any]]) -> None:
@@ -97,8 +151,8 @@ def _validate_oracle_sql(case: GoldenCase) -> None:
     statement = statements[0]
     if not isinstance(statement, exp.Query):
         raise ValueError(f"oracle SQL for {case.case_id} must be a read-only Query")
-    if any(isinstance(node, exp.Into) for node in statement.walk()):
-        raise ValueError(f"oracle SQL for {case.case_id} must not use SELECT INTO")
+    if any(isinstance(node, _FORBIDDEN_QUERY_NODES) for node in statement.walk()):
+        raise ValueError(f"oracle SQL for {case.case_id} contains a forbidden node")
     outer_select = _outer_select(statement)
     projections = tuple(outer_select.expressions)
     if not projections or any(not isinstance(projection, exp.Alias) for projection in projections):
@@ -113,8 +167,19 @@ def _validate_oracle_sql(case: GoldenCase) -> None:
             f"oracle SQL for {case.case_id} lacks declared output alias(es): "
             f"{', '.join(sorted(missing_columns))}"
         )
-    if case.case_id in _MULTI_ROW_CASE_IDS and outer_select.args.get("order") is None:
-        raise ValueError(f"multi-row oracle SQL for {case.case_id} requires deterministic ORDER BY")
+    if case.case_id in _MULTI_ROW_CASE_IDS:
+        order = outer_select.args.get("order")
+        if order is None:
+            raise ValueError(
+                f"multi-row oracle SQL for {case.case_id} requires deterministic ORDER BY"
+            )
+        ordered_columns = {column.name for column in order.find_all(exp.Column)}
+        missing_ordered_keys = set(case.key_columns) - ordered_columns
+        if missing_ordered_keys:
+            raise ValueError(
+                f"oracle SQL for {case.case_id} ORDER BY must cover key columns: "
+                f"{', '.join(sorted(missing_ordered_keys))}"
+            )
 
 
 def load_golden_cases(path: str | Path) -> tuple[GoldenCase, ...]:

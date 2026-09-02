@@ -1,5 +1,9 @@
 -- G006 metric_version=1.0.0
-with south_conversion as (
+with cause_keys as (
+  select cause_type as cause_type, sort_order as sort_order
+  from (values ('south_conversion', 1), ('SKU-000001', 2), ('SKU-000002', 3))
+    as causes(cause_type, sort_order)
+), south_conversion as (
   select
     count(*) filter (where s.occurred_at >= timestamptz '2026-06-08T00:00:00Z'
       and s.occurred_at < timestamptz '2026-06-15T00:00:00Z' and s.converted)::numeric
@@ -28,15 +32,18 @@ with south_conversion as (
     and o.ordered_at >= timestamptz '2026-06-01T00:00:00Z'
     and o.ordered_at < timestamptz '2026-06-15T00:00:00Z'
   group by p.sku
-), evidence as (
-  select 'south_conversion'::text as cause_type, previous_value as previous,
-    current_value as current, current_value - previous_value as delta
-  from south_conversion
-  union all
-  select sku as cause_type, previous_value as previous, current_value as current,
-    current_value - previous_value as delta
-  from sku_gmv
 )
-select cause_type as cause_type, previous as previous, current as current, delta as delta
-from evidence
-order by case cause_type when 'south_conversion' then 1 else 2 end, cause_type asc;
+select cause_keys.cause_type as cause_type,
+  case when cause_keys.cause_type = 'south_conversion'
+    then coalesce(south_conversion.previous_value, 0)
+    else coalesce(sku_gmv.previous_value, 0) end as previous,
+  case when cause_keys.cause_type = 'south_conversion'
+    then coalesce(south_conversion.current_value, 0)
+    else coalesce(sku_gmv.current_value, 0) end as current,
+  case when cause_keys.cause_type = 'south_conversion'
+    then coalesce(south_conversion.current_value, 0) - coalesce(south_conversion.previous_value, 0)
+    else coalesce(sku_gmv.current_value, 0) - coalesce(sku_gmv.previous_value, 0) end as delta
+from cause_keys
+left join south_conversion on cause_keys.cause_type = 'south_conversion'
+left join sku_gmv on sku_gmv.sku = cause_keys.cause_type
+order by cause_keys.sort_order asc, cause_keys.cause_type asc;
