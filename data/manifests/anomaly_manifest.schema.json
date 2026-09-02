@@ -1,6 +1,7 @@
 {
   "$defs": {
     "AnomalyRecord": {
+      "additionalProperties": false,
       "description": "Immutable, machine-readable truth for one deterministic anomaly.",
       "properties": {
         "affected_keys": {
@@ -72,6 +73,7 @@
       "type": "object"
     },
     "ExpectedSignal": {
+      "additionalProperties": false,
       "description": "A metric-level effect expected from one injected root cause.",
       "properties": {
         "metric_id": {
@@ -116,6 +118,7 @@
       "type": "object"
     }
   },
+  "additionalProperties": false,
   "description": "The ordered source of truth for all injected anomalies.",
   "properties": {
     "anomalies": {

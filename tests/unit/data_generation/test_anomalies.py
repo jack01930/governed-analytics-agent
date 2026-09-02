@@ -129,6 +129,10 @@ def test_manifest_and_record_models_reject_invalid_truth_boundaries(result) -> N
             anomalies=(result.manifest.anomalies[1], record, *result.manifest.anomalies[2:]),
         )
     assert AnomalyManifest(dataset_id=valid_dataset_id, anomalies=result.manifest.anomalies)
+    with pytest.raises(ValueError, match="extra_forbidden"):
+        AnomalyManifest.model_validate({**result.manifest.model_dump(), "unexpected": True})
+    with pytest.raises(ValueError, match="extra_forbidden"):
+        AnomalyRecord.model_validate({**record_data, "unexpected": True})
 
 
 def test_quality_anomalies_have_exact_tiny_counts_and_stable_selection(base, result) -> None:  # type: ignore[no-untyped-def]

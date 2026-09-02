@@ -12,8 +12,8 @@ from governed_analytics.data_generation.models import DatasetManifest, DatasetSc
 
 def _manifest(scale: DatasetScale = DatasetScale.TINY, suffix: str = "a") -> DatasetManifest:
     return DatasetManifest(
-        dataset_id=f"dataset-{suffix}",
-        config_sha256=f"config-{suffix}",
+        dataset_id=("a" if suffix == "a" else "b") * 64,
+        config_sha256=("c" if suffix == "a" else "d") * 64,
         seed=20260901,
         scale=scale,
         tables=tuple(
@@ -71,7 +71,7 @@ def test_generate_calls_pipeline_and_prints_nonsecret_summary(
     assert cli.main(["generate", "--scale", "tiny", "--output", str(tmp_path)]) == 0
     output = capsys.readouterr().out
     assert captured["output_path"] == tmp_path / "tiny"
-    assert "scale=tiny" in output and "dataset=dataset-a" in output
+    assert "scale=tiny" in output and "dataset=" + "a" * 64 in output
     assert "password" not in output.lower() and "postgresql" not in output.lower()
 
 
@@ -130,7 +130,7 @@ def test_verify_success_keeps_expected_and_removes_temp(
     expected_root = tmp_path / "tiny"
     expected = _manifest()
     _write_evidence(expected_root, expected)
-    before = (expected_root / "dataset_manifest.json").read_bytes()
+    before = {path.name: path.read_bytes() for path in expected_root.iterdir()}
 
     def fake_generate(_: Path, output: Path) -> DatasetManifest:
         output.mkdir(parents=True)
@@ -144,7 +144,7 @@ def test_verify_success_keeps_expected_and_removes_temp(
     monkeypatch.setattr(cli, "_load_anomaly_evidence", lambda path: json.loads(path.read_text()))
     assert cli.main(["verify", "--scale", "tiny", "--output", str(tmp_path)]) == 0
     assert "verification succeeded" in capsys.readouterr().out
-    assert (expected_root / "dataset_manifest.json").read_bytes() == before
+    assert {path.name: path.read_bytes() for path in expected_root.iterdir()} == before
     assert not list(tmp_path.glob(".tiny-verify-*"))
 
 
@@ -167,3 +167,101 @@ def test_verify_rejects_missing_or_invalid_expected_manifest(
     assert cli.main(["verify", "--scale", "tiny", "--output", str(tmp_path)]) == 2
     assert "invalid expected dataset manifest" in capsys.readouterr().out
     assert calls == 0
+
+
+@pytest.mark.parametrize("kind", ("dataset", "anomaly", "source"))
+def test_verify_rejects_invalid_expected_evidence_before_generation_and_keeps_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    kind: str,
+) -> None:
+    root = tmp_path / "tiny"
+    _write_evidence(root, _manifest())
+    if kind == "dataset":
+        (root / "dataset_manifest.json").write_text(
+            '{"secret":"postgresql://u:pw@db"}', encoding="utf-8"
+        )
+    elif kind == "anomaly":
+        (root / "anomaly_manifest.json").write_text('{"unexpected": true}', encoding="utf-8")
+    else:
+        (root / "source_csv_digests.json").write_text(
+            '[{"table_name":"categories","row_count":-1,"sha256":"not-a-hash"}]',
+            encoding="utf-8",
+        )
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+    calls = 0
+
+    def fake_generate(_: Path, __: Path) -> DatasetManifest:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("generation must not start")
+
+    monkeypatch.setattr(cli, "generate_and_load", fake_generate)
+    if kind == "source":
+        monkeypatch.setattr(cli, "_load_anomaly_evidence", lambda _: {})
+    assert cli.main(["verify", "--scale", "tiny", "--output", str(tmp_path)]) == 2
+    captured = capsys.readouterr()
+    assert "postgresql://u:pw@db" not in captured.out + captured.err
+    assert calls == 0
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+    assert not list(tmp_path.glob(".tiny-verify-*"))
+
+
+def test_operation_errors_are_stably_redacted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret = "postgresql://user:p%40ssword@host/db"
+
+    def fake_generate(_: Path, __: Path) -> DatasetManifest:
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(cli, "generate_and_load", fake_generate)
+    assert cli.main(["generate", "--scale", "tiny", "--output", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "data operation failed"
+    assert (
+        secret not in captured.out + captured.err
+        and "p%40ssword" not in captured.out + captured.err
+    )
+
+
+@pytest.mark.parametrize("outcome", ("mismatch", "invalid_actual", "generate_error"))
+def test_verify_preserves_all_expected_evidence_and_cleans_temp_on_non_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    outcome: str,
+) -> None:
+    expected_root = tmp_path / "tiny"
+    expected = _manifest()
+    _write_evidence(expected_root, expected)
+    before = {path.name: path.read_bytes() for path in expected_root.iterdir()}
+
+    def fake_generate(_: Path, output: Path) -> DatasetManifest:
+        output.mkdir(parents=True)
+        if outcome == "generate_error":
+            raise RuntimeError("postgresql://u:secret@db")
+        (output / "anomaly_manifest.json").write_text(
+            "{}" if outcome == "invalid_actual" else '{"evidence":"same"}', encoding="utf-8"
+        )
+        (output / "source_csv_digests.json").write_bytes(
+            (expected_root / "source_csv_digests.json").read_bytes()
+        )
+        return _manifest(suffix="expected") if outcome == "mismatch" else expected
+
+    monkeypatch.setattr(cli, "generate_and_load", fake_generate)
+    monkeypatch.setattr(
+        cli,
+        "_load_anomaly_evidence",
+        lambda path: (
+            json.loads(path.read_text())
+            if path.read_text() != "{}"
+            else (_ for _ in ()).throw(ValueError())
+        ),
+    )
+    assert cli.main(["verify", "--scale", "tiny", "--output", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert "secret" not in captured.out + captured.err
+    assert {path.name: path.read_bytes() for path in expected_root.iterdir()} == before
+    assert not list(tmp_path.glob(".tiny-verify-*"))

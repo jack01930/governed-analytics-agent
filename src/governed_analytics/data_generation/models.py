@@ -15,6 +15,20 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 GENERATOR_CONTRACT_VERSION = "1.0.0"
+MANIFEST_TABLE_ORDER = (
+    "categories",
+    "customers",
+    "products",
+    "marketing_campaigns",
+    "orders",
+    "order_items",
+    "payments",
+    "refunds",
+    "inventory_snapshots",
+    "web_sessions",
+    "campaign_attributions",
+    "pipeline_runs",
+)
 
 
 class DatasetScale(StrEnum):
@@ -51,18 +65,28 @@ class GeneratorConfig(BaseModel):
 
 
 class TableDigest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     table_name: str
     row_count: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class DatasetManifest(BaseModel):
-    dataset_id: str
-    config_sha256: str
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     seed: int
     scale: DatasetScale
     tables: tuple[TableDigest, ...]
     anomaly_manifest_path: Path
+
+    @model_validator(mode="after")
+    def validate_table_order(self) -> Self:
+        if tuple(table.table_name for table in self.tables) != MANIFEST_TABLE_ORDER:
+            raise ValueError("table names/order must exactly match the dataset registry")
+        return self
 
 
 def load_generator_config(path: str | Path) -> GeneratorConfig:

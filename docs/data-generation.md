@@ -32,7 +32,7 @@ NumPy RNG（`named_rng(seed, namespace)`），不调用模型、网络或外部 
 | ID | UTC 窗口 / 配额 | 突变 | 可观察信号 |
 | --- | --- | --- | --- |
 | `anomaly_gmv_drop_south_conversion` | 2026-06-08 至 06-15 | 华南已转化会话按稳定 identity 反转 35%（等价目标转化概率 0.65） | 华南 GMV、已转化会话较前周下降 |
-| `anomaly_gmv_drop_stockout` | 2026-06-08 至 06-15 | `SKU-000001/2` 可售量清零，抑制各 SKU 90% 合格订单行（tiny/full 各 18/1,800） | 两个商品对 GMV 损失有实质贡献 |
+| `anomaly_gmv_drop_stockout` | 2026-06-08 至 06-15 | `SKU-000001/2` 可售量清零；按各自 eligible cohort 的稳定顺序取 floor(90%) 抑制订单行（tiny 各 18；full 为 1,803、1,804，合计 3,607，以 manifest 为准） | 两个商品对 GMV 损失有实质贡献 |
 | `anomaly_refund_spike_category` | 2026-05-04 至 05-11 | `CAT-018` 成功退款概率由 0.06 提至 0.24 | 品类退款率至少为 2 倍 |
 | `anomaly_inventory_delay` | 2026-06-15 | 删除 08:00 UTC 后库存快照并写失败 pipeline run | freshness watermark 过期 |
 | `anomaly_duplicate_order_items` | 2026-04-10；20 / 2,000 | 复制相同 `source_line_id`，新主键 | 逻辑重复数精确为配额 |

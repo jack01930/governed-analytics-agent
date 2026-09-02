@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from governed_analytics.data_generation.anomalies import AnomalyManifest
 from governed_analytics.data_generation.loader import TABLE_LOAD_ORDER
@@ -27,8 +27,8 @@ class _SourceDigest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     table_name: str
-    row_count: int
-    sha256: str
+    row_count: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 _SOURCE_DIGESTS = TypeAdapter(tuple[_SourceDigest, ...])
@@ -74,7 +74,7 @@ def _load_dataset_manifest(path: Path) -> DatasetManifest:
     try:
         return DatasetManifest.model_validate_json(path.read_text(encoding="utf-8"), strict=True)
     except (OSError, ValidationError, ValueError) as error:
-        raise ValueError(f"invalid expected dataset manifest: {error}") from error
+        raise ValueError("invalid expected dataset manifest") from error
 
 
 def _load_anomaly_evidence(path: Path) -> Any:
@@ -84,7 +84,7 @@ def _load_anomaly_evidence(path: Path) -> Any:
             path.read_text(encoding="utf-8"), strict=True
         )
     except (OSError, ValidationError, ValueError) as error:
-        raise ValueError(f"invalid anomaly manifest: {error}") from error
+        raise ValueError("invalid expected anomaly manifest") from error
     return manifest.model_dump(mode="json")
 
 
@@ -92,9 +92,9 @@ def _load_source_evidence(path: Path) -> tuple[_SourceDigest, ...]:
     try:
         evidence = _SOURCE_DIGESTS.validate_json(path.read_text(encoding="utf-8"), strict=True)
     except (OSError, ValidationError, ValueError) as error:
-        raise ValueError(f"invalid source digest evidence: {error}") from error
+        raise ValueError("invalid expected source digest evidence") from error
     if tuple(item.table_name for item in evidence) != TABLE_LOAD_ORDER:
-        raise ValueError("invalid source digest evidence: table names/order must match contract")
+        raise ValueError("invalid expected source digest evidence")
     return evidence
 
 
@@ -130,14 +130,14 @@ def _verify(scale: str, output_root: Path) -> int:
     expected_root = dataset_root(output_root, scale)
     expected_manifest_path = expected_root / "dataset_manifest.json"
     if not expected_manifest_path.is_file():
-        print(f"missing expected dataset manifest: {expected_manifest_path}")
+        print("missing expected dataset manifest")
         return 2
     try:
         expected = _load_dataset_manifest(expected_manifest_path)
         expected_anomalies = _load_anomaly_evidence(expected_root / "anomaly_manifest.json")
         expected_source = _load_source_evidence(expected_root / "source_csv_digests.json")
     except ValueError as error:
-        print(error)
+        print(str(error))
         return 2
 
     # TemporaryDirectory is rooted beside the evidence, hence uses its filesystem and is removed
@@ -149,8 +149,8 @@ def _verify(scale: str, output_root: Path) -> int:
         try:
             actual_anomalies = _load_anomaly_evidence(actual_root / "anomaly_manifest.json")
             actual_source = _load_source_evidence(actual_root / "source_csv_digests.json")
-        except ValueError as error:
-            print(error)
+        except ValueError:
+            print("generated evidence is invalid")
             return 1
 
         differences = _compare_manifests(expected, actual)
@@ -173,8 +173,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "generate":
             return _generate(arguments.scale, arguments.output)
         return _verify(arguments.scale, arguments.output)
-    except Exception as error:  # CLI errors must not leak connection URLs or environment values.
-        print(f"data operation failed: {type(error).__name__}: {error}", file=sys.stderr)
+    except Exception:  # CLI errors must not leak connection URLs or environment values.
+        print("data operation failed", file=sys.stderr)
         return 1
 
 

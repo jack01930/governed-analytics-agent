@@ -46,7 +46,7 @@ _CONTRACT_ANOMALY_IDS = (
 class ExpectedSignal(BaseModel):
     """A metric-level effect expected from one injected root cause."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     metric_id: str
     operator: Literal["decrease", "increase", "equals", "stale"]
@@ -56,7 +56,7 @@ class ExpectedSignal(BaseModel):
 class AnomalyRecord(BaseModel):
     """Immutable, machine-readable truth for one deterministic anomaly."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     anomaly_id: str
     start_at: datetime
@@ -86,7 +86,7 @@ class AnomalyRecord(BaseModel):
 class AnomalyManifest(BaseModel):
     """The ordered source of truth for all injected anomalies."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     dataset_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     anomalies: tuple[AnomalyRecord, ...]

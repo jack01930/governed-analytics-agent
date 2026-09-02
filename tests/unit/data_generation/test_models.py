@@ -6,8 +6,10 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from governed_analytics.data_generation.models import (
+    DatasetManifest,
     DatasetScale,
     GeneratorConfig,
+    TableDigest,
     dataset_id_for_config,
     generator_config_sha256,
 )
@@ -96,3 +98,24 @@ def test_generator_config_hash_and_dataset_id_are_stable_and_sensitive() -> None
     assert len(dataset_id) == 64
     assert all(character in "0123456789abcdef" for character in config_hash)
     assert all(character in "0123456789abcdef" for character in dataset_id)
+
+
+def test_dataset_manifest_rejects_unknown_fields_bad_hashes_and_table_order() -> None:
+    table = TableDigest(table_name="categories", row_count=0, sha256="0" * 64)
+    payload = {
+        "dataset_id": "1" * 64,
+        "config_sha256": "2" * 64,
+        "seed": 20260901,
+        "scale": "tiny",
+        "tables": [table.model_dump()],
+        "anomaly_manifest_path": "anomaly_manifest.json",
+        "unexpected": True,
+    }
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        DatasetManifest.model_validate(payload)
+    with pytest.raises(ValidationError, match="String should match pattern"):
+        TableDigest(table_name="categories", row_count=0, sha256="BAD")
+    with pytest.raises(ValidationError, match="table names/order"):
+        DatasetManifest.model_validate(
+            {key: value for key, value in payload.items() if key != "unexpected"}
+        )
