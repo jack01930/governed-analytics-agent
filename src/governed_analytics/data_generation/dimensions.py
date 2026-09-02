@@ -18,6 +18,8 @@ from governed_analytics.data_generation.vocabulary import (
 
 _CENT = Decimal("0.01")
 _CATEGORY_CREATED_AT = datetime(2025, 1, 1, tzinfo=UTC)
+_Q2_2026_START = datetime(2026, 4, 1, tzinfo=UTC)
+_Q2_CAMPAIGN_COUNT = 5
 
 
 def cents_to_decimal(cents: int) -> Decimal:
@@ -96,9 +98,22 @@ def generate_campaigns(config: GeneratorConfig) -> pd.DataFrame:
     """Generate non-overlapping 14-day non-organic marketing campaigns."""
     rng = named_rng(config.seed, "campaigns")
     campaign_ids = list(range(1, config.campaigns + 1))
-    start_times = [
-        config.start_at + timedelta(days=14 * index) for index in range(config.campaigns)
-    ]
+    q2_campaign_count = min(_Q2_CAMPAIGN_COUNT, config.campaigns)
+    pre_q2_campaign_count = config.campaigns - q2_campaign_count
+    q2_anchor_capacity = (_Q2_2026_START - config.start_at).days // 14
+    if pre_q2_campaign_count <= q2_anchor_capacity:
+        start_times = [
+            config.start_at + timedelta(days=14 * index)
+            for index in range(pre_q2_campaign_count)
+        ] + [
+            _Q2_2026_START + timedelta(days=14 * index)
+            for index in range(q2_campaign_count)
+        ]
+    else:
+        # Near-capacity configurations keep the compact schedule, which already spans Q2.
+        start_times = [
+            config.start_at + timedelta(days=14 * index) for index in range(config.campaigns)
+        ]
     channels = rng.choice(CHANNELS[1:], size=config.campaigns)
     spend_cents = rng.integers(500000, 10000001, size=config.campaigns)
 

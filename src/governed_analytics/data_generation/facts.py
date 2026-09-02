@@ -27,6 +27,8 @@ _DISCOUNT_WEIGHTS = (0.55, 0.20, 0.20, 0.05)
 _CHANNEL_WEIGHTS = (0.30, 0.25, 0.20, 0.10, 0.15)
 _PAYMENT_PROVIDERS = ("alipay", "wechat_pay", "card")
 _REFUND_REASONS = ("商品质量问题", "不再需要", "配送延迟", "规格不符")
+_Q2_2026_START = datetime(2026, 4, 1, tzinfo=UTC)
+_Q2_2026_END = datetime(2026, 7, 1, tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,8 @@ def _anchor_order_ids(config: GeneratorConfig) -> dict[str, np.ndarray]:
         "category_refund": _quota(config, 25),
         "refund_exceeds_payment": _quota(config, 3),
         "south_sku": _quota(config, 40),
+        "consumer_previous": _quota(config, 100),
+        "campaign_q2": min(5, config.campaigns),
     }
     cursor = 1
     anchors: dict[str, np.ndarray] = {}
@@ -98,6 +102,7 @@ def _date_for_anchor(anchor_name: str) -> date:
         "category_refund": date(2026, 5, 4),
         "refund_exceeds_payment": date(2026, 5, 20),
         "south_sku": date(2026, 6, 8),
+        "consumer_previous": date(2026, 6, 1),
     }
     return dates[anchor_name]
 
@@ -108,6 +113,7 @@ def _generate_orders_and_items(
     """Generate order headers and line items, retaining integer cents until frame construction."""
     customers = generate_customers(config)
     products = generate_products(config)
+    campaigns = generate_campaigns(config)
     anchors = _anchor_order_ids(config)
     order_ids = np.arange(1, config.orders + 1, dtype=int)
     day_starts = pd.date_range(config.start_at, config.end_at, freq="D", inclusive="left")
@@ -120,7 +126,21 @@ def _generate_orders_and_items(
         day_starts[int(day_index)].to_pydatetime() + timedelta(seconds=int(second))
         for day_index, second in zip(day_indexes, seconds, strict=True)
     ]
+    q2_campaigns = campaigns[
+        (campaigns["start_at"] < _Q2_2026_END) & (campaigns["end_at"] > _Q2_2026_START)
+    ]
+    campaign_anchor_ids = anchors["campaign_q2"]
+    if len(q2_campaigns) < len(campaign_anchor_ids):
+        raise ValueError(
+            "campaign dimensions have insufficient Q2 campaigns for attribution anchors"
+        )
     for name, ids in anchors.items():
+        if name == "campaign_q2":
+            for order_id, campaign in zip(
+                ids, q2_campaigns.iloc[: len(ids)].itertuples(index=False), strict=True
+            ):
+                ordered_at[int(order_id) - 1] = campaign.start_at + timedelta(minutes=30)
+            continue
         anchored_day = _date_for_anchor(name)
         for order_id in ids:
             hour_limit = 10 if name == "refund_exceeds_payment" else 24
@@ -136,11 +156,17 @@ def _generate_orders_and_items(
     ].to_numpy(dtype=int)
     if len(south_customer_ids) == 0:
         raise ValueError("customer dimensions have no South-region customer for conversion anchors")
-    south_anchor_ids = anchors["south_sku"]
+    south_anchor_ids = np.concatenate((anchors["south_sku"], anchors["consumer_previous"]))
     customer_ids[south_anchor_ids - 1] = np.resize(south_customer_ids, len(south_anchor_ids))
     customer_regions = customers.set_index("customer_id").loc[customer_ids, "region"].tolist()
     channel_rng = named_rng(config.seed, "facts.orders.channels")
     channels = channel_rng.choice(CHANNELS, size=config.orders, p=_CHANNEL_WEIGHTS)
+    for order_id, campaign in zip(
+        campaign_anchor_ids,
+        q2_campaigns.iloc[: len(campaign_anchor_ids)].itertuples(index=False),
+        strict=True,
+    ):
+        channels[int(order_id) - 1] = campaign.channel
 
     item_rng = named_rng(config.seed, "facts.order_items")
     item_counts = item_rng.choice(_ITEM_COUNTS, size=config.orders, p=_ITEM_COUNT_WEIGHTS).astype(
@@ -161,10 +187,12 @@ def _generate_orders_and_items(
         product_ids[first_item_indexes[int(order_id) - 1]] = category_18_products[
             index % len(category_18_products)
         ]
-    south_sku_ids = anchors["south_sku"]
-    per_sku = len(south_sku_ids) // 2
-    for index, order_id in enumerate(south_sku_ids):
-        product_ids[first_item_indexes[int(order_id) - 1]] = 1 if index < per_sku else 2
+    for consumer_sku_ids in (anchors["south_sku"], anchors["consumer_previous"]):
+        per_sku = len(consumer_sku_ids) // 2
+        for index, order_id in enumerate(consumer_sku_ids):
+            product_ids[first_item_indexes[int(order_id) - 1]] = (
+                1 if index < per_sku else 2
+            )
 
     quantities = item_rng.choice(_QUANTITIES, size=len(item_ids), p=_QUANTITY_WEIGHTS).astype(int)
     discount_rates = item_rng.choice(
@@ -194,6 +222,7 @@ def _generate_orders_and_items(
     )
     payment_succeeded = payment_outcome_rng.random(config.orders) < success_probabilities
     payment_succeeded[anchors["refund_exceeds_payment"] - 1] = True
+    payment_succeeded[anchors["consumer_previous"] - 1] = True
     final_statuses = np.where(
         payment_succeeded,
         np.where(planned_statuses == "completed", "completed", "paid"),

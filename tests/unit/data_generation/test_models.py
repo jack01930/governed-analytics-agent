@@ -6,6 +6,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from governed_analytics.data_generation.models import (
+    GENERATOR_CONTRACT_VERSION,
     DatasetManifest,
     DatasetScale,
     GeneratorConfig,
@@ -98,6 +99,11 @@ def test_generator_config_hash_and_dataset_id_are_stable_and_sensitive() -> None
     assert len(dataset_id) == 64
     assert all(character in "0123456789abcdef" for character in config_hash)
     assert all(character in "0123456789abcdef" for character in dataset_id)
+
+
+def test_consumer_signal_producer_revision_has_an_explicit_contract_version() -> None:
+    """A changed fixed-seed truth cannot silently retain the prior dataset identity contract."""
+    assert GENERATOR_CONTRACT_VERSION == "1.1.0"
 
 
 def test_dataset_manifest_rejects_unknown_fields_bad_hashes_and_table_order() -> None:

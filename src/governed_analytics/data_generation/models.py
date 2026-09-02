@@ -14,7 +14,7 @@ from typing import Any, Self
 import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-GENERATOR_CONTRACT_VERSION = "1.0.0"
+GENERATOR_CONTRACT_VERSION = "1.1.0"
 MANIFEST_TABLE_ORDER = (
     "categories",
     "customers",

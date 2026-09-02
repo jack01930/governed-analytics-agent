@@ -7,7 +7,11 @@ import numpy as np
 import pandas as pd  # type: ignore[import-untyped]
 import pytest
 
-from governed_analytics.data_generation.dimensions import generate_customers, generate_products
+from governed_analytics.data_generation.dimensions import (
+    generate_campaigns,
+    generate_customers,
+    generate_products,
+)
 from governed_analytics.data_generation.facts import (
     _anchor_order_ids,
     _date_for_anchor,
@@ -292,18 +296,7 @@ def test_sessions_inventory_pipeline_and_attribution_contracts(config, facts) ->
         .all()
     )
 
-    campaign_windows = pd.DataFrame(
-        {
-            "campaign_id": range(1, config.campaigns + 1),
-            "start_at": [
-                config.start_at + pd.Timedelta(days=14 * index) for index in range(config.campaigns)
-            ],
-            "end_at": [
-                config.start_at + pd.Timedelta(days=14 * (index + 1))
-                for index in range(config.campaigns)
-            ],
-        }
-    ).set_index("campaign_id")
+    campaign_windows = generate_campaigns(config).set_index("campaign_id")
     assert facts.campaign_attributions.duplicated(["campaign_id", "order_id"]).sum() == 0
     for row in facts.campaign_attributions.itertuples(index=False):
         window = campaign_windows.loc[row.campaign_id]
@@ -389,6 +382,8 @@ def test_full_anchor_plan_has_exact_disjoint_task_4_quotas() -> None:
         "category_refund": 2500,
         "refund_exceeds_payment": 300,
         "south_sku": 4000,
+        "consumer_previous": 10000,
+        "campaign_q2": 5,
     }
     all_ids = [order_id for ids in anchors.values() for order_id in ids]
     assert len(all_ids) == len(set(all_ids))

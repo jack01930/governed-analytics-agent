@@ -315,7 +315,7 @@ async def test_trusted_catalog_scalars_match_fixed_queries_in_nonempty_window() 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_june_campaign_metrics_are_null_at_zero_denominator() -> None:
+async def test_june_campaign_metrics_are_scoreable_from_q2_attributions() -> None:
     engine = create_async_database_engine(DatabaseSettings())  # type: ignore[call-arg]
     try:
         async with engine.connect() as connection:
@@ -324,7 +324,9 @@ async def test_june_campaign_metrics_are_null_at_zero_denominator() -> None:
                 await _readonly_connection_state(connection)
                 for metric_id in ("customer_acquisition_cost", "campaign_roi"):
                     result = await connection.execute(text(METRIC_QUERIES[metric_id]), WINDOW)
-                    assert result.scalar_one() is None
+                    value = result.scalar_one()
+                    assert value is not None
+                    assert Decimal(value).is_finite()
             finally:
                 await transaction.rollback()
     finally:
