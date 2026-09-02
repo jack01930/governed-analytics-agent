@@ -31,6 +31,11 @@ async def test_readonly_executor_sets_all_runtime_defenses_and_caps_rows() -> No
     )
     assert len(capped_rows.rows) == 500
 
+    fetched_rows = await executor.execute_readonly_sql(
+        "select generate_series(1, 1000) as value fetch first 10 rows only"
+    )
+    assert len(fetched_rows.rows) == 10
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio

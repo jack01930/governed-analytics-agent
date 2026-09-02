@@ -23,6 +23,21 @@ def _limit_value(sql: str) -> int:
     return int(expression.this)
 
 
+def _outer_row_cap(sql: str) -> int:
+    statements = sqlglot.parse(sql, read="postgres")
+    assert len(statements) == 1
+    assert isinstance(statements[0], exp.Query)
+    row_cap = statements[0].args.get("limit")
+    if isinstance(row_cap, exp.Limit):
+        expression = row_cap.expression
+    else:
+        assert isinstance(row_cap, exp.Fetch)
+        expression = row_cap.args.get("count")
+    assert isinstance(expression, exp.Literal)
+    assert not expression.is_string
+    return int(expression.this)
+
+
 @pytest.mark.parametrize(
 (
     "sql",
@@ -63,6 +78,28 @@ def test_guard_preserves_outer_offset_and_inner_top_k_limit() -> None:
     )
     assert isinstance(inner_limit.expression, exp.Literal)
     assert inner_limit.expression.this == "5"
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_row_cap"),
+    [
+        ("select 1 fetch first 0 rows only", 0),
+        ("select 1 fetch first 10 rows only", 10),
+        ("select 1 fetch next 500 rows only", 500),
+        ("select 1 fetch next 501 rows only", 500),
+        ("select 1 fetch first all rows only", 500),
+        ("select 1 fetch first $1 rows only", 500),
+    ],
+)
+def test_guard_applies_a_safe_outer_fetch_cap(sql: str, expected_row_cap: int) -> None:
+    assert _outer_row_cap(validate_baseline_sql(sql)) == expected_row_cap
+
+
+def test_guard_preserves_offset_with_safe_outer_fetch_cap() -> None:
+    validated = validate_baseline_sql("select 1 offset 3 rows fetch first 10 rows only")
+
+    assert _outer_row_cap(validated) == 10
+    assert "OFFSET 3" in validated
 
 
 def test_guard_output_reparses_as_one_capped_query_without_forbidden_nodes() -> None:
@@ -157,3 +194,22 @@ def test_guard_rejects_invalid_or_markdown_sql_without_echoing_input(sql: str) -
         assert sql not in message
     assert "Expected" not in message
     assert "Line" not in message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select 'unique-single-quote-secret",
+        "select /* unique-comment-secret",
+        "select $$unique-dollar-quote-secret",
+        'select "unique-identifier-secret',
+    ],
+)
+def test_guard_sanitizes_sqlglot_token_errors(sql: str) -> None:
+    with pytest.raises(SqlRejected) as raised:
+        validate_baseline_sql(sql)
+
+    assert type(raised.value) is SqlRejected
+    assert str(raised.value) == "baseline SQL rejected"
+    assert "unique-" not in str(raised.value)
+    assert raised.value.__cause__ is None

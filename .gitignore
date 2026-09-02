@@ -32,7 +32,6 @@ exports/
 logs/
 data/generated/
 evals/reports/generated/
-task-4-report.md
 *.db
 *.sqlite
 *.sqlite3

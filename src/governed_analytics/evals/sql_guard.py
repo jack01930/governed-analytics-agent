@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Never
 
 import sqlglot
 from sqlglot import exp
@@ -52,8 +52,8 @@ class SqlRejected(ValueError):
     """Stable public error for SQL that is outside the Week 1 baseline boundary."""
 
 
-def _reject() -> None:
-    raise SqlRejected("baseline SQL rejected")
+def _reject() -> Never:
+    raise SqlRejected("baseline SQL rejected") from None
 
 
 def _parse_single_query(sql: str) -> exp.Query:
@@ -61,11 +61,11 @@ def _parse_single_query(sql: str) -> exp.Query:
         _reject()
     try:
         statements = sqlglot.parse(sql, read="postgres")
-    except sqlglot.errors.ParseError:
-        raise SqlRejected("baseline SQL rejected") from None
+    except sqlglot.errors.SqlglotError:
+        _reject()
     if len(statements) != 1 or not isinstance(statements[0], exp.Query):
         _reject()
-    return cast(exp.Query, statements[0])
+    return statements[0]
 
 
 def _has_forbidden_content(query: exp.Query) -> bool:
@@ -77,8 +77,10 @@ def _has_forbidden_content(query: exp.Query) -> bool:
     return False
 
 
-def _outer_limit_is_safe_literal(limit: exp.Limit) -> bool:
-    expression = limit.expression
+def _outer_row_cap_is_safe_literal(row_cap: exp.Limit | exp.Fetch) -> bool:
+    expression = (
+        row_cap.expression if isinstance(row_cap, exp.Limit) else row_cap.args.get("count")
+    )
     if not isinstance(expression, exp.Literal) or expression.is_string:
         return False
     try:
@@ -88,8 +90,8 @@ def _outer_limit_is_safe_literal(limit: exp.Limit) -> bool:
 
 
 def _cap_outer_limit(query: exp.Query) -> None:
-    limit = query.args.get("limit")
-    if isinstance(limit, exp.Limit) and _outer_limit_is_safe_literal(limit):
+    row_cap = query.args.get("limit")
+    if isinstance(row_cap, (exp.Limit, exp.Fetch)) and _outer_row_cap_is_safe_literal(row_cap):
         return
     query.set("limit", exp.Limit(expression=exp.Literal.number(_MAX_RESULT_ROWS)))
 
