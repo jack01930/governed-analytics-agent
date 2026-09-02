@@ -39,7 +39,7 @@
 | `G008` | 2026 年 5 月净收入是多少？ | one row: `net_revenue` | scalar |
 | `G009` | 2026-05-04 当周退款率最高的品类有哪些？ | top 5 category/refund_rate | top_k |
 | `G010` | 该退款异常周最常见的退款原因是什么？ | reason/refund_count/refund_amount | top_k |
-| `G011` | 2026-06-08 当周各渠道转化率是多少？ | channel/session_count/conversion_rate | table |
+| `G011` | 2026-06-08 当周各渠道转化率是多少？ | channel/conversion_rate | table |
 | `G012` | 2026-06-08 当周哪些商品发生缺货？ | sku/stockout_days | table |
 | `G013` | 2026 年 6 月活跃客户数是多少？ | one row: `active_customers` | scalar |
 | `G014` | 2026 年 6 月新增客户数是多少？ | one row: `new_customers` | scalar |
@@ -66,7 +66,7 @@ Create one file per case under `evals/datasets/golden/sql/G001.sql` through `G02
 - `G008`: succeeded payment total minus succeeded refund total for orders placed in May.
 - `G009`: refund amount divided by succeeded payment amount for orders/items grouped by category in the anomaly week.
 - `G010`: succeeded refunds grouped by reason in the anomaly week, ordered by refund amount descending.
-- `G011`: sessions and converted sessions grouped by channel; ratio uses `nullif(count(*), 0)`.
+- `G011`: sessions and converted sessions are grouped internally by channel; the oracle outputs only `channel` and `conversion_rate`, and the ratio uses `nullif(count(*), 0)`.
 - `G012`: count distinct snapshot dates with `available_qty = 0` per SKU in the target week.
 - `G013`: count distinct customers with valid June orders.
 - `G014`: count customers registered in June.

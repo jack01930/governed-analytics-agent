@@ -689,7 +689,7 @@ def test_core_catalog_has_exact_metric_ids_and_valid_sql() -> None:
     assert tuple(catalog) == (
         "gmv", "paid_gmv", "net_revenue", "valid_order_count", "average_order_value",
         "payment_success_rate", "refund_amount", "refund_rate", "active_customers",
-        "new_customers", "repeat_purchase_rate", "session_count", "conversion_rate",
+        "new_customers", "repeat_purchase_rate", "customer_acquisition_cost", "conversion_rate",
         "stockout_rate", "campaign_roi",
     )
 ```
@@ -713,7 +713,7 @@ Create `data/metrics/core.yaml` with version `1.0.0`, `valid_from: 2025-01-01T00
 | `active_customers` | distinct customers with valid orders | `o.ordered_at` | count | region, segment |
 | `new_customers` | customers registered in interval | `c.registered_at` | count | region, segment |
 | `repeat_purchase_rate` | customers with at least two valid lifetime orders by interval end / active customers | `o.ordered_at` | ratio | region, segment |
-| `session_count` | count of web sessions | `s.occurred_at` | count | channel, region |
+| `customer_acquisition_cost` | campaign spend pre-aggregated per campaign / distinct attributed customers over the interval | `a.attributed_at` | CNY | campaign, channel |
 | `conversion_rate` | converted sessions / all sessions | `s.occurred_at` | ratio | channel, region |
 | `stockout_rate` | product snapshots with available quantity zero / all product snapshots | `i.snapshot_at` | ratio | category, product |
 | `campaign_roi` | `(attributed_revenue - campaign_spend) / nullif(campaign_spend, 0)` | `a.attributed_at` | ratio | campaign, channel |
