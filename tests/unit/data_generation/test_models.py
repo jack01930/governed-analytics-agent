@@ -84,6 +84,29 @@ def test_config_rejects_campaigns_beyond_14_day_non_overlapping_capacity() -> No
         GeneratorConfig.model_validate(raw)
 
 
+@pytest.mark.parametrize("campaign_count", (0, 1, 4))
+def test_config_rejects_campaign_counts_without_q2_scoreable_capacity(campaign_count: int) -> None:
+    """Every accepted profile must be able to supply five Q2 campaign score rows."""
+    raw = yaml.safe_load(Path("data/generator/tiny.yaml").read_text(encoding="utf-8"))
+    raw["campaigns"] = campaign_count
+
+    with pytest.raises(ValidationError):
+        GeneratorConfig.model_validate(raw)
+
+
+def test_config_accepts_the_minimum_five_campaigns_with_existing_interval_contract() -> None:
+    """The new consumer boundary composes with UTC and 14-day capacity validation."""
+    raw = yaml.safe_load(Path("data/generator/tiny.yaml").read_text(encoding="utf-8"))
+    raw["campaigns"] = 5
+
+    config = GeneratorConfig.model_validate(raw)
+
+    assert config.campaigns == 5
+    assert config.start_at.utcoffset() == timedelta(0)
+    assert config.end_at.utcoffset() == timedelta(0)
+    assert config.campaigns * timedelta(days=14) <= config.end_at - config.start_at
+
+
 def test_generator_config_hash_and_dataset_id_are_stable_and_sensitive() -> None:
     config = load_config("tiny")
     changed_config = config.model_copy(update={"orders": config.orders + 1})

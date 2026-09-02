@@ -46,7 +46,7 @@ class GeneratorConfig(BaseModel):
     customers: int = Field(gt=0)
     products: int = Field(gt=0)
     orders: int = Field(gt=0)
-    campaigns: int = Field(gt=0)
+    campaigns: int = Field(ge=5)
 
     @model_validator(mode="after")
     def validate_interval(self) -> Self:
