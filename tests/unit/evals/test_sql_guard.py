@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import sqlglot
 from sqlglot import exp
@@ -143,6 +145,56 @@ def test_guard_accepts_mixed_case_comments_schema_qualification_and_safe_name_li
     )
 
     assert _limit_value(validated) == 500
+
+
+def test_guard_accepts_every_checked_in_golden_oracle_query() -> None:
+    oracle_paths = sorted(Path("evals/datasets/golden/sql").glob("G*.sql"))
+
+    assert len(oracle_paths) == 20
+    for oracle_path in oracle_paths:
+        assert validate_baseline_sql(oracle_path.read_text(encoding="utf-8"))
+
+
+def test_guard_accepts_only_required_pure_builtin_functions() -> None:
+    validated = validate_baseline_sql(
+        "select coalesce(sum(category_id), 0), count(*), nullif(abs(-1), 0), "
+        "cast(1 as decimal) from categories"
+    )
+
+    assert _limit_value(validated) == 500
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select pg_notify('unique-notify-secret', 'message')",
+        "select public.pg_notify('channel', 'message')",
+        'select "PG_NOTIFY"(\'channel\', \'message\')',
+        "select PG_ADVISORY_LOCK(1)",
+        "select pg_advisory_lock_shared(1)",
+        "select pg_advisory_xact_lock(1)",
+        "select pg_advisory_xact_lock_shared(1)",
+        "select pg_try_advisory_lock(1)",
+        "select pg_try_advisory_lock_shared(1)",
+        "select pg_try_advisory_xact_lock(1)",
+        "select pg_try_advisory_xact_lock_shared(1)",
+        "select pg_advisory_unlock(1)",
+        "select pg_advisory_unlock_shared(1)",
+        "select pg_advisory_unlock_all()",
+        "select pg_cancel_backend(pg_backend_pid())",
+        "select pg_terminate_backend(pg_backend_pid())",
+        "select lower('not on the golden allowlist')",
+        "select current_setting('search_path')",
+    ],
+)
+def test_guard_fails_closed_for_non_allowlisted_or_side_effect_functions(sql: str) -> None:
+    with pytest.raises(SqlRejected) as raised:
+        validate_baseline_sql(sql)
+
+    assert type(raised.value) is SqlRejected
+    assert str(raised.value) == "baseline SQL rejected"
+    assert "unique-notify-secret" not in str(raised.value)
+    assert raised.value.__cause__ is None
 
 
 @pytest.mark.parametrize(

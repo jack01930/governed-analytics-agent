@@ -13,10 +13,11 @@ from governed_analytics.evals.sql_guard import SqlRejected
 @pytest.mark.asyncio
 async def test_readonly_executor_sets_all_runtime_defenses_and_caps_rows() -> None:
     result = await executor.execute_readonly_sql(
-        "select current_setting('transaction_read_only') as transaction_read_only, "
-        "current_setting('statement_timeout') as statement_timeout, "
-        "current_setting('search_path') as search_path, "
-        "current_setting('TimeZone') as timezone"
+        "select (select setting from pg_settings where name = 'transaction_read_only') "
+        "as transaction_read_only, "
+        "(select setting from pg_settings where name = 'statement_timeout') as statement_timeout, "
+        "(select setting from pg_settings where name = 'search_path') as search_path, "
+        "(select setting from pg_settings where name = 'TimeZone') as timezone"
     )
 
     assert result.columns == (
@@ -25,23 +26,51 @@ async def test_readonly_executor_sets_all_runtime_defenses_and_caps_rows() -> No
         "search_path",
         "timezone",
     )
-    assert result.rows == (("on", "10s", "public, pg_catalog", "UTC"),)
+    assert result.rows == (("on", "10000", "public, pg_catalog", "UTC"),)
 
     capped_rows = await executor.execute_readonly_sql(
-        "select category_id from categories cross join generate_series(1, 501)"
+        "select order_id from orders"
     )
     assert len(capped_rows.rows) == 500
 
     fetched_rows = await executor.execute_readonly_sql(
-        "select generate_series(1, 1000) as value fetch first 10 rows only"
+        "select order_id from orders fetch first 10 rows only"
     )
     assert len(fetched_rows.rows) == 10
 
     with pytest.raises(SqlRejected, match=r"^baseline SQL rejected$"):
         await executor.execute_readonly_sql(
-            "select 1 as value from generate_series(1, 1000) order by value "
-            "fetch first 1 row with ties"
+            "select 1 as value from orders order by value fetch first 1 row with ties"
         )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select pg_notify('guard-reject-channel', 'message')",
+        "select pg_advisory_lock(123456789)",
+        "select pg_terminate_backend(pg_backend_pid())",
+    ],
+)
+async def test_executor_never_connects_for_rejected_function_sql(
+    monkeypatch: pytest.MonkeyPatch,
+    sql: str,
+) -> None:
+    engine_requested = False
+
+    def fail_if_engine_requested(_settings: object) -> None:
+        nonlocal engine_requested
+        engine_requested = True
+        raise AssertionError("rejected function SQL reached the database engine")
+
+    monkeypatch.setattr(executor, "create_async_database_engine", fail_if_engine_requested)
+
+    with pytest.raises(SqlRejected, match=r"^baseline SQL rejected$"):
+        await executor.execute_readonly_sql(sql)
+
+    assert not engine_requested
 
 
 @pytest.mark.integration

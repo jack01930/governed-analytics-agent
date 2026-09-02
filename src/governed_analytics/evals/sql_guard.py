@@ -8,16 +8,17 @@ import sqlglot
 from sqlglot import exp
 
 _MAX_RESULT_ROWS = 500
-_DANGEROUS_FUNCTIONS = frozenset(
-    {
-        "dblink",
-        "lo_export",
-        "lo_import",
-        "pg_ls_dir",
-        "pg_read_file",
-        "pg_sleep",
-        "set_config",
-    }
+_ALLOWED_READONLY_FUNCTION_NODE_TYPES = (
+    exp.Abs,
+    exp.And,
+    exp.Case,
+    exp.Cast,
+    exp.Coalesce,
+    exp.Count,
+    exp.If,
+    exp.Nullif,
+    exp.Or,
+    exp.Sum,
 )
 _FORBIDDEN_NODE_TYPES = (
     exp.Alter,
@@ -78,7 +79,9 @@ def _has_forbidden_content(query: exp.Query) -> bool:
             and node.args["limit_options"].args.get("with_ties") is True
         ):
             return True
-        if isinstance(node, exp.Func) and node.name.lower() in _DANGEROUS_FUNCTIONS:
+        if isinstance(node, exp.Func) and not isinstance(
+            node, _ALLOWED_READONLY_FUNCTION_NODE_TYPES
+        ):
             return True
     return False
 
