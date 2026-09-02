@@ -36,6 +36,7 @@ dependencies = [
 
 [project.scripts]
 governed-data = "governed_analytics.data_generation.cli:main"
+governed-eval = "governed_analytics.evals.cli:main"
 
 [dependency-groups]
 dev = [

@@ -19,10 +19,11 @@ def _normalized(run_steps: list[str]) -> list[str]:
 
 def _assert_database_runs_are_safe(workflow: str) -> None:
     normalized = _normalized(_database_run_steps(workflow))
-    assert normalized[-3:] == [
+    assert normalized[-4:] == [
         "uv run governed-data generate --scale tiny",
         "uv run governed-data verify --scale tiny",
         "uv run pytest tests/unit/metrics tests/integration/metrics -v",
+        "uv run governed-eval baseline --dataset tiny --mode fixture",
     ]
     forbidden = (
         "--scale full",
@@ -31,6 +32,9 @@ def _assert_database_runs_are_safe(workflow: str) -> None:
         "curl",
         "wget",
         "httpie",
+        "model_api_key",
+        "--mode live",
+        "--live",
     )
     assert all(not any(token in step for token in forbidden) for step in normalized)
     assert all("http://" not in step and "https://" not in step for step in normalized)

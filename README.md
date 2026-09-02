@@ -53,12 +53,17 @@ make migrate
 make data-tiny
 make data-verify
 make metrics-check
+make eval-fixture
 ```
 
 `.env` 仅在本地使用且已被 Git 忽略；以上命令不需要模型 key 或外部 API。生成的 CSV 和
 manifest 位于被忽略的 `artifacts/datasets/tiny/`。完整命令、再生安全边界与异常证据见
 [数据生成指南](docs/data-generation.md)，指标公式、窗口和只读约束见
 [指标指南](docs/metrics.md)。
+
+`make eval-fixture` 只在本地 tiny 数据集上运行离线 fixture，并将不可变报告写入被 Git 忽略的
+`artifacts/evals/baseline/fixture/`。该命令 100% 仅证明评测链路可用，不代表模型质量；真实模型调用仍需
+明确执行双重授权命令。评测契约、报告字段、成本快照与 live 边界见[评测指南](docs/evals.md)。
 
 ## Database
 

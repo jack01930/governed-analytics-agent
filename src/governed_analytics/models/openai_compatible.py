@@ -73,6 +73,11 @@ class OpenAICompatibleSqlGenerator:
         self._client = client
         self._model = model
 
+    @property
+    def model(self) -> str:
+        """Return the configured request alias without exposing client configuration."""
+        return self._model
+
     async def generate(self, request: SqlGenerationRequest) -> GeneratedSql:
         started_at = monotonic()
         try:
