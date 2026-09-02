@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import NoReturn
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from governed_analytics.evals.golden import load_golden_cases
 from governed_analytics.evals.models import GoldenCase, QueryResult
+from governed_analytics.persistence.database import create_async_database_engine
 
 
 @pytest.mark.asyncio
@@ -98,6 +99,81 @@ async def test_failure_keeps_existing_expected_files_and_unknown_files_unchanged
     assert expected_file.read_bytes() == b"previous expected truth\n"
     assert unknown_file.read_bytes() == b"preserve me\n"
     assert not list(tmp_path.parent.glob(f".{tmp_path.name}-staging-*"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+@pytest.mark.parametrize("failed_case_id", ["G002", "G020"])
+async def test_publish_failure_rolls_back_all_fixed_expected_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failed_case_id: str
+) -> None:
+    from governed_analytics.evals import oracle
+
+    cases = load_golden_cases("evals/datasets/golden/cases.yaml")
+    old_bytes = {
+        "G001": b"old G001\n",
+        "G004": b"old G004\n",
+        "G020": b"old G020\n",
+    }
+    for case_id, contents in old_bytes.items():
+        (tmp_path / f"{case_id}.json").write_bytes(contents)
+    unknown_file = tmp_path / "notes.json"
+    unknown_file.write_bytes(b"preserve unknown file\n")
+    original_replace = oracle._replace_file
+
+    def fail_one_staged_replace(source: Path, target: Path) -> None:
+        if source.name == f"{failed_case_id}.json" and source.parent.name.startswith(
+            f".{tmp_path.name}-staging-"
+        ):
+            raise OSError("injected staged publish failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(oracle, "_replace_file", fail_one_staged_replace)
+
+    with pytest.raises(OSError, match="injected staged publish failure"):
+        await oracle.materialize_oracles(cases, tmp_path)
+
+    for case in cases:
+        output = tmp_path / f"{case.case_id}.json"
+        if case.case_id in old_bytes:
+            assert output.read_bytes() == old_bytes[case.case_id]
+        else:
+            assert not output.exists()
+    assert unknown_file.read_bytes() == b"preserve unknown file\n"
+    assert not list(tmp_path.parent.glob(f".{tmp_path.name}-staging-*"))
+    assert not list(tmp_path.parent.glob(f".{tmp_path.name}-backup-*"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_dispose_failure_cleans_owned_temporary_directories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from governed_analytics.evals import oracle
+
+    class DisposeFailingEngine:
+        def __init__(self, wrapped: AsyncEngine) -> None:
+            self._wrapped = wrapped
+
+        def connect(self) -> AsyncConnection:
+            return self._wrapped.connect()
+
+        async def dispose(self) -> None:
+            await self._wrapped.dispose()
+            raise RuntimeError("injected disposal URL postgresql://secret@example.invalid")
+
+    cases = load_golden_cases("evals/datasets/golden/cases.yaml")
+    monkeypatch.setattr(
+        "governed_analytics.evals.oracle.create_async_database_engine",
+        lambda settings: DisposeFailingEngine(create_async_database_engine(settings)),
+    )
+
+    with pytest.raises(RuntimeError, match="Oracle materialization cleanup failed"):
+        await oracle.materialize_oracles(cases, tmp_path)
+
+    assert not (tmp_path / "G001.json").exists()
+    assert not list(tmp_path.parent.glob(f".{tmp_path.name}-staging-*"))
+    assert not list(tmp_path.parent.glob(f".{tmp_path.name}-backup-*"))
 
 
 def test_query_result_json_is_deterministic_and_uses_json_mode() -> None:

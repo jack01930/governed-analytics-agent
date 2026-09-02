@@ -115,19 +115,81 @@ def _stage_results(results: dict[str, QueryResult], staging_dir: Path) -> None:
         )
 
 
-def _publish_staged_results(staging_dir: Path, output_dir: Path) -> None:
+def _replace_file(source: Path, target: Path) -> None:
+    """Replace one owned file; isolated to make publish-failure tests precise."""
+    source.replace(target)
+
+
+def _rollback_published_results(
+    output_dir: Path,
+    backup_dir: Path,
+    published_case_ids: Sequence[str],
+    old_case_ids: Sequence[str],
+) -> None:
+    try:
+        for case_id in published_case_ids:
+            (output_dir / f"{case_id}.json").unlink(missing_ok=True)
+        for case_id in old_case_ids:
+            _replace_file(backup_dir / f"{case_id}.json", output_dir / f"{case_id}.json")
+    except Exception:
+        raise RuntimeError("Oracle publish rollback failed") from None
+
+
+def _publish_staged_results(staging_dir: Path, output_dir: Path, backup_dir: Path) -> None:
+    """Publish fixed result files and restore the prior complete snapshot on failure."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    for case_id in _EXPECTED_CASE_IDS:
-        (staging_dir / f"{case_id}.json").replace(output_dir / f"{case_id}.json")
+    original_exists = {
+        case_id: (output_dir / f"{case_id}.json").exists() for case_id in _EXPECTED_CASE_IDS
+    }
+    old_case_ids: list[str] = []
+    published_case_ids: list[str] = []
+    try:
+        for case_id in _EXPECTED_CASE_IDS:
+            if original_exists[case_id]:
+                _replace_file(
+                    output_dir / f"{case_id}.json", backup_dir / f"{case_id}.json"
+                )
+                old_case_ids.append(case_id)
+        for case_id in _EXPECTED_CASE_IDS:
+            _replace_file(staging_dir / f"{case_id}.json", output_dir / f"{case_id}.json")
+            published_case_ids.append(case_id)
+    except Exception:
+        _rollback_published_results(output_dir, backup_dir, published_case_ids, old_case_ids)
+        raise
 
 
-def _cleanup_staging(staging_dir: Path) -> None:
-    if not staging_dir.exists():
+def _cleanup_owned_directory(directory: Path) -> None:
+    if not directory.exists():
         return
-    for staged_file in staging_dir.iterdir():
-        if staged_file.is_file():
-            staged_file.unlink()
-    staging_dir.rmdir()
+    for case_id in _EXPECTED_CASE_IDS:
+        (directory / f"{case_id}.json").unlink(missing_ok=True)
+    directory.rmdir()
+
+
+def _cleanup_temporary_directories(staging_dir: Path, backup_dir: Path) -> None:
+    try:
+        _cleanup_owned_directory(staging_dir)
+    finally:
+        _cleanup_owned_directory(backup_dir)
+
+
+async def _dispose_and_cleanup_after_failure(
+    engine: AsyncEngine | None, staging_dir: Path, backup_dir: Path
+) -> None:
+    cleanup_failed = False
+    try:
+        try:
+            if engine is not None:
+                await engine.dispose()
+        except Exception:
+            cleanup_failed = True
+    finally:
+        try:
+            _cleanup_temporary_directories(staging_dir, backup_dir)
+        except Exception:
+            cleanup_failed = True
+    if cleanup_failed:
+        raise RuntimeError("Oracle materialization cleanup failed") from None
 
 
 async def materialize_oracles(
@@ -141,7 +203,9 @@ async def materialize_oracles(
     destination = Path(output_dir)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging_dir = destination.parent / f".{destination.name}-staging-{uuid4().hex}"
+    backup_dir = destination.parent / f".{destination.name}-backup-{uuid4().hex}"
     staging_dir.mkdir()
+    backup_dir.mkdir()
     engine: AsyncEngine | None = None
     try:
         engine = create_async_database_engine(DatabaseSettings())  # type: ignore[call-arg]
@@ -157,12 +221,32 @@ async def materialize_oracles(
                 case.case_id: await _execute_oracle(connection, case) for case in ordered_cases
             }
         _stage_results(results, staging_dir)
-        _publish_staged_results(staging_dir, destination)
-        return results
-    finally:
+    except Exception:
+        await _dispose_and_cleanup_after_failure(engine, staging_dir, backup_dir)
+        raise
+
+    try:
         if engine is not None:
             await engine.dispose()
-        _cleanup_staging(staging_dir)
+    except Exception:
+        await _dispose_and_cleanup_after_failure(None, staging_dir, backup_dir)
+        raise RuntimeError("Oracle materialization cleanup failed") from None
+    engine = None
+
+    try:
+        _publish_staged_results(staging_dir, destination, backup_dir)
+    except Exception:
+        try:
+            _cleanup_temporary_directories(staging_dir, backup_dir)
+        except Exception:
+            raise RuntimeError("Oracle materialization cleanup failed") from None
+        raise
+
+    try:
+        _cleanup_temporary_directories(staging_dir, backup_dir)
+    except Exception:
+        raise RuntimeError("Oracle materialization cleanup failed") from None
+    return results
 
 
 def _build_parser() -> argparse.ArgumentParser:
