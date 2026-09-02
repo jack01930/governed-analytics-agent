@@ -1,0 +1,11 @@
+provider: aliyun_model_studio
+region: cn-beijing
+requested_model: qwen3.7-plus
+resolved_model: qwen3.7-plus-2026-05-26
+effective_date: 2026-09-01
+currency: CNY
+unit_tokens: 1000000
+input_token_upper_bound: 262144
+input_price: "2.00"
+output_price: "8.00"
+source: https://help.aliyun.com/zh/model-studio/qwen3-7-plus
