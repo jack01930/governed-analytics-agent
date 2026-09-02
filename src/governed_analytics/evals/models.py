@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+_EXPECTED_EVALUATION_CASE_IDS = tuple(f"G{number:03d}" for number in range(1, 21))
+
 
 class _FrozenWireModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -120,9 +122,9 @@ class BaselineRunReport(_FrozenWireModel):
             raise ValueError("resolved_models must be a sorted, unique tuple")
         if any(not model for model in self.resolved_models):
             raise ValueError("resolved_models cannot contain empty values")
-        if not self.cases:
-            raise ValueError("baseline reports require at least one case")
         case_ids = tuple(case.case_id for case in self.cases)
         if len(set(case_ids)) != len(case_ids):
             raise ValueError("baseline reports cannot contain duplicate case IDs")
+        if case_ids != _EXPECTED_EVALUATION_CASE_IDS:
+            raise ValueError("baseline reports require exactly 20 ordered G001 through G020 cases")
         return self
