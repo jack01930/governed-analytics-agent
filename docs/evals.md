@@ -13,7 +13,7 @@ Decimal 容差评分。`passed` 表示分数 1；`wrong_answer` 表示已执行�
 报告目录不可覆盖，包含 JSON、Markdown 和 20 个逐用例 JSON；汇总保留准确率、有效 SQL 率、执行成功率、
 P50/P95 延迟、tokens 和精确 CNY 成本。JSON 为审计轨迹保留生成 SQL；异常原文、密钥与端点永不写入，Markdown
 不嵌入 SQL。fixture 报告会明确标为
-“Harness validation, not model quality.”：`make eval-fixture` 的 100% 仅验证离线评测链路，live 结果才是模型
+“评测链路验证，不代表模型质量”（报告原始固定标记：`Harness validation, not model quality.`）：`make eval-fixture` 的 100% 仅验证离线评测链路，live 结果才是模型
 基线。
 
 默认安全命令为：

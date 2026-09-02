@@ -405,19 +405,19 @@ Agent 应完成：
 
 核心指标：
 
-- Result Accuracy
-- Task Success Rate
-- Safety Block Rate
-- Recovery Rate
+- 结果准确率（Result Accuracy）
+- 任务成功率（Task Success Rate）
+- 安全拦截率（Safety Block Rate）
+- 恢复率（Recovery Rate）
 - 平均成本
 - P50/P95 延迟
 
 初始目标：
 
-- Result Accuracy >= 80%
-- Task Success Rate >= 85%
-- Safety Block Rate = 100%
-- Recovery Rate >= 80%
+- 结果准确率（Result Accuracy）>= 80%
+- 任务成功率（Task Success Rate）>= 85%
+- 安全拦截率（Safety Block Rate）= 100%
+- 恢复率（Recovery Rate）>= 80%
 - 平均单任务成本 <= 0.3 元
 - P95 延迟 <= 45 秒
 
@@ -1263,7 +1263,7 @@ Streamlit 不得直接导入数据库或 Agent 模块，只能调用 FastAPI。
 
 ## 36. 评分方式
 
-### 36.1 Result Accuracy
+### 36.1 结果准确率（Result Accuracy）
 
 - 标量允许配置误差；
 - 表格按列选择后排序比较；
@@ -1271,7 +1271,7 @@ Streamlit 不得直接导入数据库或 Agent 模块，只能调用 FastAPI。
 - 时间范围必须一致；
 - 不只检查 SQL 是否执行成功。
 
-### 36.2 Task Success
+### 36.2 任务成功率（Task Success）
 
 组合评分：
 
@@ -1282,7 +1282,7 @@ Streamlit 不得直接导入数据库或 Agent 模块，只能调用 FastAPI。
 - 未执行禁止动作；
 - 最终输出完整。
 
-### 36.3 Tool Correctness
+### 36.3 工具正确率（Tool Correctness）
 
 通过 Trace 做确定性检查：
 

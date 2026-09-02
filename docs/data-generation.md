@@ -32,9 +32,9 @@ NumPy RNG（`named_rng(seed, namespace)`），不调用模型、网络或外部 
 | ID | UTC 窗口 / 配额 | 突变 | 可观察信号 |
 | --- | --- | --- | --- |
 | `anomaly_gmv_drop_south_conversion` | 2026-06-08 至 06-15 | 华南已转化会话按稳定 identity 反转 35%（等价目标转化概率 0.65） | 华南 GMV、已转化会话较前周下降 |
-| `anomaly_gmv_drop_stockout` | 2026-06-08 至 06-15 | `SKU-000001/2` 可售量清零；按各自 eligible cohort 的稳定顺序取 floor(90%) 抑制订单行（tiny 各 18；full 为 1,803、1,804，合计 3,607，以 manifest 为准） | 两个商品对 GMV 损失有实质贡献 |
+| `anomaly_gmv_drop_stockout` | 2026-06-08 至 06-15 | `SKU-000001/2` 可售量清零；按各自符合条件的群组稳定顺序取 floor(90%) 抑制订单行（tiny 各 18；full 为 1,803、1,804，合计 3,607，以清单为准） | 两个商品对 GMV 损失有实质贡献 |
 | `anomaly_refund_spike_category` | 2026-05-04 至 05-11 | `CAT-018` 成功退款概率由 0.06 提至 0.24 | 品类退款率至少为 2 倍 |
-| `anomaly_inventory_delay` | 2026-06-15 | 删除 08:00 UTC 后库存快照并写失败 pipeline run | freshness watermark 过期 |
+| `anomaly_inventory_delay` | 2026-06-15 | 删除 UTC 08:00 后的库存快照，并写入失败的流水线运行记录 | 新鲜度 watermark 过期 |
 | `anomaly_duplicate_order_items` | 2026-04-10；20 / 2,000 | 复制相同 `source_line_id`，新主键 | 逻辑重复数精确为配额 |
 | `anomaly_order_amount_mismatch` | 2026-03-17；10 / 1,000 | `payable_amount` 增加 CNY 10.00 | 订单/明细对账失败数精确为配额 |
 | `anomaly_missing_region` | 2026-02-12；10 / 1,000 | `orders.region = NULL` | 完整性空值数精确为配额 |
@@ -57,7 +57,7 @@ NumPy RNG（`named_rng(seed, namespace)`），不调用模型、网络或外部 
 - `anomaly_manifest.json`：异常真值；
 - `dataset_manifest.json`：dataset/config/seed/scale 和按数据库 `COPY TO` 计算的 12 表摘要。
 
-源摘要与数据库摘要刻意不同：前者是生成 CSV，后者是数据库 canonical export。
+源摘要与数据库摘要刻意不同：前者来自生成的 CSV，后者来自数据库规范导出。
 载入程序仅以 `analytics_loader` 最小权限角色连接，迁移 `0003` 的
 `reset_analytics_dataset()` 在单一事务内清空并用 1 MiB chunk 的 PostgreSQL `COPY`
 重新载入；不逐行 INSERT。只读指标使用 `analytics_readonly`。
@@ -75,10 +75,10 @@ uv run governed-data verify --scale full --output artifacts/datasets
 ```
 
 `generate` 固定读取仓库内 `data/generator/{tiny,full}.yaml`，只接受 scale 和
-output root；不会接受数据库、表或配置路径。`verify` 先严格读取既有 expected
-manifest/anomaly/source 证据，随后在同一 output filesystem 的临时目录独立生成并
+输出根目录；不会接受数据库、表或配置路径。`verify` 先严格读取既有预期
+清单/异常/源证据，随后在同一输出文件系统的临时目录独立生成并
 载入数据库，比较 dataset/config/seed/scale、固定顺序的 12 个表 count/DB SHA-256、
-canonical anomaly manifest 和 source evidence；它从不先覆盖 expected，临时目录总会清理。
+规范异常清单与源证据；它从不预先覆盖预期值，临时目录始终会清理。
 安全再生的方式是明确执行 `generate` 覆盖该 scale 的已知 artifacts，绝不递归删除用户目录。
 
 ## 实测性能与本地证据
