@@ -641,7 +641,8 @@ def inject_anomalies(config: GeneratorConfig, base: GeneratedFacts) -> AnomalyIn
         _in_window(orders, "ordered_at", missing_day, missing_day + timedelta(days=1))
     ].sort_values("order_id", kind="stable")
     missing_orders = _require_count("missing region", missing_scope, counts["missing_region"])
-    orders.loc[missing_orders.index, "region"] = None
+    orders.loc[missing_orders.index, "region"] = pd.NA
+    orders["region"] = orders["region"].astype("string")
     records.append(
         AnomalyRecord(
             anomaly_id="anomaly_missing_region",

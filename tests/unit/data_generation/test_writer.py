@@ -69,7 +69,7 @@ def test_canonical_csv_distinguishes_empty_strings_from_nulls(tmp_path: Path) ->
     frame = pd.DataFrame(
         {
             "id": [1, 2, 3],
-            "text_value": ["", None, pd.NA],
+            "text_value": pd.Series(["", pd.NA, pd.NA], dtype="string"),
             "occurred_at": [pd.NaT, pd.NaT, pd.NaT],
             "maybe_id": pd.Series([7, None, None], dtype="Int64"),
         }
@@ -85,7 +85,10 @@ def test_canonical_csv_distinguishes_empty_strings_from_nulls(tmp_path: Path) ->
     )
 
 
-@pytest.mark.parametrize("value", [1.0, float("nan"), np.float64(1.0), np.float64("nan")])
+@pytest.mark.parametrize(
+    "value",
+    [1.0, float("nan"), float("inf"), float("-inf"), np.float64(1.0), np.float64("nan")],
+)
 def test_canonical_csv_rejects_all_float_values(value: float, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="float"):
         write_canonical_csv(
@@ -93,6 +96,33 @@ def test_canonical_csv_rejects_all_float_values(value: float, tmp_path: Path) ->
             tmp_path / "float.csv",
             sort_by=("id",),
         )
+
+
+def test_canonical_csv_rejects_nan_from_string_dtype_and_does_not_replace_artifact(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "string-nan.csv"
+    path.write_bytes(b"known-good\n")
+    frame = pd.DataFrame(
+        {
+            "id": [1],
+            "value": pd.Series([np.nan], dtype=pd.StringDtype(na_value=np.nan)),
+        }
+    )
+
+    with pytest.raises(ValueError, match="float"):
+        write_canonical_csv(frame, path, sort_by=("id",))
+
+    assert path.read_bytes() == b"known-good\n"
+
+
+def test_canonical_csv_writes_default_string_dtype_pd_na_as_null_sentinel(tmp_path: Path) -> None:
+    path = tmp_path / "string-na.csv"
+    frame = pd.DataFrame({"id": [1], "value": pd.Series([pd.NA], dtype="string")})
+
+    write_canonical_csv(frame, path, sort_by=("id",))
+
+    assert path.read_bytes() == b"id,value\n1,\\N\n"
 
 
 def test_canonical_csv_rejects_reserved_null_sentinel(tmp_path: Path) -> None:

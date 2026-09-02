@@ -2,6 +2,8 @@
 
 import csv
 import json
+import os
+import tempfile
 from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -24,15 +26,13 @@ def _format_datetime(value: datetime) -> str:
     return value.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _format_value(value: object, *, string_null: bool = False) -> object:
+def _format_value(value: object) -> object:
     """Return a CSV-safe scalar while preserving the dataset type contract."""
     if value is None or value is pd.NA or value is pd.NaT:
         return CSV_NULL
     if isinstance(value, bool):
         return "True" if value else "False"
     if isinstance(value, (float, np.floating)):
-        if string_null and np.isnan(value):
-            return CSV_NULL
         raise ValueError("float values are not canonical; use Decimal or an integer")
     if isinstance(value, str) and value == CSV_NULL:
         raise ValueError("string value equals reserved NULL sentinel \\N")
@@ -82,21 +82,30 @@ def write_canonical_csv(
         raise ValueError("CSV output columns must be unique")
 
     canonical = frame.sort_values(list(sort_by), kind="stable")
-    string_nulls = tuple(
-        isinstance(canonical[column].dtype, pd.StringDtype) for column in output_columns
-    )
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as target:
-        output = csv.writer(target, lineterminator="\n")
-        output.writerow(output_columns)
-        for row in canonical.loc[:, output_columns].itertuples(index=False, name=None):
-            output.writerow(
-                [
-                    _format_value(value, string_null=string_null)
-                    for value, string_null in zip(row, string_nulls, strict=True)
-                ]
-            )
-    return sha256_file(path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as target:
+            temporary_path = Path(target.name)
+            output = csv.writer(target, lineterminator="\n")
+            output.writerow(output_columns)
+            for row in canonical.loc[:, output_columns].itertuples(index=False, name=None):
+                output.writerow([_format_value(value) for value in row])
+        digest = sha256_file(temporary_path)
+        os.replace(temporary_path, path)
+        return digest
+    except Exception:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def write_canonical_json(value: Any, path: Path) -> str:

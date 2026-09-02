@@ -139,7 +139,7 @@ def test_copy_preserves_empty_text_and_null_sentinel_in_one_rolled_back_transact
             "status": ["succeeded", "succeeded"],
             "watermark": [None, None],
             "row_count": pd.Series([None, None], dtype="Int64"),
-            "error_code": ["", None],
+            "error_code": pd.Series(["", pd.NA], dtype="string"),
         }
     )
     write_canonical_csv(frame, csv_path, sort_by=("pipeline_name",))
