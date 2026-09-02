@@ -34,3 +34,6 @@ jobs:
       - run: docker compose up -d --wait db
       - run: uv run alembic upgrade head
       - run: uv run pytest tests/integration/persistence -v
+      - run: uv run governed-data generate --scale tiny
+      - run: uv run governed-data verify --scale tiny
+      - run: uv run pytest tests/unit/metrics tests/integration/metrics -v

@@ -2,7 +2,8 @@
 
 面向电商运营分析师的可治理数据分析智能体，也是一个针对 Agent/大模型应用开发实习岗位设计的旗舰作品集项目。
 
-项目目前处于“仓库与本地开发环境已就绪、尚未开始功能实现”阶段。正式需求、技术架构、评测方案和八周路线见 [项目计划设计文档](GOVERNED_ANALYTICS_AGENT_PLAN.md)。
+项目已具备本地 PostgreSQL 基线、最小权限角色、可复现模拟数据与首批 15 个受治理指标。
+正式需求、技术架构、评测方案和八周路线见 [项目计划设计文档](GOVERNED_ANALYTICS_AGENT_PLAN.md)。
 
 ## 项目目标
 
@@ -43,13 +44,31 @@ cp .env.example .env
 
 当前机器的检查结果、尚缺工具和处理建议见 [启动就绪报告](docs/STARTUP_READINESS.md)。
 
+## 本地快速开始
+
+```bash
+cp .env.example .env
+make db-up
+make migrate
+make data-tiny
+make data-verify
+make metrics-check
+```
+
+`.env` 仅在本地使用且已被 Git 忽略；以上命令不需要模型 key 或外部 API。生成的 CSV 和
+manifest 位于被忽略的 `artifacts/datasets/tiny/`。完整命令、再生安全边界与异常证据见
+[数据生成指南](docs/data-generation.md)，指标公式、窗口和只读约束见
+[指标指南](docs/metrics.md)。
+
 ## Database
 
-本地 PostgreSQL、Alembic 迁移、最小权限角色和测试工作流已就绪。连接角色、12 张业务表、可复制的开发命令及权限边界见 [数据库开发指南](docs/database.md)。
+本地 PostgreSQL、Alembic 迁移 `0001`–`0003`、最小权限角色和测试工作流已就绪。连接角色、
+12 张业务表、可复制的开发命令及权限边界见 [数据库开发指南](docs/database.md)。
 
 ## 当前边界
 
-- 本地开发基线包含 Docker Compose PostgreSQL、Alembic `0001`/`0002` 迁移和 12 张业务表；应用功能仍按项目路线逐步实现。
+- 本地开发基线包含 Docker Compose PostgreSQL、Alembic `0001`–`0003` 迁移、12 张业务表和固定
+  synthetic dataset；full 数据集仅允许本地显式生成，绝不进入 CI。
 - GitHub 远程仓库已配置；未经确认，不进行云端部署或公开发布。
 - 未经确认，不创建云资源、不产生付费调用、不使用真实个人或企业数据。
 

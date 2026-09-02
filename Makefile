@@ -1,6 +1,6 @@
 PYTHON ?= python3.12
 
-.PHONY: doctor venv sync lint format typecheck test check db-up db-down migrate migration-check test-integration
+.PHONY: doctor venv sync lint format typecheck test check db-up db-down migrate migration-check test-integration data-tiny data-full data-verify metrics-check
 
 doctor:
 	@bash scripts/check_environment.sh
@@ -39,5 +39,17 @@ migration-check:
 
 test-integration:
 	@uv run pytest tests/integration -v
+
+data-tiny:
+	@uv run governed-data generate --scale tiny
+
+data-full:
+	@uv run governed-data generate --scale full
+
+data-verify:
+	@uv run governed-data verify --scale tiny
+
+metrics-check:
+	@uv run pytest tests/unit/metrics tests/integration/metrics -v
 
 check: lint typecheck test
