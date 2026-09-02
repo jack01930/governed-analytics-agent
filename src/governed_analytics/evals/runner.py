@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -13,6 +14,7 @@ from governed_analytics.evals.context import (
     EVALUATION_CONTEXT_VERSION,
     build_metric_context,
     build_schema_context,
+    context_sha256,
 )
 from governed_analytics.evals.executor import execute_readonly_sql
 from governed_analytics.evals.golden import load_golden_cases
@@ -72,14 +74,27 @@ def _load_expected_results(path: str | Path) -> dict[str, QueryResult]:
             raise ValueError
         for case_id in _EXPECTED_CASE_IDS:
             result_path = directory / f"{case_id}.json"
+            raw_result = json.loads(
+                result_path.read_text(encoding="utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
             results[case_id] = QueryResult.model_validate_json(
-                result_path.read_text(encoding="utf-8"), strict=True
+                json.dumps(raw_result, ensure_ascii=False), strict=True
             )
     except Exception:
         raise BaselineRunError("baseline truth unavailable") from None
     if tuple(results) != _EXPECTED_CASE_IDS:
         raise BaselineRunError("baseline truth unavailable")
     return results
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate expected JSON key")
+        result[key] = value
+    return result
 
 
 def _load_tiny_manifest(path: str | Path) -> DatasetManifest:
@@ -143,6 +158,7 @@ async def run_baseline(
         manifest = _load_tiny_manifest(manifest_path)
         schema_context = build_schema_context()
         metric_context = build_metric_context()
+        context_digest = context_sha256(schema_context, metric_context)
     except BaselineRunError:
         raise
     except Exception:
@@ -258,19 +274,33 @@ async def run_baseline(
                 )
             )
             continue
-        score = score_result(case, expected[case.case_id], actual)
-        case_results.append(
-            BaselineCaseResult(
-                case_id=case.case_id,
-                generated_sql=generated.sql,
-                status="passed" if score == Decimal("1") else "wrong_answer",
-                score=score,
-                latency_ms=generated.latency_ms,
-                input_tokens=generated.input_tokens,
-                output_tokens=generated.output_tokens,
-                estimated_cost_cny=cost,
+        try:
+            score = score_result(case, expected[case.case_id], actual)
+            case_results.append(
+                BaselineCaseResult(
+                    case_id=case.case_id,
+                    generated_sql=generated.sql,
+                    status="passed" if score == Decimal("1") else "wrong_answer",
+                    score=score,
+                    latency_ms=generated.latency_ms,
+                    input_tokens=generated.input_tokens,
+                    output_tokens=generated.output_tokens,
+                    estimated_cost_cny=cost,
+                )
             )
-        )
+        except Exception:
+            case_results.append(
+                _error_case(
+                    case.case_id,
+                    generated_sql=generated.sql,
+                    latency_ms=generated.latency_ms,
+                    input_tokens=generated.input_tokens,
+                    output_tokens=generated.output_tokens,
+                    cost=cost,
+                    status="execution_error",
+                    error_type="scoring_failed",
+                )
+            )
     try:
         report = build_baseline_run_report(
             case_results,
@@ -278,7 +308,9 @@ async def run_baseline(
             mode=mode,  # type: ignore[arg-type]
             dataset_id=manifest.dataset_id,
             model=requested_model,
-            prompt_version=f"{BASELINE_PROMPT_VERSION}+{EVALUATION_CONTEXT_VERSION}",
+            prompt_version=(
+                f"{BASELINE_PROMPT_VERSION}+{EVALUATION_CONTEXT_VERSION}+sha256:{context_digest}"
+            ),
             requested_model=requested_model,
             resolved_models=tuple(sorted(resolved_models)),
         )

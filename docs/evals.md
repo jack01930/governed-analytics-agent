@@ -3,7 +3,7 @@
 Week 1 使用 20 条版本化黄金业务问题（`G001` 到 `G020`）建立直接 Text-to-SQL 基线。每条问题有一条受控
 Oracle 查询及其在 tiny 数据集上物化的只读结果；Oracle 是评测真值，不会发送给模型。模型上下文固定来自
 迁移 `0001` 的 12 张公开分析表、字段/类型、主外键与必要枚举，以及固定顺序的 15 个治理指标元数据。上下文
-版本会并入 prompt version，且不含答案、Oracle SQL、异常清单、case ID、凭据或特权重置函数。
+版本和基于实际 UTF-8 上下文字节的 SHA-256 会并入 prompt version，且不含答案、Oracle SQL、异常清单、case ID、凭据或特权重置函数。
 
 每个用例只允许一次生成、一次 SQL 执行、一次评分：没有重试、修复、工具循环或 LangGraph。SQL 先经过窄
 只读 guard，再在 `analytics_readonly` 的只读、10 秒超时事务中执行。标量、表、top-k、布尔结果按列、键和

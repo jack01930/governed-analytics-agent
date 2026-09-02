@@ -24,12 +24,16 @@ class _Generator:
         outcome = self.outcomes.get(case_id)
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome if isinstance(outcome, GeneratedSql) else GeneratedSql(
-            sql="select 1 as gmv",
-            provider_model="fake-model",
-            input_tokens=2,
-            output_tokens=3,
-            latency_ms=4,
+        return (
+            outcome
+            if isinstance(outcome, GeneratedSql)
+            else GeneratedSql(
+                sql="select 1 as gmv",
+                provider_model="fake-model",
+                input_tokens=2,
+                output_tokens=3,
+                latency_ms=4,
+            )
         )
 
 
@@ -103,6 +107,14 @@ def test_expected_truth_requires_exact_twenty_fixed_case_files(tmp_path: Path) -
     with pytest.raises(BaselineRunError, match=r"^baseline truth unavailable$"):
         _load_expected_results(copied)
 
+    (copied / "G021.json").unlink()
+    (copied / "G001.json").write_text(
+        '{"columns":["first"],"columns":["gmv"],"rows":[["1"]]}', encoding="utf-8"
+    )
+    with pytest.raises(BaselineRunError, match=r"^baseline truth unavailable$") as error:
+        _load_expected_results(copied)
+    assert error.value.__cause__ is None
+
 
 @pytest.mark.asyncio
 async def test_runner_preserves_model_adapter_category_and_sanitizes_publish_failure(
@@ -139,3 +151,70 @@ async def test_runner_preserves_model_adapter_category_and_sanitizes_publish_fai
             executor=fake_executor,
         )
     assert error.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_runner_continues_after_scoring_failure_without_raw_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    generator = _Generator({})
+    executor_calls: list[str] = []
+
+    async def fake_executor(sql: str) -> QueryResult:
+        executor_calls.append(sql)
+        return QueryResult(columns=("gmv",), rows=((Decimal("1"),),))
+
+    monkeypatch.setattr(
+        "governed_analytics.evals.runner.FixtureSqlGenerator.from_path",
+        lambda *_args: generator,
+    )
+    monkeypatch.setattr(
+        "governed_analytics.evals.runner.score_result",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("score-marker")),
+    )
+    monkeypatch.setattr(
+        "governed_analytics.evals.runner.write_baseline_report",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    report = await run_baseline(mode="fixture", output_root=tmp_path, executor=fake_executor)
+
+    assert len(generator.calls) == 20
+    assert len(executor_calls) == 20
+    assert [case.case_id for case in report.cases] == [f"G{number:03d}" for number in range(1, 21)]
+    assert all(case.status == "execution_error" for case in report.cases)
+    assert all(case.error_type == "scoring_failed" for case in report.cases)
+    assert all("score-marker" not in str(case) for case in report.cases)
+
+
+@pytest.mark.asyncio
+async def test_report_prompt_identity_binds_exact_context_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    generator = _Generator({})
+    contexts = {"schema": "schema-v1", "metrics": "metrics-v1"}
+
+    async def fake_executor(_sql: str) -> QueryResult:
+        return QueryResult(columns=("gmv",), rows=((Decimal("1"),),))
+
+    monkeypatch.setattr(
+        "governed_analytics.evals.runner.FixtureSqlGenerator.from_path",
+        lambda *_args: generator,
+    )
+    monkeypatch.setattr(
+        "governed_analytics.evals.runner.build_schema_context",
+        lambda: contexts["schema"],
+    )
+    monkeypatch.setattr(
+        "governed_analytics.evals.runner.build_metric_context",
+        lambda: contexts["metrics"],
+    )
+    monkeypatch.setattr(
+        "governed_analytics.evals.runner.write_baseline_report",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    first = await run_baseline(mode="fixture", output_root=tmp_path, executor=fake_executor)
+    contexts["metrics"] = "metrics-v2"
+    second = await run_baseline(mode="fixture", output_root=tmp_path, executor=fake_executor)
+
+    assert first.prompt_version != second.prompt_version
+    assert "sha256:" in first.prompt_version

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from hashlib import sha256
 from pathlib import Path
 
 from governed_analytics.metrics.catalog import load_metric_catalog
@@ -28,6 +29,18 @@ _PUBLIC_TABLES = (
     "campaign_attributions",
     "pipeline_runs",
 )
+
+
+def context_sha256(schema_context: str, metric_context: str) -> str:
+    """Hash exact UTF-8 context bytes with unambiguous field boundaries."""
+    digest = sha256()
+    for name, contents in ((b"schema", schema_context), (b"metrics", metric_context)):
+        encoded = contents.encode("utf-8")
+        digest.update(name)
+        digest.update(b"\0")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _migration_tables(source: str) -> dict[str, str]:

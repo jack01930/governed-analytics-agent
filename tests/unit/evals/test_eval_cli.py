@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
+from governed_analytics.config import ModelSettings
 from governed_analytics.evals import cli
 
 
@@ -35,14 +36,28 @@ def test_live_requires_nonblank_key_before_client(
 ) -> None:
     calls: list[object] = []
     monkeypatch.setattr(cli, "AsyncOpenAI", lambda **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(
-        cli,
-        "ModelSettings",
-        lambda: SimpleNamespace(model_api_key=None if key is None else SecretStr(key)),
-    )
+    settings = ModelSettings(model_api_key=key, _env_file=None)  # type: ignore[call-arg,arg-type]
+    monkeypatch.setattr(cli, "ModelSettings", lambda: settings)
     assert cli.main(["baseline", "--dataset", "tiny", "--mode", "live", "--live"]) == 2
     assert capsys.readouterr().err.strip() == "MODEL_API_KEY is not configured"
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("baseline", "--dataset", "unique-dataset-marker", "--mode", "fixture"),
+        ("baseline", "--dataset", "tiny", "--mode", "unique-mode-marker"),
+        ("baseline", "--dataset", "tiny", "--mode", "fixture", "--unique-unknown-marker"),
+    ),
+)
+def test_argparse_errors_are_stable_and_do_not_echo_raw_input(
+    capsys: pytest.CaptureFixture[str], argv: tuple[str, ...]
+) -> None:
+    assert cli.main(argv) == 2
+    stderr = capsys.readouterr().err.strip()
+    assert stderr == "Invalid governed-eval arguments"
+    assert "unique-" not in stderr
 
 
 def test_live_constructs_once_only_after_all_preflights(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,6 +77,7 @@ def test_live_constructs_once_only_after_all_preflights(monkeypatch: pytest.Monk
             requested_model="configured-alias", resolved_model="configured-snapshot"
         ),
     )
+
     def fake_client(**kwargs: Any) -> object:
         calls.append(kwargs)
         return object()

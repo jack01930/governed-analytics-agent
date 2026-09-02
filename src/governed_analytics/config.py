@@ -117,6 +117,14 @@ class ModelSettings(BaseSettings):
             raise ValueError(error)
         return model_base_url
 
+    @field_validator("model_api_key", mode="before")
+    @classmethod
+    def normalize_unconfigured_model_api_key(cls, model_api_key: object) -> object:
+        """Normalize raw empty environment input before ``SecretStr`` is constructed."""
+        if model_api_key is None or (isinstance(model_api_key, str) and not model_api_key.strip()):
+            return None
+        return model_api_key
+
     @model_validator(mode="after")
     def validate_model_names(self) -> "ModelSettings":
         if not self.model_name.strip() or not self.eval_model_name.strip():

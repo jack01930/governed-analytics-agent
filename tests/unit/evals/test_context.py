@@ -8,6 +8,7 @@ from governed_analytics.evals.context import (
     EVALUATION_CONTEXT_VERSION,
     build_metric_context,
     build_schema_context,
+    context_sha256,
 )
 
 
@@ -45,3 +46,12 @@ def test_contexts_are_stable_complete_and_do_not_leak_golden_truth(
     assert "METRIC gmv version=1.0.0" in metrics
     for prohibited in ("oracle", "expected", "anomaly", "reset_dataset"):
         assert prohibited not in (schema + metrics).lower()
+
+
+def test_context_digest_changes_for_any_schema_or_metric_byte() -> None:
+    schema = build_schema_context()
+    metrics = build_metric_context()
+
+    assert context_sha256(schema, metrics) == context_sha256(schema, metrics)
+    assert context_sha256(schema + "x", metrics) != context_sha256(schema, metrics)
+    assert context_sha256(schema, metrics + "x") != context_sha256(schema, metrics)

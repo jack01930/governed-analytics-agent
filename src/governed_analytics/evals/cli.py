@@ -7,7 +7,7 @@ import asyncio
 import sys
 from collections.abc import Sequence
 from contextlib import suppress
-from typing import Literal
+from typing import Literal, Never
 
 from openai import AsyncOpenAI
 
@@ -20,8 +20,17 @@ from governed_analytics.models.protocols import SqlGenerator
 _PRICING_PATH = "data/pricing/qwen3.7-plus-2026-09-01.yaml"
 
 
+class _CliArgumentError(ValueError):
+    """Internal marker for a public, input-free argparse failure."""
+
+
+class _StableArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> Never:
+        raise _CliArgumentError
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="governed-eval")
+    parser = _StableArgumentParser(prog="governed-eval")
     command = parser.add_subparsers(dest="command", required=True)
     baseline = command.add_parser("baseline")
     baseline.add_argument("--dataset", required=True, choices=("tiny", "full"))
@@ -58,7 +67,10 @@ def _run(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    try:
+        args = _parser().parse_args(argv)
+    except _CliArgumentError:
+        return _failure("Invalid governed-eval arguments")
     if args.dataset != "tiny":
         return _failure("Week 1 baseline supports only dataset tiny")
     if args.mode == "fixture":
@@ -74,7 +86,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         return _failure("MODEL settings are invalid")
     secret = settings.model_api_key
-    if secret is None or not secret.get_secret_value().strip():
+    if secret is None:
         return _failure("MODEL_API_KEY is not configured")
     try:
         pricing = load_model_pricing(_PRICING_PATH)
