@@ -12,9 +12,14 @@ import sqlglot
 from sqlglot import exp
 
 from governed_analytics.evals.models import GeneratedSql
-from governed_analytics.models.protocols import SqlGenerationRequest
+from governed_analytics.models.protocols import EvaluationGenerationRequest, SqlGenerationRequest
 
 _EXPECTED_CASE_IDS = tuple(f"G{number:03d}" for number in range(1, 21))
+_EXPECTED_WEEK2_CASE_IDS = tuple(
+    [f"C2{number:02d}" for number in range(1, 21)]
+    + [f"P2{number:02d}" for number in range(1, 21)]
+    + [f"B2{number:02d}" for number in range(1, 11)]
+)
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -141,6 +146,44 @@ class FixtureSqlGenerator:
             sql = self._sql_by_case_id[request.case_id]
         except KeyError as error:
             raise FixtureContractError("fixture SQL unavailable") from error
+        return GeneratedSql(
+            sql=sql,
+            assumptions=(),
+            provider_model="fixture-oracle",
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=0,
+        )
+
+
+class Week2FixtureSqlGenerator:
+    """No-network generator for the fixed 50 Week 2 execute cases."""
+
+    def __init__(self, sql_by_case_id: Mapping[str, str]) -> None:
+        if tuple(sql_by_case_id) != _EXPECTED_WEEK2_CASE_IDS:
+            raise FixtureContractError(
+                "invalid Week 2 fixture: execute IDs must be ordered and complete"
+            )
+        validated: dict[str, str] = {}
+        for case_id, sql in sql_by_case_id.items():
+            if not isinstance(sql, str):
+                raise FixtureContractError("invalid Week 2 fixture: invalid SQL")
+            try:
+                _parse_query(sql)
+            except FixtureContractError:
+                raise FixtureContractError("invalid Week 2 fixture: invalid SQL") from None
+            validated[case_id] = sql
+        self._sql_by_case_id = MappingProxyType(validated)
+
+    @property
+    def case_ids(self) -> tuple[str, ...]:
+        return tuple(self._sql_by_case_id)
+
+    async def generate(self, request: EvaluationGenerationRequest) -> GeneratedSql:
+        try:
+            sql = self._sql_by_case_id[request.case_id]
+        except KeyError as error:
+            raise FixtureContractError("Week 2 fixture SQL unavailable") from error
         return GeneratedSql(
             sql=sql,
             assumptions=(),

@@ -17,3 +17,5 @@ def test_makefile_does_not_hide_live_model_authorization() -> None:
 
     assert "--mode live" not in makefile
     assert "--live" not in makefile
+    assert "eval-week2-fixture:" in makefile
+    assert "governed-eval week2 --dataset tiny --mode fixture" in makefile

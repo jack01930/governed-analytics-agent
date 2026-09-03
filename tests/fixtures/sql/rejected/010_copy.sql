@@ -1,0 +1,1 @@
+copy categories to stdout

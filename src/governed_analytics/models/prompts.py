@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from governed_analytics.models.protocols import SqlGenerationRequest
+from governed_analytics.models.protocols import EvaluationGenerationRequest, SqlGenerationRequest
 
 BASELINE_PROMPT_VERSION = "baseline-system-v2"
 BASELINE_SYSTEM_PROMPT_V2 = (
@@ -18,7 +18,9 @@ BASELINE_SYSTEM_PROMPT_V2 = (
 )
 
 
-def build_baseline_user_prompt(request: SqlGenerationRequest) -> str:
+def build_baseline_user_prompt(
+    request: SqlGenerationRequest | EvaluationGenerationRequest,
+) -> str:
     """Build the byte-stable user message for a single baseline request."""
     return (
         "QUESTION:\n"

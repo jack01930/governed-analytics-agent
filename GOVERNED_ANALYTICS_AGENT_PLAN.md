@@ -1,11 +1,11 @@
 # Governed Analytics Agent 项目计划设计文档
 
 > 面向电商运营的可治理数据分析智能体
-> 文档版本：v1.1
+> 文档版本：v1.2
 > 制定日期：2026-09-01
-> 最近同步：2026-09-03
+> 最近同步：2026-09-04
 > 项目周期：8 周
-> 当前阶段：第 1 周 Baseline 与 DeepSeek v1/v2 live 已完成；依据 v2 实测进入第 2 周评测有效性与安全工具层
+> 当前阶段：第 2 周评测有效性与安全工具层已完成；Week 2 live 待新的明确授权，工程上可进入第 3 周
 
 ---
 
@@ -22,7 +22,7 @@
 5. 8 周实施计划；
 6. 项目验收、作品集与面试交付要求。
 
-本项目已完成第 1 周离线实现与 DeepSeek v1/v2 live 基线，正在执行由实测导出的第 2 周安全工具层。除非用户另行明确要求，
+本项目已完成第 1 周离线实现与 DeepSeek v1/v2 live 基线，以及由实测导出的第 2 周安全工具层。除非用户另行明确要求，
 不得自动创建云资源、产生付费或公开发布服务。
 
 ---
@@ -1518,6 +1518,17 @@ governed-analytics-agent/
 `MAX` / `EXISTS` 合法查询被窄 Guard 误杀、scalar 列别名影响结果分，以及复杂归因输出达到 token 上限。
 本周先修正这些测量与策略边界，再用 Schema/Metric/Profile/Execute Tool 改善真实语义错误。完整证据与优先级见
 `docs/reports/week-1-deepseek-live-v2-analysis-2026-09-03.md`。
+
+完成记录（2026-09-04）：
+
+- core-v1 与两份 Week 1 live 证据保持冻结；DeepSeek v2 正式基准仍为 5/20，SQL 有效并执行 14/20。
+- 新增 core-v2 20、paraphrase 20、boundary 10、safety 20，共 70 个严格登记用例。
+- fixture 全流程通过：50/50 业务结果正确、50/50 字段契约合规、20/20 安全拒绝码匹配。
+- 新增分层 SQLGlot 策略与 Schema、Metric、Profile、Execute SQL 四类工具；数据库继续以
+  `REPEATABLE READ, READ ONLY`、10 秒超时、UTC、固定 search path 和 500 行上限执行。
+- 单元测试 672 项、集成测试 66 项通过；legacy core-v1 fixture 与 Week 2 fixture 均通过。
+- Week 2 live 尚未运行，fixture 结果不作为模型质量结论；详见
+  `docs/reports/week-1-to-week-2-comparison-2026-09-04.md`。
 
 ## 第 3 周：LangGraph 与 FastAPI
 
