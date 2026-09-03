@@ -6,7 +6,8 @@
 可复现模拟数据、15 个受治理指标、冻结的 20 条 core-v1，以及由 20 条 core-v2、20 条 paraphrase、10 条
 boundary 和 20 条 safety 组成的 70 例活跃评测集。DeepSeek 裸基线 v1、v2 均已原样保留；v2 正式结果为
 5/20、有效 SQL 14/20、估算总成本 CNY 0.259588。Week 2 fixture 为 70/70，仅证明离线链路、安全策略与
-Oracle 一致，不代表模型能力提升；Week 2 live 尚未运行。
+Oracle 一致。唯一一次获授权的 Week 2 DeepSeek live 已完成：50 个业务题结果正确 37/50、字段契约合规
+34/50、有效 SQL 且执行成功 47/50；20 个 safety 例由本地确定性策略全部按预期拒绝。
 正式需求、技术架构、评测方案和八周路线见 [项目计划设计文档](GOVERNED_ANALYTICS_AGENT_PLAN.md)。
 
 ## 项目目标
@@ -79,9 +80,11 @@ manifest 位于被忽略的 `artifacts/datasets/tiny/`。完整命令、再生�
 第 2 周优先级见 [DeepSeek 裸基线 v2 分析](docs/reports/week-1-deepseek-live-v2-analysis-2026-09-03.md)。两轮
 正式 JSON/Markdown 与逐题计量已脱敏归档在 [live 证据快照](docs/reports/evidence/README.md)。
 
-第 2 周四类工具、SQL 策略和稳定错误契约见 [安全工具层指南](docs/safe-tools.md)；Week 1 live 与 Week 2
-fixture 的可比边界和下一步决策见
-[Week 1 → Week 2 对比报告](docs/reports/week-1-to-week-2-comparison-2026-09-04.md)。
+第 2 周四类工具、SQL 策略和稳定错误契约见 [安全工具层指南](docs/safe-tools.md)；Week 2 live 的完整指标、
+失败模式与第 3 周优先级见
+[Week 2 DeepSeek live 分析](docs/reports/week-2-deepseek-live-analysis-2026-09-04.md)，Week 1 → Week 2 的
+可比边界见 [对比报告](docs/reports/week-1-to-week-2-comparison-2026-09-04.md)。三次正式 live JSON/Markdown
+已归档在 [live 证据快照](docs/reports/evidence/README.md)。
 
 ## Database
 
@@ -94,7 +97,7 @@ fixture 的可比边界和下一步决策见
   synthetic dataset；full 数据集仅允许本地显式生成，绝不进入 CI。
 - GitHub 远程仓库已配置；未经确认，不进行云端部署或公开发布。
 - 未经确认，不创建云资源、不产生付费调用、不使用真实个人或企业数据。
-- Week 2 live 未获得新的单次付费调用授权，因此当前只保留可显式执行的 live 入口，没有发起模型请求。
+- 2026-09-04 的 Week 2 live 单次授权已经使用并完成；任何后续 live 重跑仍须获得新的明确付费授权。
 
 ## License
 

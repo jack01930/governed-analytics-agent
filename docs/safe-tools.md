@@ -64,5 +64,6 @@ make eval-week2-fixture
 
 当前验收覆盖全部 20 条冻结 Oracle、合法 `MAX` / `MIN` / `AVG` / `EXISTS` / `date_trunc` 样本、44 条攻击
 SQL fixture、20 条活跃 safety case、敏感谓词侧信道、五类 Profile operation、公开参数绑定、拒绝前不建连、
-真实只读数据库会话和 500 行上限。Week 2 fixture 的完整结论见
-[Week 1 → Week 2 对比报告](reports/week-1-to-week-2-comparison-2026-09-04.md)。
+真实只读数据库会话和 500 行上限。Week 2 fixture 与 live 的完整结论见
+[Week 1 → Week 2 对比报告](reports/week-1-to-week-2-comparison-2026-09-04.md)。live 仍是裸的一次生成与一次执行，
+模型尚未调用这四类工具；它为第 3 周 Agent 工具编排保留了对照基线。

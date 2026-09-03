@@ -6,7 +6,7 @@
 - 工作分支：`codex/week-2-safe-tools`
 - 基线提交：`d58d0d5`（第 1 周收口合并）
 - 完成日期：2026-09-04
-- 当前状态：已完成（Week 2 live 待新的明确授权，不属于本次离线验收）
+- 当前状态：已完成（含唯一一次获授权的 Week 2 live 及证据归档）
 
 ## 目标
 
@@ -56,7 +56,7 @@ core-v2 会把隐含上下文改为自包含题面，因此只做“同一业务
 - 不实现 LangGraph、多轮规划、自动重试或自动修复；这些属于第 3 周。
 - 不覆盖或重算第 1 周 live 报告。
 - 不通过重复 live 运行挑选最好成绩。
-- 未获得新的付费调用授权前，不发起第二周 live 调用。
+- 本次仅执行用户明确授权的一次 Week 2 live；不重跑挑分，未来调用仍需新的付费授权。
 - 不发布、不 push、不修改远程仓库可见性。
 
 ## 实施顺序
@@ -94,7 +94,7 @@ core-v2 会把隐含上下文改为自包含题面，因此只做“同一业务
 
 - legacy core-v1 fixture 必须继续 20/20，历史证据哈希不变。
 - Week 2 fixture harness 必须 70/70；该分数只证明编排和 Oracle，不代表 live 模型质量。
-- 生成一份 Week 1 → Week 2 对比报告，清楚区分“已实测 live”“fixture 验证”“尚未运行 live”。
+- 生成 Week 1 → Week 2 对比与 Week 2 live 分析报告，清楚区分真实模型调用、fixture 验证和本地 safety 策略。
 - 更新 README、评测、安全与总计划文档后提交本地分支。
 
 ## 验收门禁
@@ -130,7 +130,8 @@ git diff --check
 
 ## Live 冻结规则
 
-若后续获得一次新的付费调用授权，先提交并记录所有题面、Oracle、Prompt、context、模型、价格和输出 token 上限，再运行一次：
+本次获授权的 live 已按冻结配置运行一次，未重试。若未来再次获得新的付费调用授权，仍须先提交并记录所有
+题面、Oracle、Prompt、context、模型、价格和输出 token 上限，再运行一次：
 
 ```bash
 uv run governed-eval week2 --dataset tiny --mode live --live
@@ -148,7 +149,11 @@ uv run governed-eval week2 --dataset tiny --mode live --live
 - Week 1 reference canonical SHA-256：`91e24468a0d37601154a02b502868136f7352551b1059bbafbe7508451d3ef11`。
 - fixture 结果：50/50 业务结果正确且字段契约合规，20/20 safety 按预期规则拒绝，0 tokens、0 成本；
   `cost_estimate_complete=true`，`unpriced_call_count=0`。
+- live run ID：`4afcbfcb01e5401caaea2d1b57e041db`；50 个业务题结果正确 37/50、字段契约合规
+  34/50、有效 SQL 且执行成功 47/50，严格通过 30/50；无截断。
+- live tokens 为 175,211 / 13,581，估算成本 CNY 0.644319490584，完整计价且 0 个未计价调用；20 个
+  safety 例由本地策略 20/20 拒绝，不计作模型调用。
 - 回归：672 项单元测试、66 项集成测试通过；migration、data verify、metrics、core-v1 fixture 和 Week 2
   fixture 均通过。
-- 对比结论：fixture 与 Week 1 live 不可直接比较模型质量；见
+- 对比结论：Week 2 live 与 Week 1 仅支持同意图、不同题面/协议的并列比较，不能把差值归因于模型；见
   `docs/reports/week-1-to-week-2-comparison-2026-09-04.md`。

@@ -5,7 +5,7 @@
 > 制定日期：2026-09-01
 > 最近同步：2026-09-04
 > 项目周期：8 周
-> 当前阶段：第 2 周评测有效性与安全工具层已完成；Week 2 live 待新的明确授权，工程上可进入第 3 周
+> 当前阶段：第 2 周评测有效性、安全工具层及一次 Week 2 live 已完成，工程上可进入第 3 周
 
 ---
 
@@ -22,8 +22,8 @@
 5. 8 周实施计划；
 6. 项目验收、作品集与面试交付要求。
 
-本项目已完成第 1 周离线实现与 DeepSeek v1/v2 live 基线，以及由实测导出的第 2 周安全工具层。除非用户另行明确要求，
-不得自动创建云资源、产生付费或公开发布服务。
+本项目已完成第 1 周离线实现与 DeepSeek v1/v2 live 基线、第 2 周安全工具层，以及唯一一次获授权的 Week 2
+live。除非用户另行明确要求，不得自动创建云资源、产生付费或公开发布服务。
 
 ---
 
@@ -1527,7 +1527,8 @@ governed-analytics-agent/
 - 新增分层 SQLGlot 策略与 Schema、Metric、Profile、Execute SQL 四类工具；数据库继续以
   `REPEATABLE READ, READ ONLY`、10 秒超时、UTC、固定 search path 和 500 行上限执行。
 - 单元测试 672 项、集成测试 66 项通过；legacy core-v1 fixture 与 Week 2 fixture 均通过。
-- Week 2 live 尚未运行，fixture 结果不作为模型质量结论；详见
+- 唯一一次 Week 2 live 已完成：50 个业务题结果正确 37/50、字段契约合规 34/50、有效 SQL 且执行成功
+  47/50；20 个 safety 例由本地策略 20/20 拒绝。该裸流程未调用四类工具，且与 Week 1 不是严格同题协议；详见
   `docs/reports/week-1-to-week-2-comparison-2026-09-04.md`。
 
 ## 第 3 周：LangGraph 与 FastAPI
@@ -1536,11 +1537,22 @@ governed-analytics-agent/
 
 - 打通完整 Agent 主链路。
 
+Week 2 live 导向（2026-09-04）：
+
+- 裸流程严格通过 30/50，字段契约率 68%，boundary 严格通过 3/10；第 3 周先解决输出契约、复杂指标计划和
+  边界约束，不把更多模型轮次本身当作改进。
+- 本次 run 保持为不可变裸基线。工具增强 Agent 使用独立协议，分别记录 first-pass、受控修复后结果、
+  工具调用次数、tokens、延迟和成本。
+- 当前报告不保存 SQL 与实际结果，新增诊断只能记录策略拒绝码、行列数量、key 差异计数和数值误差摘要等
+  脱敏信息；未经证据不得宣称具体 SQL 根因。
+
 任务：
 
 - 定义 AgentState；
 - 实现 Intake、Context、Plan、Schema、Execute、Validate、Synthesize 节点；
-- 实现有限分析循环；
+- 实现结构化 Answer Contract 与 typed metric plan，显式表示粒度、分子/分母、时间边界、NULL/零分母、
+  top-k 和稳定排序；
+- 实现最多一次、可审计的有限修复循环，并保留首次生成成绩；
 - 实现模型适配层；
 - 实现 FastAPI 创建任务和查询状态；
 - 实现 SSE；
@@ -1550,6 +1562,7 @@ governed-analytics-agent/
 
 - 能完成简单指标问题；
 - 能至少进行两步异常拆解；
+- 7 条“值正确、契约失败”与首批 boundary 失败形成冻结回归；裸流程与工具增强结果分开报告；
 - 超过轮数和成本能安全停止；
 - API 和 SSE 可测试。
 

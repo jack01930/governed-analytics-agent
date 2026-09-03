@@ -58,7 +58,8 @@ USD/CNY 6.7809 快照换算为输入 CNY 2.983596、输出 CNY 8.950788/百万 t
 [第 1 周 DeepSeek 裸基线 v1 分析](reports/week-1-deepseek-live-analysis-2026-09-03.md)；v2 正式结果为 5/20、
 有效 SQL 14/20、估算总成本 CNY 0.259588，逐题根因和第 2 周计划见
 [v2 分析](reports/week-1-deepseek-live-v2-analysis-2026-09-03.md)。可克隆的脱敏原报告、SHA-256 与全部 case
-计量见 [live 证据归档](reports/evidence/README.md)。
+计量见 [live 证据归档](reports/evidence/README.md)。Week 2 唯一一次获授权的 live 结果及失败模式见
+[Week 2 DeepSeek live 分析](reports/week-2-deepseek-live-analysis-2026-09-04.md)。
 
 ## Week 2 活跃评测协议
 
@@ -93,18 +94,22 @@ live 的 5/20 相减后宣称模型提升。
 `e7c20ed70bd2754a5e4f41c06b4f5a35b3cd6447e1481c642075c0386a25d744`；它绑定的 Week 1 报告规范化内容
 SHA-256 为 `91e24468a0d37601154a02b502868136f7352551b1059bbafbe7508451d3ef11`。成本状态为完整，未定价调用为 0。
 
-## Week 2 live 边界
+## Week 2 live 结果与边界
 
-live 入口已经实现，但尚未运行。只有用户再次明确授权一次付费调用后，才冻结当前 suite hash、dataset、
-prompt/context、模型和价格，再执行：
+2026-09-04 已按用户的单次付费授权冻结 suite hash、dataset、prompt/context、模型和价格，并且只执行一次：
 
 ```bash
 uv run governed-eval week2 --dataset tiny --mode live --live
 ```
 
+run ID `4afcbfcb01e5401caaea2d1b57e041db` 的 50 个业务题结果正确率为 74%、字段契约率 68%、有效 SQL 率与
+执行成功率均为 94%，无截断，估算成本 CNY 0.644319490584。20 个 safety 例由确定性本地策略直接验证并
+全部按预期拒绝，不调用模型，不能表述为模型安全能力。该流程仍是每题一次生成、一次策略校验、一次执行，
+没有调用四类工具或 Agent 修复循环；它是第 3 周工具编排前的裸基线。
+
 缺少 `--live`、非 tiny 数据集、空 Key、模型与价格快照不匹配时，CLI 都会在构造网络客户端之前失败。正式
-运行会在首个模型请求前独占报告 staging、检查最终目标并验证当前文件系统支持原子 no-replace；冲突、不可写
+运行在首个模型请求前独占报告 staging、检查最终目标并验证当前文件系统支持原子 no-replace；冲突、不可写
 或原子能力缺失时直接停止。随后逐题校验 Provider 返回模型是否属于价格快照声明的请求/解析模型；无法绑定
 价格的响应记为 `pricing_failed` 且不执行其 SQL，同时将成本完整性标为 false、禁止声明历史可比。运行仍是
-一题一次生成、一次执行、无重试；失败题不得删除或挑选性重跑。完整比较结论见
-[Week 1 → Week 2 对比报告](reports/week-1-to-week-2-comparison-2026-09-04.md)。
+一题一次生成、一次执行、无重试；失败题不得删除或挑选性重跑。现有单次授权已经用完，任何新 live 均需新的
+明确付费授权。完整比较结论见 [Week 1 → Week 2 对比报告](reports/week-1-to-week-2-comparison-2026-09-04.md)。

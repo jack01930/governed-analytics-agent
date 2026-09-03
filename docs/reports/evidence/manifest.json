@@ -1,10 +1,12 @@
 {
-  "schema_version": "governed-analytics-live-evidence-manifest-v1",
+  "schema_version": "governed-analytics-live-evidence-manifest-v2",
   "created_at": "2026-09-04T00:03:54+08:00",
+  "updated_at": "2026-09-04T07:49:28+08:00",
   "source_git_head": "3667995a5583b4deb628c0db8c95fe2151a2426c",
+  "latest_source_git_head": "dd7895ae2b110e630e9d76084abfaa4f4b0f255b",
   "archive_commit": "recorded by the Git commit containing this manifest",
   "redacted": true,
-  "redaction_policy": "exclude credentials, authorization data, environment values and full provider responses; retain generated SQL over synthetic data",
+  "redaction_policy": "always exclude credentials, authorization data, environment values and full provider responses; Week 1 raw evidence retains generated SQL over synthetic data, while Week 2 evidence also excludes generated SQL, actual query results and API endpoints",
   "runs": [
     {
       "label": "v1",
@@ -25,6 +27,50 @@
       "files": [
         {"path":"v2/report.json","bytes":16004,"sha256":"6fc2b048db8b61d73a33c3b36d74107ac6918edabeb08fbaa6b07c0196bb7466"},
         {"path":"v2/report.md","bytes":2297,"sha256":"28d1dfb2069f65aa7f3f5591da1e573a90042586e810af0ee7f5f0027edfa204"}
+      ]
+    },
+    {
+      "label": "week2-live-v1",
+      "run_id": "4afcbfcb01e5401caaea2d1b57e041db",
+      "mode": "live",
+      "protocol_version": "week2-evaluation-v1",
+      "dataset_id": "a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2",
+      "prompt_version": "baseline-system-v2+ecommerce-schema-v1+metrics-v1+sha256:ca0f1d30dcb41c9c6634ac0bfb15e65ac2283ae4ccbfc11897b8e164dd681e25",
+      "requested_model": "deepseek-v4-flash",
+      "resolved_models": ["deepseek-v4-flash"],
+      "suite_manifest_sha256": "ec5e210d8be4391903904ef65f4c1dcd5b8c7d0898a020f61e4486054ad0277d",
+      "implementation_sha256": "e7c20ed70bd2754a5e4f41c06b4f5a35b3cd6447e1481c642075c0386a25d744",
+      "pricing": {
+        "requested_model": "deepseek-v4-flash",
+        "resolved_model": "DeepSeek-V4-Flash-0731",
+        "effective_date": "2026-09-01",
+        "basis": "peak cache-miss upper bound converted at USD/CNY 6.7809",
+        "snapshot_sha256": "465b1a9e1d37e2120884045b8cc3b820d7fa8455738ff204d1fa0fb1ac9e58e2"
+      },
+      "comparison_reference": {
+        "run_id": "65c87bf0355047a9b23243f70756e3f4",
+        "suite": "core-v1",
+        "protocol": "baseline-system-v2+ecommerce-schema-v1+metrics-v1+sha256:ca0f1d30dcb41c9c6634ac0bfb15e65ac2283ae4ccbfc11897b8e164dd681e25",
+        "dataset_id": "a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2",
+        "report_sha256": "91e24468a0d37601154a02b502868136f7352551b1059bbafbe7508451d3ef11",
+        "scope": "intent-aligned protocol comparison; not same-question accuracy",
+        "status": "comparable"
+      },
+      "redaction": {
+        "sanitized": true,
+        "excludes": [
+          "generated_sql",
+          "actual_query_results",
+          "provider_raw_content",
+          "api_endpoints",
+          "credentials",
+          "authorization_data",
+          "environment_values"
+        ]
+      },
+      "files": [
+        {"path":"week2-live-v1/report.json","bytes":39560,"sha256":"18d607f8a99ab07bea35ed6e849ca052089ac6666a463f4b2bbc68fca2169db3"},
+        {"path":"week2-live-v1/report.md","bytes":10933,"sha256":"4ffdd9e74b3b750cae2e6b2535da626c549f80ccdf6b7ef0f697b8ffd9c1ae31"}
       ]
     }
   ],
