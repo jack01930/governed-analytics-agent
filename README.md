@@ -2,7 +2,9 @@
 
 面向电商运营分析师的可治理数据分析智能体，也是一个针对 Agent/大模型应用开发实习岗位设计的旗舰作品集项目。
 
-项目已具备本地 PostgreSQL 基线、最小权限角色、可复现模拟数据与首批 15 个受治理指标。
+第 1 周离线基线已经完成：项目具备本地 PostgreSQL、最小权限角色、可复现模拟数据、首批
+15 个受治理指标、20 条黄金问题和完整 fixture 评测链路。DeepSeek 裸基线 v1、v2 均已原样保留；v2 正式
+结果为 5/20、有效 SQL 14/20、估算总成本 CNY 0.259588。当前已依据实测进入第 2 周评测有效性与安全工具层。
 正式需求、技术架构、评测方案和八周路线见 [项目计划设计文档](GOVERNED_ANALYTICS_AGENT_PLAN.md)。
 
 ## 项目目标
@@ -64,6 +66,13 @@ manifest 位于被忽略的 `artifacts/datasets/tiny/`。完整命令、再生�
 `make eval-fixture` 只在本地 tiny 数据集上运行离线 fixture，并将不可变报告写入被 Git 忽略的
 `artifacts/evals/baseline/fixture/`。该命令 100% 仅证明评测链路可用，不代表模型质量；真实模型调用仍需
 明确执行双重授权命令。评测契约、报告字段、成本快照与 live 边界见[评测指南](docs/evals.md)。
+
+当前 live provider 为 DeepSeek，默认使用 `deepseek-v4-flash` 的非思考模式。配置 Key、执行一次不可重试的
+裸基线以及根据结果确定第 2 周优先级的步骤见 [DeepSeek live 基线运行手册](docs/live-baseline-playbook.md)；
+黄金问题的分层扩展原则见 [Golden Questions 优化策略](docs/golden-questions-strategy.md)。v1 的适配器根因见
+[DeepSeek 裸基线 v1 分析](docs/reports/week-1-deepseek-live-analysis-2026-09-03.md)，正式 v2 结果、逐类根因和
+第 2 周优先级见 [DeepSeek 裸基线 v2 分析](docs/reports/week-1-deepseek-live-v2-analysis-2026-09-03.md)。两轮
+正式 JSON/Markdown 与逐题计量已脱敏归档在 [live 证据快照](docs/reports/evidence/README.md)。
 
 ## Database
 

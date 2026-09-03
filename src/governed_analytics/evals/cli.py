@@ -17,7 +17,7 @@ from governed_analytics.evals.runner import BaselineRunError, run_baseline
 from governed_analytics.models.openai_compatible import OpenAICompatibleSqlGenerator
 from governed_analytics.models.protocols import SqlGenerator
 
-_PRICING_PATH = "data/pricing/qwen3.7-plus-2026-09-01.yaml"
+_PRICING_PATH = "data/pricing/deepseek-v4-flash-2026-09-01.yaml"
 
 
 class _CliArgumentError(ValueError):

@@ -12,7 +12,7 @@ from governed_analytics.evals.golden import load_golden_cases
 from governed_analytics.models.fixtures import FixtureContractError, FixtureSqlGenerator
 from governed_analytics.models.prompts import (
     BASELINE_PROMPT_VERSION,
-    BASELINE_SYSTEM_PROMPT_V1,
+    BASELINE_SYSTEM_PROMPT_V2,
     build_baseline_user_prompt,
 )
 from governed_analytics.models.protocols import SqlGenerationRequest, SqlGenerator
@@ -80,12 +80,14 @@ def test_request_is_frozen_strict_and_rejects_blank_versioned_fields() -> None:
 def test_prompt_is_pinned_and_deterministic() -> None:
     request = _request()
 
-    assert BASELINE_PROMPT_VERSION == "baseline-system-v1"
-    assert BASELINE_SYSTEM_PROMPT_V1 == (
+    assert BASELINE_PROMPT_VERSION == "baseline-system-v2"
+    assert BASELINE_SYSTEM_PROMPT_V2 == (
         "You generate exactly one PostgreSQL read-only query for the supplied ecommerce question.\n"
         "Use only tables and columns in SCHEMA CONTEXT and metric rules in METRIC CONTEXT.\n"
         "Use half-open UTC time intervals. Do not invent columns or metrics.\n"
-        'Return one JSON object with keys "sql" and "assumptions".\n'
+        "Return exactly one JSON object matching this example shape:\n"
+        '{"sql":"select 1 as value","assumptions":["short business assumption"]}\n'
+        'The "assumptions" value must be a JSON array of 0 to 8 strings; use [] when none.\n'
         "Do not provide chain-of-thought or hidden reasoning. "
         "Assumptions may contain only short business assumptions.\n"
         "The SQL must be one SELECT or WITH query. Do not include Markdown fences."
@@ -97,7 +99,8 @@ def test_prompt_is_pinned_and_deterministic() -> None:
         "orders(order_id, status, ordered_at); order_items(order_id, net_amount)\n\n"
         "METRIC CONTEXT:\n"
         "gmv = sum(order_items.net_amount) for valid orders\n\n"
-        'OUTPUT FORMAT:\nReturn only one JSON object with exactly the keys "sql" and "assumptions".'
+        "OUTPUT FORMAT:\n"
+        'Return only one JSON object with a "sql" string and an "assumptions" array of strings.'
     )
     assert build_baseline_user_prompt(request) == build_baseline_user_prompt(request)
 

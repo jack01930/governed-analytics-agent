@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -108,6 +109,8 @@ class BaselineRunReport(_FrozenWireModel):
     prompt_version: str = Field(min_length=1)
     requested_model: str = Field(min_length=1)
     resolved_models: tuple[str, ...] = ()
+    pricing_effective_date: date | None = None
+    pricing_basis: str | None = None
     result_accuracy: Decimal = Field(ge=0, le=1)
     valid_sql_rate: Decimal = Field(ge=0, le=1)
     execution_success_rate: Decimal = Field(ge=0, le=1)
@@ -122,6 +125,13 @@ class BaselineRunReport(_FrozenWireModel):
             raise ValueError("resolved_models must be a sorted, unique tuple")
         if any(not model for model in self.resolved_models):
             raise ValueError("resolved_models cannot contain empty values")
+        if self.mode == "live":
+            if self.pricing_effective_date is None or self.pricing_basis is None:
+                raise ValueError("live reports require pricing metadata")
+            if not self.pricing_basis.strip():
+                raise ValueError("pricing_basis must not be blank")
+        elif self.pricing_effective_date is not None or self.pricing_basis is not None:
+            raise ValueError("fixture reports cannot contain pricing metadata")
         case_ids = tuple(case.case_id for case in self.cases)
         if len(set(case_ids)) != len(case_ids):
             raise ValueError("baseline reports cannot contain duplicate case IDs")

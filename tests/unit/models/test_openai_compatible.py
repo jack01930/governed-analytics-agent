@@ -14,7 +14,7 @@ from governed_analytics.models.openai_compatible import (
     OpenAICompatibleSqlGenerator,
 )
 from governed_analytics.models.prompts import (
-    BASELINE_SYSTEM_PROMPT_V1,
+    BASELINE_SYSTEM_PROMPT_V2,
     build_baseline_user_prompt,
 )
 from governed_analytics.models.protocols import SqlGenerationRequest, SqlGenerator
@@ -32,7 +32,7 @@ def _request() -> SqlGenerationRequest:
 def _response(
     *,
     content: object = '{"sql":"select 1 as value","assumptions":["valid orders only"]}',
-    model: object = "qwen3.7-plus-2026-05-26",
+    model: object = "deepseek-v4-flash",
     prompt_tokens: object = 17,
     completion_tokens: object = 9,
 ) -> object:
@@ -70,7 +70,7 @@ async def test_live_adapter_sends_complete_one_pass_contract_and_preserves_metad
 ) -> None:
     client = _FakeClient(_response())
     generator: SqlGenerator = OpenAICompatibleSqlGenerator(
-        cast(AsyncOpenAI, client), "qwen3.7-plus"
+        cast(AsyncOpenAI, client), "deepseek-v4-flash"
     )
     moments = iter((100.0, 101.234))
     monkeypatch.setattr(
@@ -81,21 +81,21 @@ async def test_live_adapter_sends_complete_one_pass_contract_and_preserves_metad
 
     assert result.sql == "select 1 as value"
     assert result.assumptions == ("valid orders only",)
-    assert result.provider_model == "qwen3.7-plus-2026-05-26"
+    assert result.provider_model == "deepseek-v4-flash"
     assert result.input_tokens == 17
     assert result.output_tokens == 9
     assert result.latency_ms == 1234
     assert client.completions.calls == [
         {
-            "model": "qwen3.7-plus",
+            "model": "deepseek-v4-flash",
             "messages": [
-                {"role": "system", "content": BASELINE_SYSTEM_PROMPT_V1},
+                {"role": "system", "content": BASELINE_SYSTEM_PROMPT_V2},
                 {"role": "user", "content": build_baseline_user_prompt(_request())},
             ],
             "temperature": 0,
             "response_format": {"type": "json_object"},
-            "max_completion_tokens": 1200,
-            "extra_body": {"enable_thinking": False},
+            "max_tokens": 1200,
+            "extra_body": {"thinking": {"type": "disabled"}},
         }
     ]
 
@@ -103,7 +103,7 @@ async def test_live_adapter_sends_complete_one_pass_contract_and_preserves_metad
 @pytest.mark.asyncio
 async def test_live_adapter_makes_exactly_one_call_and_sanitizes_sdk_failures() -> None:
     client = _FakeClient(RuntimeError("https://endpoint.example/key=secret/raw provider failure"))
-    generator = OpenAICompatibleSqlGenerator(client, "qwen3.7-plus")  # type: ignore[arg-type]
+    generator = OpenAICompatibleSqlGenerator(client, "deepseek-v4-flash")  # type: ignore[arg-type]
 
     with pytest.raises(ModelAdapterError, match=r"^provider_call_failed$") as error:
         await generator.generate(_request())
@@ -115,30 +115,61 @@ async def test_live_adapter_makes_exactly_one_call_and_sanitizes_sdk_failures() 
 
 
 @pytest.mark.asyncio
+async def test_invalid_assumptions_preserves_safe_call_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(
+        _response(content='{"sql":"select 1","assumptions":"none"}')
+    )
+    generator = OpenAICompatibleSqlGenerator(client, "deepseek-v4-flash")  # type: ignore[arg-type]
+    moments = iter((100.0, 100.25))
+    monkeypatch.setattr(
+        "governed_analytics.models.openai_compatible.monotonic", lambda: next(moments)
+    )
+
+    with pytest.raises(ModelAdapterError, match=r"^invalid_assumptions$") as captured:
+        await generator.generate(_request())
+
+    error = captured.value
+    assert error.provider_model == "deepseek-v4-flash"
+    assert error.input_tokens == 17
+    assert error.output_tokens == 9
+    assert error.latency_ms == 250
+    assert "select 1" not in repr(error)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "category"),
     [
         (SimpleNamespace(choices=[]), "missing_content"),
         (_response(content=None), "missing_content"),
-        (_response(content="not JSON"), "invalid_content"),
-        (_response(content='{"sql":"select 1","assumptions":[],"extra":true}'), "invalid_content"),
-        (_response(content='{"sql":" select 1","assumptions":[]}'), "invalid_content"),
-        (_response(content='{"sql":"delete from orders","assumptions":[]}'), "invalid_content"),
-        (_response(content='{"sql":"selective_not_a_query","assumptions":[]}'), "invalid_content"),
+        (_response(content=1), "invalid_content_type"),
+        (_response(content="not JSON"), "invalid_json"),
+        (_response(content='{"sql":"select 1","assumptions":[],"extra":true}'), "invalid_envelope"),
+        (_response(content='{"sql":" select 1","assumptions":[]}'), "invalid_sql_content"),
+        (_response(content='{"sql":"delete from orders","assumptions":[]}'), "invalid_sql_content"),
+        (
+            _response(content='{"sql":"selective_not_a_query","assumptions":[]}'),
+            "invalid_sql_content",
+        ),
         (
             _response(content='{"sql":"withholding_not_a_query","assumptions":[]}'),
-            "invalid_content",
+            "invalid_sql_content",
         ),
-        (_response(content='{"sql":"SELECTive_not_a_query","assumptions":[]}'), "invalid_content"),
-        (_response(content='{"sql":"select 1","assumptions":[1]}'), "invalid_content"),
-        (_response(content='{"sql":"select 1","assumptions":[" "]}'), "invalid_content"),
+        (
+            _response(content='{"sql":"SELECTive_not_a_query","assumptions":[]}'),
+            "invalid_sql_content",
+        ),
+        (_response(content='{"sql":"select 1","assumptions":[1]}'), "invalid_assumptions"),
+        (_response(content='{"sql":"select 1","assumptions":[" "]}'), "invalid_assumptions"),
         (
             _response(content=json.dumps({"sql": "select 1", "assumptions": ["x" * 201]})),
-            "invalid_content",
+            "invalid_assumptions",
         ),
         (
             _response(content=json.dumps({"sql": "select 1", "assumptions": ["x"] * 9})),
-            "invalid_content",
+            "invalid_assumptions",
         ),
         (
             SimpleNamespace(
@@ -159,7 +190,7 @@ async def test_live_adapter_makes_exactly_one_call_and_sanitizes_sdk_failures() 
 async def test_live_adapter_classifies_invalid_provider_responses(
     response: object, category: str
 ) -> None:
-    generator = OpenAICompatibleSqlGenerator(_FakeClient(response), "qwen3.7-plus")  # type: ignore[arg-type]
+    generator = OpenAICompatibleSqlGenerator(_FakeClient(response), "deepseek-v4-flash")  # type: ignore[arg-type]
 
     with pytest.raises(ModelAdapterError, match=rf"^{category}$") as error:
         await generator.generate(_request())
@@ -168,7 +199,7 @@ async def test_live_adapter_classifies_invalid_provider_responses(
     assert "select 1" not in str(error.value)
 
 
-@pytest.mark.parametrize("model", ("", " \t ", 1, b"qwen3.7-plus"))
+@pytest.mark.parametrize("model", ("", " \t ", 1, b"deepseek-v4-flash"))
 def test_live_adapter_rejects_invalid_requested_model(model: object) -> None:
     with pytest.raises(ModelAdapterError, match=r"^invalid_request$"):
         OpenAICompatibleSqlGenerator(object(), model)  # type: ignore[arg-type]
@@ -206,14 +237,17 @@ def test_model_settings_do_not_echo_rejected_url_credentials() -> None:
 
 
 def test_model_settings_are_frozen_and_allow_local_http_without_unwrapping_secret() -> None:
+    defaults = ModelSettings(_env_file=None)  # type: ignore[call-arg]
     settings = ModelSettings(
         model_base_url="http://127.0.0.1:8000/v1",
         model_api_key=SecretStr("never-unwrap-this"),
         _env_file=None,
     )  # type: ignore[call-arg]
 
-    assert settings.model_name == "qwen3.7-plus"
-    assert settings.eval_model_name == "qwen3.7-plus-2026-05-26"
+    assert defaults.model_base_url == "https://api.deepseek.com"
+    assert defaults.model_name == "deepseek-v4-flash"
+    assert defaults.eval_model_name == "DeepSeek-V4-Flash-0731"
+    assert settings.model_base_url == "http://127.0.0.1:8000/v1"
     assert "never-unwrap-this" not in repr(settings)
     with pytest.raises(ValidationError):
         settings.model_name = "other"

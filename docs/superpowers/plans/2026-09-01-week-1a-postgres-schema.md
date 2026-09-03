@@ -1,5 +1,8 @@
 # 第 1A 周：PostgreSQL Schema 实现计划
 
+> **状态同步（2026-09-04）：** 实现步骤已完成；本地 arm64 上数据库迁移、12 表 Schema、角色权限与集成
+> 测试通过，当前 head 为后续加入数据集重置函数的 `0003`。外部 CI amd64 尚无运行记录，相关项保持待验证。
+
 > **供 Agent 执行者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐任务实施本计划。各步骤使用复选框（`- [ ]`）跟踪进度。
 
 **目标：** 交付一个 Docker 化的 PostgreSQL 17 数据库，包含 pgvector、12 张电商业务表、确定性 Alembic 迁移、最小权限的加载/只读角色，以及可执行的 Schema 契约测试。
@@ -57,7 +60,7 @@
 - 输入：`.env.example` 中记录的环境变量。
 - 输出：只读专用 `DatabaseSettings`、加载专用 `LoaderDatabaseSettings`、迁移专用 `MigrationDatabaseSettings`、名为 `db` 的健康 Compose 服务，以及 `analytics_loader` 与 `analytics_readonly` 角色。
 
-- [ ] **步骤 1：注册 Pytest 标记并编写失败的设置测试**
+- [x] **步骤 1：注册 Pytest 标记并编写失败的设置测试**
 
 在 `pyproject.toml` 的 `[tool.pytest.ini_options]` 中添加：
 
@@ -117,7 +120,7 @@ def test_readonly_settings_reject_invalid_driver_role_or_password(database_url: 
 
 为 `LoaderDatabaseSettings` 和 `MigrationDatabaseSettings` 添加等价的角色互换、driver、编码角色名及缺失密码拒绝矩阵。按 URL 语义解析凭据，并在验证前进行百分号解码；但要求使用规范的未转义用户名写法，以拒绝编码后等价的角色名。driver 与角色身份必须精确匹配：`postgresql+asyncpg` / `analytics_readonly`、`postgresql+psycopg` / `analytics_loader`，以及 `postgresql+psycopg` / `governed_admin`。每个 URL 都必须包含显式非空密码。
 
-- [ ] **步骤 2：运行测试并确认因模块缺失而失败**
+- [x] **步骤 2：运行测试并确认因模块缺失而失败**
 
 运行：
 
@@ -127,7 +130,7 @@ uv run pytest tests/unit/test_config.py -v
 
 预期：由于三个按角色隔离的设置契约尚不存在，测试收集失败。
 
-- [ ] **步骤 3：实现不可变数据库设置**
+- [x] **步骤 3：实现不可变数据库设置**
 
 创建 `src/governed_analytics/config.py`。共享的不可变 `SettingsConfigDict` 与 URL 验证辅助函数保持私有；每个公共设置类只声明自己的 URL：
 
@@ -172,7 +175,7 @@ DATABASE_URL=postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.
 
 删除旧的单一管理员 `DATABASE_URL` 行，确保每个变量只有一个规范值。
 
-- [ ] **步骤 4：添加 PostgreSQL Compose 服务**
+- [x] **步骤 4：添加 PostgreSQL Compose 服务**
 
 创建 `docker-compose.yml`：
 
@@ -235,7 +238,7 @@ end
 $$;
 ```
 
-- [ ] **步骤 5：验证设置与 Compose 配置**
+- [x] **步骤 5：验证设置与 Compose 配置**
 
 运行：
 
@@ -246,7 +249,7 @@ docker compose config --quiet
 
 预期：按角色隔离的设置矩阵通过，Compose 以状态码 0 退出且不打印验证错误。
 
-- [ ] **步骤 6：提交设置与 Compose 边界**
+- [x] **步骤 6：提交设置与 Compose 边界**
 
 ```bash
 git add .env.example pyproject.toml docker-compose.yml infra/docker/postgres/init/001_bootstrap.sql src/governed_analytics/config.py tests/unit/test_config.py
@@ -268,7 +271,7 @@ git commit -m "chore: 建立 PostgreSQL 本地环境与角色配置"
 - 输入：异步应用 engine 使用只读专用 `DatabaseSettings`；Alembic 使用迁移专用 `MigrationDatabaseSettings`。
 - 输出：`create_async_database_engine(settings) -> AsyncEngine`、`set_alembic_database_url(config, database_url) -> None`，以及只使用 `MIGRATION_DATABASE_URL` 的同步 Alembic 迁移环境。
 
-- [ ] **步骤 1：编写失败的 engine 配置测试**
+- [x] **步骤 1：编写失败的 engine 配置测试**
 
 创建 `tests/unit/persistence/test_database.py`：
 
@@ -302,7 +305,7 @@ def test_alembic_database_url_round_trips_percent_encoded_credentials() -> None:
     assert config.get_main_option("sqlalchemy.url") == url
 ```
 
-- [ ] **步骤 2：运行测试并确认因包缺失而失败**
+- [x] **步骤 2：运行测试并确认因包缺失而失败**
 
 运行：
 
@@ -312,7 +315,7 @@ uv run pytest tests/unit/persistence/test_database.py -v
 
 预期：由于 `governed_analytics.persistence.database` 不存在，导入失败。
 
-- [ ] **步骤 3：实现异步 engine 工厂**
+- [x] **步骤 3：实现异步 engine 工厂**
 
 创建 `src/governed_analytics/persistence/database.py`：
 
@@ -339,7 +342,7 @@ def set_alembic_database_url(config: Config, database_url: str) -> None:
 
 创建不导出任何符号的 `src/governed_analytics/persistence/__init__.py`。
 
-- [ ] **步骤 4：初始化 Alembic，并让 URL 由环境驱动**
+- [x] **步骤 4：初始化 Alembic，并让 URL 由环境驱动**
 
 运行一次：
 
@@ -359,7 +362,7 @@ set_alembic_database_url(config, settings.migration_database_url)
 
 辅助函数负责 `Config.set_main_option` 的插值边界：仅在持久化时将 `%` 加倍，使 `Config.get_main_option` 返回原始 URL。保持 `target_metadata = None`；本计划中的迁移是显式 SQL 契约，不使用 ORM 自动生成。
 
-- [ ] **步骤 5：验证 engine 与 Alembic 配置**
+- [x] **步骤 5：验证 engine 与 Alembic 配置**
 
 运行：
 
@@ -370,7 +373,7 @@ uv run alembic heads
 
 预期：engine 与 `%40`/`%25` URL 往返测试通过；`alembic heads` 以状态码 0 退出，且尚无迁移版本。
 
-- [ ] **步骤 6：提交连接基础设施**
+- [x] **步骤 6：提交连接基础设施**
 
 ```bash
 git add alembic.ini migrations src/governed_analytics/persistence tests/unit/persistence
@@ -387,7 +390,7 @@ git commit -m "chore: 配置数据库连接与 Alembic"
 - 输入：管理员迁移连接及上述 Schema 契约。
 - 输出：生成器、指标和黄金 SQL 使用的 12 张表、约束与查询索引。
 
-- [ ] **步骤 1：编写失败的表与扩展契约测试**
+- [x] **步骤 1：编写失败的表与扩展契约测试**
 
 创建 `tests/integration/persistence/test_schema_contract.py`：
 
@@ -431,7 +434,7 @@ def test_schema_contains_all_business_tables_and_vector_extension() -> None:
     assert vector_enabled == (True,)
 ```
 
-- [ ] **步骤 2：启动 PostgreSQL，并确认测试在迁移前失败**
+- [x] **步骤 2：启动 PostgreSQL，并确认测试在迁移前失败**
 
 运行：
 
@@ -442,7 +445,7 @@ uv run pytest tests/integration/persistence/test_schema_contract.py -v
 
 预期：断言报告业务表缺失。
 
-- [ ] **步骤 3：使用精确 Schema 创建版本 `0001`**
+- [x] **步骤 3：使用精确 Schema 创建版本 `0001`**
 
 创建 `migrations/versions/0001_create_ecommerce_schema.py`。设置 `revision = "0001"`、`down_revision = None`，并在 `upgrade()` 中执行以下 SQL：
 
@@ -649,7 +652,7 @@ drop table if exists customers;
 drop table if exists categories;
 ```
 
-- [ ] **步骤 4：应用迁移并通过表契约测试**
+- [x] **步骤 4：应用迁移并通过表契约测试**
 
 运行：
 
@@ -660,7 +663,7 @@ uv run pytest tests/integration/persistence/test_schema_contract.py -v
 
 预期：测试通过，并确认 12 张表及 `vector` 扩展全部存在。
 
-- [ ] **步骤 5：提交 Schema 迁移**
+- [x] **步骤 5：提交 Schema 迁移**
 
 ```bash
 git add migrations/versions/0001_create_ecommerce_schema.py tests/integration/persistence/test_schema_contract.py
@@ -677,7 +680,7 @@ git commit -m "feat: 创建电商分析数据库结构"
 - 输入：版本 `0001` 的 12 张表，以及 `001_bootstrap.sql` 创建的角色。
 - 输出：由 PostgreSQL 强制执行的加载角色 DML 权限和只读角色 SELECT 权限。
 
-- [ ] **步骤 1：编写失败的加载/只读权限测试**
+- [x] **步骤 1：编写失败的加载/只读权限测试**
 
 创建 `tests/integration/persistence/test_database_roles.py`：
 
@@ -716,7 +719,7 @@ def test_loader_role_can_insert_but_cannot_create_tables() -> None:
             connection.execute("create table forbidden_loader_table (id bigint)")
 ```
 
-- [ ] **步骤 2：运行角色测试，并确认授权前预期操作也会失败**
+- [x] **步骤 2：运行角色测试，并确认授权前预期操作也会失败**
 
 运行：
 
@@ -726,7 +729,7 @@ uv run pytest tests/integration/persistence/test_database_roles.py -v
 
 预期：由于表授权尚不存在，两个角色连各自应被允许的操作也会失败。
 
-- [ ] **步骤 3：添加包含显式授权的版本 `0002`**
+- [x] **步骤 3：添加包含显式授权的版本 `0002`**
 
 创建 `migrations/versions/0002_grant_analytics_roles.py`，设置 `revision = "0002"`、`down_revision = "0001"`。在 `upgrade()` 中执行：
 
@@ -755,7 +758,7 @@ revoke usage, select on all sequences in schema public from analytics_loader;
 revoke select, insert, update, delete, truncate on all tables in schema public from analytics_loader;
 ```
 
-- [ ] **步骤 4：应用授权迁移并通过角色测试**
+- [x] **步骤 4：应用授权迁移并通过角色测试**
 
 运行：
 
@@ -766,7 +769,7 @@ uv run pytest tests/integration/persistence/test_database_roles.py -v
 
 预期：只读角色 SELECT 和加载角色 INSERT 通过；DDL 尝试抛出 `InsufficientPrivilege`。
 
-- [ ] **步骤 5：提交角色权限约束**
+- [x] **步骤 5：提交角色权限约束**
 
 ```bash
 git add migrations/versions/0002_grant_analytics_roles.py tests/integration/persistence/test_database_roles.py
@@ -780,10 +783,10 @@ git commit -m "feat: 强制数据库最小权限角色"
 - 新建：`tests/integration/persistence/test_migrations.py`
 
 **接口：**
-- 输入：Alembic 版本 `0001` 与 `0002`。
-- 输出：证明每个外键均已建立索引、迁移 head 为 `0002` 的自动化证据。
+- 输入：Alembic 版本 `0001`、`0002` 与后续数据集重置版本 `0003`。
+- 输出：证明每个外键均已建立索引、当前迁移 head 为 `0003` 的自动化证据。
 
-- [ ] **步骤 1：添加外键索引测试**
+- [x] **步骤 1：添加外键索引测试**
 
 追加到 `test_schema_contract.py`：
 
@@ -811,7 +814,7 @@ def test_every_foreign_key_column_is_indexed() -> None:
     assert missing == []
 ```
 
-- [ ] **步骤 2：添加 Alembic head 测试**
+- [x] **步骤 2：添加 Alembic head 测试**
 
 创建 `tests/integration/persistence/test_migrations.py`：
 
@@ -828,10 +831,10 @@ def test_database_is_at_expected_alembic_head() -> None:
     with psycopg.connect(url) as connection:
         revision = connection.execute("select version_num from alembic_version").fetchone()
 
-    assert revision == ("0002",)
+    assert revision == ("0003",)
 ```
 
-- [ ] **步骤 3：运行全部持久化集成测试**
+- [x] **步骤 3：运行全部持久化集成测试**
 
 运行：
 
@@ -840,9 +843,9 @@ uv run pytest tests/integration/persistence -v
 uv run alembic current
 ```
 
-预期：全部测试通过，且 Alembic 输出 `0002 (head)`。
+预期：全部测试通过，且 Alembic 输出 `0003 (head)`。
 
-- [ ] **步骤 4：在可丢弃的本地数据库上验证降级/升级**
+- [x] **步骤 4：在可丢弃的本地数据库上验证降级/升级**
 
 仅在加载生成数据前运行：
 
@@ -854,7 +857,7 @@ uv run pytest tests/integration/persistence -v
 
 预期：两个迁移均成功重放，全部持久化测试通过。
 
-- [ ] **步骤 5：提交 Schema 契约覆盖**
+- [x] **步骤 5：提交 Schema 契约覆盖**
 
 ```bash
 git add tests/integration/persistence
@@ -874,7 +877,7 @@ git commit -m "test: 验证数据库迁移与外键索引"
 - 输入：Compose、Alembic 与持久化测试。
 - 输出：稳定的开发命令及无网络 CI 门禁。
 
-- [ ] **步骤 1：添加本地数据库命令**
+- [x] **步骤 1：添加本地数据库命令**
 
 将启动测试移到 `tests/unit/` 下，替换现有 `test` target，使其只运行单元测试，并在 `Makefile` 中加入以下数据库 target：
 
@@ -903,7 +906,7 @@ test-integration:
 
 `db-down` 停止容器但保留命名卷。不得添加会调用 `docker compose down -v` 的默认 target。
 
-- [ ] **步骤 2：添加不调用付费模型的 GitHub Actions**
+- [x] **步骤 2：添加不调用付费模型的 GitHub Actions**
 
 创建 `.github/workflows/ci.yml`：
 
@@ -946,7 +949,7 @@ jobs:
       - run: uv run pytest tests/integration/persistence -v
 ```
 
-- [ ] **步骤 3：记录角色与迁移边界**
+- [x] **步骤 3：记录角色与迁移边界**
 
 创建 `docs/database.md`，内容包括：
 
@@ -959,7 +962,7 @@ jobs:
 
 在 `README.md` 中添加数据库章节，并链接到 `docs/database.md`。
 
-- [ ] **步骤 4：运行完整 Plan A 门禁**
+- [x] **步骤 4：运行完整 Plan A 门禁**
 
 运行：
 
@@ -973,9 +976,9 @@ uv run pytest tests/integration/persistence -v
 git diff --check
 ```
 
-预期：环境错误为零、质量检查通过、数据库健康且位于版本 `0002`、持久化测试通过，并且不报告空白字符错误。
+预期：环境错误为零、质量检查通过、数据库健康且位于版本 `0003`、持久化测试通过，并且不报告空白字符错误。
 
-- [ ] **步骤 5：提交 Plan A 开发工作流**
+- [x] **步骤 5：提交 Plan A 开发工作流**
 
 ```bash
 git add Makefile .github/workflows/ci.yml docs/database.md README.md tests/test_project_bootstrap.py tests/unit/test_project_bootstrap.py
@@ -984,12 +987,12 @@ git commit -m "ci: 验证数据库迁移与权限边界"
 
 ## Plan A 完成门禁
 
-- [ ] `docker compose up -d --wait db` 在 arm64 和 CI amd64 上均成功。
-- [ ] `vector` 扩展存在。
-- [ ] 执行 `alembic upgrade head` 后恰好存在 12 张业务表。
-- [ ] 每个外键列都由索引覆盖。
-- [ ] `analytics_readonly` 可以执行 SELECT，但不能执行 DML 或 DDL。
-- [ ] `analytics_loader` 可以加载数据，但不能执行 DDL。
-- [ ] `uv run alembic downgrade base && uv run alembic upgrade head` 可在可丢弃的空数据库上成功执行。
-- [ ] 单元测试与持久化集成测试通过。
-- [ ] 未使用付费 API 或模型 Key。
+- [ ] `docker compose up -d --wait db` 在 arm64 和 CI amd64 上均成功（arm64 已通过；外部 CI 待运行）。
+- [x] `vector` 扩展存在。
+- [x] 执行 `alembic upgrade head` 后恰好存在 12 张业务表。
+- [x] 每个外键列都由索引覆盖。
+- [x] `analytics_readonly` 可以执行 SELECT，但不能执行 DML 或 DDL。
+- [x] `analytics_loader` 可以加载数据，但不能执行 DDL。
+- [x] `uv run alembic downgrade base && uv run alembic upgrade head` 可在可丢弃的空数据库上成功执行。
+- [x] 单元测试与持久化集成测试通过。
+- [x] Plan A 未使用付费 API 或模型 Key。

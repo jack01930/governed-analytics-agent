@@ -9,7 +9,7 @@ import platform
 import shutil
 from collections import Counter
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Literal
@@ -38,6 +38,8 @@ def build_baseline_run_report(
     prompt_version: str,
     requested_model: str,
     resolved_models: tuple[str, ...] = (),
+    pricing_effective_date: date | None = None,
+    pricing_basis: str | None = None,
 ) -> BaselineRunReport:
     """Build exact aggregate metrics from one complete set of case outcomes."""
     case_results = tuple(cases)
@@ -55,6 +57,8 @@ def build_baseline_run_report(
         prompt_version=prompt_version,
         requested_model=requested_model,
         resolved_models=resolved_models,
+        pricing_effective_date=pricing_effective_date,
+        pricing_basis=pricing_basis,
         result_accuracy=sum((case.score for case in case_results), Decimal("0")) / total_cases,
         valid_sql_rate=(
             Decimal(sum(case.status != "invalid_sql" for case in case_results)) / total_cases
@@ -102,6 +106,13 @@ def _render_markdown(report: BaselineRunReport) -> str:
     lines = ["# Baseline evaluation report", ""]
     if report.mode == "fixture":
         lines.extend(["**Harness validation, not model quality.**", ""])
+    else:
+        lines.extend(
+            [
+                f"- Pricing effective date: {report.pricing_effective_date}",
+                f"- Pricing basis: {_escape_markdown(report.pricing_basis)}",
+            ]
+        )
     lines.extend(
         [
             f"- Run ID: {_escape_markdown(report.run_id)}",

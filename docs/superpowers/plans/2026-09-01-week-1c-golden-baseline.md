@@ -1,5 +1,8 @@
 # 第 1C 周：黄金问题与 Text-to-SQL 基线实现计划
 
+> **状态同步（2026-09-03）：** 20 个核心问题、Oracle、fixture、执行/评分/报告和 DeepSeek live 适配已完成；
+> v1/v2 live 报告均已原样保留，v2 结构化响应与失败计量契约已验证。详细门禁保留为复核清单。
+
 > **供 Agent 执行者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐任务实施本计划。各步骤使用复选框（`- [ ]`）跟踪进度。
 
 **目标：** 构建 20 个由 Oracle 支撑的业务问题，以及安全、可度量的直接 Text-to-SQL 基线，用于建立 Agent 实现前的准确率、失败、延迟与成本参照。
@@ -15,7 +18,7 @@
 - 基线只进行一次模型请求，随后执行一次生成 SQL。它不包含规划循环、工具、重试、LangGraph 或隐藏修复步骤。
 - 测试与 CI 使用 fixture 模式，不发起外部请求。
 - live 模式必须提供 `MODEL_API_KEY`，并同时使用 CLI 标志 `--mode live --live`。
-- 探索阶段使用模型别名 `qwen3.7-plus`；记录 provider 返回的 resolved model。
+- live 基线使用模型别名 `deepseek-v4-flash` 的非思考模式；记录 provider 返回的 resolved model。
 - 对配置的 OpenAI-compatible Base URL 调用 `AsyncOpenAI.chat.completions.create`。不得假设 provider 支持 OpenAI Responses 专属能力。
 - 要求输出只包含 `sql` 与 `assumptions` 的 JSON 对象；SDK 返回后使用 Pydantic 解析。
 - 不得请求或存储隐藏思维链。`assumptions` 只包含简短业务假设。
@@ -92,7 +95,7 @@
 - 输入：20 用例表与 Oracle SQL 契约。
 - 输出：`GoldenCase`、`BaselineCaseResult`、`load_golden_cases(path) -> tuple[GoldenCase, ...]`。
 
-- [ ] **步骤 1：编写失败的注册表测试**
+- [x] **步骤 1：编写失败的注册表测试**
 
 创建 `tests/unit/evals/test_golden_registry.py`：
 
@@ -109,7 +112,7 @@ def test_week_one_registry_has_twenty_unique_ordered_cases() -> None:
     assert all(case.oracle_sql_path.is_file() for case in cases)
 ```
 
-- [ ] **步骤 2：运行测试并确认评测模块缺失**
+- [x] **步骤 2：运行测试并确认评测模块缺失**
 
 运行：
 
@@ -119,7 +122,7 @@ uv run pytest tests/unit/evals/test_golden_registry.py -v
 
 预期：导入 `governed_analytics.evals` 失败。
 
-- [ ] **步骤 3：实现不可变契约**
+- [x] **步骤 3：实现不可变契约**
 
 实现主计划中精确的 `GoldenCase` 与 `BaselineCaseResult`。添加：
 
@@ -150,7 +153,7 @@ class BaselineRunReport(BaseModel):
     cases: tuple[BaselineCaseResult, ...]
 ```
 
-- [ ] **步骤 4：创建 YAML 注册表与加载器**
+- [x] **步骤 4：创建 YAML 注册表与加载器**
 
 `cases.yaml` 包含本计划全部 20 个 ID/问题/类别/路径/比较模式。使用以下 `key_columns`：
 
@@ -165,7 +168,7 @@ class BaselineRunReport(BaseModel):
 
 使用 Oracle 输出中命名的数值列。`load_golden_cases` 相对仓库根目录解析 SQL 路径，拒绝重复 ID，并验证 ID 匹配 `G[0-9]{3}`。
 
-- [ ] **步骤 5：添加全部 20 个 Oracle SQL 文件并通过注册表测试**
+- [x] **步骤 5：添加全部 20 个 Oracle SQL 文件并通过注册表测试**
 
 编写 Oracle SQL 契约所述的精确查询。加载时使用 `sqlglot.parse_one(sql, read="postgres")` 解析每条查询。
 
@@ -177,7 +180,7 @@ uv run pytest tests/unit/evals/test_golden_registry.py -v
 
 预期：一个包含 20 个有序用例的测试通过。
 
-- [ ] **步骤 6：提交黄金契约**
+- [x] **步骤 6：提交黄金契约**
 
 ```bash
 git add src/governed_analytics/evals evals/datasets/golden tests/unit/evals
@@ -195,7 +198,7 @@ git commit -m "feat: 定义二十条黄金业务问题"
 - 输入：已加载的 tiny 数据集与 20 个 Oracle SQL 文件。
 - 输出：`materialize_oracles(cases, output_dir) -> dict[str, QueryResult]` 及版本化预期 JSON 文件。
 
-- [ ] **步骤 1：编写 Oracle 执行测试**
+- [x] **步骤 1：编写 Oracle 执行测试**
 
 创建 `tests/integration/evals/test_oracles.py`：
 
@@ -220,7 +223,7 @@ def test_all_oracles_execute_and_materialize(tmp_path: Path) -> None:
     assert results["G020"].rows[0][0] == 3
 ```
 
-- [ ] **步骤 2：运行测试并确认 Oracle 执行器缺失**
+- [x] **步骤 2：运行测试并确认 Oracle 执行器缺失**
 
 运行：
 
@@ -230,13 +233,13 @@ uv run pytest tests/integration/evals/test_oracles.py -v
 
 预期：导入 `oracle` 失败。
 
-- [ ] **步骤 3：实现只读 Oracle 执行**
+- [x] **步骤 3：实现只读 Oracle 执行**
 
 使用只读专用 `DatabaseSettings.database_url` 与异步 engine。每条 Oracle 语句都必须在显式事务中运行，并先在同一连接上执行 `SET TRANSACTION READ ONLY`、`SET LOCAL statement_timeout = '10s'` 和 `SET LOCAL search_path = public, pg_catalog`。通过 Pydantic 序列化将 `Decimal` 与时间戳转换为 JSON 字符串。对象键排序，JSON 文件以一个换行结尾。真实 Oracle 集成测试必须在该事务中查询 `current_setting`，并断言 `transaction_read_only = 'on'`、`statement_timeout = '10s'` 和 `search_path = 'public, pg_catalog'`。
 
 提供同步命令包装器，仅在 CLI 边界使用 `asyncio.run`；内部函数保持异步。
 
-- [ ] **步骤 4：物化并提交 tiny 预期结果**
+- [x] **步骤 4：物化并提交 tiny 预期结果**
 
 运行：
 
@@ -268,7 +271,7 @@ git commit -m "test: 固化黄金查询预期结果"
 - 输入：问题、Schema 摘要、指标上下文及 fixture SQL。
 - 输出：`SqlGenerationRequest`、`SqlGenerator`，以及 `FixtureSqlGenerator.generate(request) -> GeneratedSql`。
 
-- [ ] **步骤 1：编写无网络 fixture 适配器测试**
+- [x] **步骤 1：编写无网络 fixture 适配器测试**
 
 创建 `tests/unit/models/test_fixture_generator.py`：
 
@@ -297,7 +300,7 @@ async def test_fixture_generator_returns_case_sql_without_network() -> None:
     assert result.output_tokens == 0
 ```
 
-- [ ] **步骤 2：定义与模型无关的接口**
+- [x] **步骤 2：定义与模型无关的接口**
 
 创建 `protocols.py`：
 
@@ -322,7 +325,7 @@ class SqlGenerator(Protocol):
     async def generate(self, request: SqlGenerationRequest) -> GeneratedSql: ...
 ```
 
-- [ ] **步骤 3：冻结基线 Prompt**
+- [x] **步骤 3：冻结基线 Prompt**
 
 `prompts.py` 导出满足以下要求的 `BASELINE_SYSTEM_PROMPT_V1`：
 
@@ -336,11 +339,11 @@ The SQL must be one SELECT or WITH query. Do not include Markdown fences.
 
 `build_baseline_user_prompt(request)` 以稳定顺序标记问题、Schema 上下文与指标上下文。
 
-- [ ] **步骤 4：添加 20 条 fixture 响应**
+- [x] **步骤 4：添加 20 条 fixture 响应**
 
 `evals/fixtures/baseline_sql.json` 将每个用例 ID 映射到对应 Oracle SQL 文本。该 fixture 用于验证编排、安全、执行、评分与报告；其分数绝不能表述为 live 模型质量。
 
-- [ ] **步骤 5：运行测试并提交模型边界**
+- [x] **步骤 5：运行测试并提交模型边界**
 
 运行：
 
@@ -368,7 +371,7 @@ git commit -m "feat: 隔离基线模型接口与离线夹具"
 - 输入：模型生成的 SQL。
 - 输出：`validate_baseline_sql(sql) -> str` 与 `execute_readonly_sql(sql) -> QueryResult`。
 
-- [ ] **步骤 1：编写守卫允许/拒绝测试**
+- [x] **步骤 1：编写守卫允许/拒绝测试**
 
 创建 `tests/unit/evals/test_sql_guard.py`：
 
@@ -405,7 +408,7 @@ def test_guard_rejects_unsafe_sql(sql: str) -> None:
         validate_baseline_sql(sql)
 ```
 
-- [ ] **步骤 2：实现 AST 验证**
+- [x] **步骤 2：实现 AST 验证**
 
 使用 `sqlglot.parse(sql, read="postgres")` 解析；要求恰好一个表达式，且必须为 `exp.Query`。拒绝以下类的任何后代节点：
 
@@ -434,7 +437,7 @@ DENIED_FUNCTIONS = frozenset(
 
 使用 SQLGlot AST 添加外层查询上限或将其缩减为 500，再序列化为 PostgreSQL 方言。第 2 周将用完整策略引擎替换该窄范围守卫。
 
-- [ ] **步骤 3：实现只读执行器**
+- [x] **步骤 3：实现只读执行器**
 
 使用：
 
@@ -451,11 +454,11 @@ async with engine.connect() as connection:
 
 engine 只能由只读专用 `DatabaseSettings.database_url` 创建。不得将事务状态添加到通用 engine 工厂。真实 PostgreSQL 执行器集成测试必须通过该执行器事务查询 `current_setting`，并断言 `transaction_read_only = 'on'`、`statement_timeout = '10s'` 及 `search_path = 'public, pg_catalog'`。
 
-- [ ] **步骤 4：证明数据库权限是守卫的后备防线**
+- [x] **步骤 4：证明数据库权限是守卫的后备防线**
 
 创建集成测试，将 `validate_baseline_sql` monkeypatch 为返回 `insert into categories ...`，并断言 PostgreSQL 抛出 `InsufficientPrivilege`。这证明即使绕过守卫也无法写入。
 
-- [ ] **步骤 5：运行测试并提交基线执行安全实现**
+- [x] **步骤 5：运行测试并提交基线执行安全实现**
 
 运行：
 
@@ -483,7 +486,7 @@ git commit -m "feat: 安全执行只读基线查询"
 - 输入：`GoldenCase`、预期 `QueryResult`、实际 `QueryResult` 与 `BaselineCaseResult`。
 - 输出：`score_result(...) -> Decimal`、聚合 `BaselineRunReport`、JSON 与 Markdown 报告。
 
-- [ ] **步骤 1：编写精确评分器测试**
+- [x] **步骤 1：编写精确评分器测试**
 
 覆盖以下用例：
 
@@ -502,7 +505,7 @@ def test_top_k_returns_overlap_fraction() -> None:
     assert score_top_k(("A", "B", "C"), ("A", "C", "D")) == Decimal("0.666667")
 ```
 
-- [ ] **步骤 2：实现比较语义**
+- [x] **步骤 2：实现比较语义**
 
 - scalar：一个数值，位于绝对或相对容差内；
 - table：键集合精确相同、非数值单元格精确相同、每个数值单元格按容差比较，忽略行顺序；
@@ -511,7 +514,7 @@ def test_top_k_returns_overlap_fraction() -> None:
 
 仅当分数等于 1 时，用例状态才为 `passed`。有效但部分正确的 `top_k` 结果仍标记为 `wrong_answer`，并保留部分分数。
 
-- [ ] **步骤 3：实现聚合指标**
+- [x] **步骤 3：实现聚合指标**
 
 计算：
 
@@ -524,7 +527,7 @@ total_cost_cny = sum(case.estimated_cost_cny for case in cases)
 
 展示的比率四舍五入到四位小数，成本四舍五入到六位小数；JSON 中保留未舍入的逐用例值。
 
-- [ ] **步骤 4：生成不可变 JSON 与 Markdown 报告**
+- [x] **步骤 4：生成不可变 JSON 与 Markdown 报告**
 
 目录格式：
 
@@ -538,7 +541,7 @@ artifacts/evals/baseline/<mode>/<YYYYMMDDTHHMMSSZ>-<run_id>/
 
 Markdown 包含数据集 ID、Prompt 版本、请求/实际模型、结果准确率、有效 SQL 率、执行率、总/平均成本、P50/P95 延迟、失败数量及 20 行用例表。fixture 报告必须明确标注“评测链路验证，不代表模型质量”。
 
-- [ ] **步骤 5：运行测试并提交评分/报告实现**
+- [x] **步骤 5：运行测试并提交评分/报告实现**
 
 运行：
 
@@ -558,7 +561,7 @@ git commit -m "feat: 评估基线结果并生成报告"
 **文件：**
 - 新建：`src/governed_analytics/models/openai_compatible.py`
 - 新建：`src/governed_analytics/evals/pricing.py`
-- 新建：`data/pricing/qwen3.7-plus-2026-09-01.yaml`
+- 新建：`data/pricing/deepseek-v4-flash-2026-09-01.yaml`
 - 修改：`src/governed_analytics/config.py`
 - 新建：`tests/unit/models/test_openai_compatible.py`
 - 新建：`tests/unit/evals/test_pricing.py`
@@ -567,7 +570,7 @@ git commit -m "feat: 评估基线结果并生成报告"
 - 输入：`AsyncOpenAI`、`SqlGenerationRequest`、模型设置及价格 YAML。
 - 输出：`OpenAICompatibleSqlGenerator` 与 `estimate_cost_cny(...) -> Decimal`。
 
-- [ ] **步骤 1：编写伪 SDK 响应测试**
+- [x] **步骤 1：编写伪 SDK 响应测试**
 
 使用具有类型的伪对象，其 `chat.completions.create` 异步方法记录参数并返回以下内容：
 
@@ -575,9 +578,10 @@ git commit -m "feat: 评估基线结果并生成报告"
 {"sql":"select count(*) as order_count from orders","assumptions":["有效订单口径由指标目录提供"]}
 ```
 
-断言适配器发送 `model`、稳定消息、`temperature=0`、`response_format={"type": "json_object"}` 和 `max_completion_tokens=1200`；同时断言返回的 usage 与 provider model 得以保留。
+断言适配器发送 `model`、稳定消息、`temperature=0`、`response_format={"type": "json_object"}`、
+`max_tokens=1200` 和 `thinking.type=disabled`；同时断言返回的 usage 与 provider model 得以保留。
 
-- [ ] **步骤 2：通过 client 注入实现适配器**
+- [x] **步骤 2：通过 client 注入实现适配器**
 
 向 `src/governed_analytics/config.py` 添加模型设置：
 
@@ -593,10 +597,10 @@ class ModelSettings(BaseSettings):
         frozen=True,
     )
 
-    model_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    model_base_url: str = "https://api.deepseek.com"
     model_api_key: SecretStr | None = None
-    model_name: str = "qwen3.7-plus"
-    eval_model_name: str = "qwen3.7-plus-2026-05-26"
+    model_name: str = "deepseek-v4-flash"
+    eval_model_name: str = "DeepSeek-V4-Flash-0731"
 ```
 
 CLI 仅在构造 `AsyncOpenAI` 时解包 `model_api_key`；日志与报告绝不序列化 `SecretStr`。
@@ -621,25 +625,29 @@ response = await self._client.chat.completions.create(
     ],
     temperature=0,
     response_format={"type": "json_object"},
-    max_completion_tokens=1200,
+    max_tokens=1200,
+    extra_body={"thinking": {"type": "disabled"}},
 )
 ```
 
 使用私有 Pydantic 响应模型验证 `response.choices[0].message.content`。将内容缺失、JSON 无效或 usage 缺失分类为适配器错误；仅 fixture 模式允许 usage 为零。
 
-- [ ] **步骤 3：版本化 Qwen 价格元数据**
+- [x] **步骤 3：版本化 DeepSeek 价格元数据**
 
 创建：
 
 ```yaml
-provider: aliyun_model_studio
-model: qwen3.7-plus
+provider: deepseek
+requested_model: deepseek-v4-flash
+resolved_model: DeepSeek-V4-Flash-0731
 effective_date: 2026-09-01
 currency: CNY
 unit_tokens: 1000000
-input_price: "2.00"
-output_price: "8.00"
-source: https://help.aliyun.com/zh/model-studio/model-pricing
+input_price: "2.983596"
+output_price: "8.950788"
+pricing_basis: peak cache-miss upper bound converted at USD/CNY 6.7809
+source: https://api-docs.deepseek.com/quick_start/pricing
+fx_source: https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do
 ```
 
 成本公式只使用 `Decimal`：
@@ -651,7 +659,7 @@ cost = (
 )
 ```
 
-- [ ] **步骤 4：运行测试并提交 live 适配器**
+- [x] **步骤 4：运行测试并提交 live 适配器**
 
 运行：
 
@@ -682,7 +690,7 @@ git commit -m "feat: 接入兼容模型并记录调用成本"
 - 输入：用例、Schema/指标上下文、fixture 或 live 生成器、守卫、执行器、Oracle 结果、评分器与价格。
 - 输出：`governed-eval baseline` 及完整基线报告。
 
-- [ ] **步骤 1：添加控制台入口**
+- [x] **步骤 1：添加控制台入口**
 
 添加：
 
@@ -692,7 +700,7 @@ governed-data = "governed_analytics.data_generation.cli:main"
 governed-eval = "governed_analytics.evals.cli:main"
 ```
 
-- [ ] **步骤 2：编写 fixture 执行器集成测试**
+- [x] **步骤 2：编写 fixture 执行器集成测试**
 
 创建 `tests/integration/evals/test_baseline_runner.py`：
 
@@ -717,7 +725,7 @@ async def test_fixture_baseline_executes_all_cases_without_cost(tmp_path: Path) 
     assert all(case.status == "passed" for case in report.cases)
 ```
 
-- [ ] **步骤 3：实现单次通过的用例执行**
+- [x] **步骤 3：实现单次通过的用例执行**
 
 对每个用例严格执行一次：
 
@@ -730,7 +738,7 @@ async def test_fixture_baseline_executes_all_cases_without_cost(tmp_path: Path) 
 
 只在用例边界捕获并分类异常。失败后继续下一个用例。第 1 周不得重试或修复 SQL。
 
-- [ ] **步骤 4：在 CLI 中强制执行 live 授权**
+- [x] **步骤 4：在 CLI 中强制执行 live 授权**
 
 CLI 接口：
 
@@ -741,7 +749,7 @@ governed-eval baseline --dataset tiny --mode live --live
 
 若模式为 live 但缺少 `--live`，以状态码 2 退出并提示 `Live model calls require --live`。若 Key 缺失，以状态码 2 退出并提示 `MODEL_API_KEY is not configured`。第 1 周拒绝对 full 数据集运行基线。
 
-- [ ] **步骤 5：添加仅限 fixture 的 Make 与 CI 命令**
+- [x] **步骤 5：添加仅限 fixture 的 Make 与 CI 命令**
 
 ```make
 .PHONY: eval-fixture
@@ -758,13 +766,13 @@ eval-fixture:
 
 不得向 CI 添加 `MODEL_API_KEY`，也不得运行 live 模式。
 
-- [ ] **步骤 6：记录报告解读与 OpenAI-compatible 边界**
+- [x] **步骤 6：记录报告解读与 OpenAI-compatible 边界**
 
 `docs/evals.md` 记录用例 Schema、Oracle 物化、评分器语义、失败类别、fixture/live 区别、价格快照、显式 live 授权，以及“live 结果才是基线，fixture 的 100% 不是模型成绩”这一事实。
 
 引用适配器使用的官方 Chat Completions 接口：`https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions`。
 
-- [ ] **步骤 7：运行完整 Plan C 门禁**
+- [x] **步骤 7：运行完整 Plan C 门禁**
 
 运行：
 
@@ -781,7 +789,7 @@ git diff --check
 
 预期：20 个 fixture 用例通过，不发起外部调用，全部质量检查通过，报告生成在被忽略的 artifacts 下。
 
-- [ ] **步骤 8：提交 Plan C 工作流**
+- [x] **步骤 8：提交 Plan C 工作流**
 
 ```bash
 git add pyproject.toml uv.lock src/governed_analytics/evals src/governed_analytics/models Makefile .github/workflows/ci.yml docs/evals.md README.md
@@ -790,11 +798,11 @@ git commit -m "feat: 建立可复现 Text-to-SQL 基线"
 
 ## Plan C 完成门禁
 
-- [ ] 20 个用例定义、20 个 Oracle SQL 文件及 20 个预期 JSON 文件均已版本化。
-- [ ] 在 tiny 数据上，精确异常用例 G018–G020 分别返回固定种子数量 `20`、`10`、`3`。
-- [ ] fixture 模式执行全部 20 个用例，Token 为零、人民币成本为零、无网络访问。
-- [ ] 不安全/多语句 SQL 在执行前被拒；PostgreSQL 权限独立拒绝 DML。
-- [ ] 报告包含准确率、有效 SQL 率、执行率、P50/P95 延迟、Token、成本及全部失败。
-- [ ] live 调用需要显式双重授权，且绝不在 CI 中运行。
-- [ ] 首次获授权的 live 报告即使准确率很差也要保留。
-- [ ] 不存在 LangGraph 或修复循环，从而保留该基线比较的价值。
+- [x] 20 个用例定义、20 个 Oracle SQL 文件及 20 个预期 JSON 文件均已版本化。
+- [x] 在 tiny 数据上，精确异常用例 G018–G020 分别返回固定种子数量 `20`、`10`、`3`。
+- [x] fixture 模式执行全部 20 个用例，Token 为零、人民币成本为零、无网络访问。
+- [x] 不安全/多语句 SQL 在执行前被拒；PostgreSQL 权限独立拒绝 DML。
+- [x] 报告包含准确率、有效 SQL 率、执行率、P50/P95 延迟、Token、成本及全部失败。
+- [x] live 调用需要显式双重授权，且绝不在 CI 中运行。
+- [x] 首次获授权的 live 报告即使准确率很差也要保留。
+- [x] 不存在 LangGraph 或修复循环，从而保留该基线比较的价值。

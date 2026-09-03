@@ -8,4 +8,5 @@ unit_tokens: 1000000
 input_token_upper_bound: 262144
 input_price: "2.00"
 output_price: "8.00"
+pricing_basis: published CNY list price
 source: https://help.aliyun.com/zh/model-studio/qwen3-7-plus

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
@@ -52,10 +52,12 @@ def _report(
         run_id="run_01",
         mode=mode,
         dataset_id="a" * 64,
-        model="qwen3.7-plus",
+        model="deepseek-v4-flash",
         prompt_version="baseline-v1",
-        requested_model="qwen3.7-plus",
-        resolved_models=("fixture-model",) if mode == "fixture" else ("qwen3.7-plus-2026-05-26",),
+        requested_model="deepseek-v4-flash",
+        resolved_models=("fixture-model",) if mode == "fixture" else ("deepseek-v4-flash",),
+        pricing_effective_date=date(2026, 9, 1) if mode == "live" else None,
+        pricing_basis="peak cache-miss upper bound" if mode == "live" else None,
     )
 
 
@@ -139,9 +141,9 @@ def test_report_model_enforces_safe_identifiers_and_model_contract() -> None:
     common: dict[str, Any] = dict(
         mode="fixture",
         dataset_id="a" * 64,
-        model="qwen3.7-plus",
+        model="deepseek-v4-flash",
         prompt_version="v1",
-        requested_model="qwen3.7-plus",
+        requested_model="deepseek-v4-flash",
         resolved_models=(),
         result_accuracy=Decimal("1"),
         valid_sql_rate=Decimal("1"),
@@ -205,6 +207,8 @@ def test_live_report_omits_fixture_label_and_escapes_markdown_cells(tmp_path: Pa
     markdown = (written / "report.md").read_text(encoding="utf-8")
     assert "Harness validation, not model quality." not in markdown
     assert "v1\\|unsafe" in markdown
+    assert "Pricing effective date: 2026-09-01" in markdown
+    assert "Pricing basis: peak cache-miss upper bound" in markdown
 
 
 def test_collision_does_not_overwrite_prior_run_and_unsafe_run_id_cannot_write(

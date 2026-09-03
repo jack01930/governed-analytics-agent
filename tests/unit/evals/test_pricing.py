@@ -11,19 +11,21 @@ from governed_analytics.evals.pricing import (
     load_model_pricing,
 )
 
-PRICING_PATH = "data/pricing/qwen3.7-plus-2026-09-01.yaml"
+PRICING_PATH = "data/pricing/deepseek-v4-flash-2026-09-01.yaml"
 
 
 def test_pricing_record_is_versioned_and_cost_is_exact_decimal() -> None:
     pricing = load_model_pricing(PRICING_PATH)
 
-    assert pricing.provider == "aliyun_model_studio"
-    assert pricing.requested_model == "qwen3.7-plus"
-    assert pricing.resolved_model == "qwen3.7-plus-2026-05-26"
-    assert pricing.input_token_upper_bound == 262144
-    assert estimate_cost_cny(200_000, 1_000_000, pricing) == Decimal("8.400")
+    assert pricing.provider == "deepseek"
+    assert pricing.requested_model == "deepseek-v4-flash"
+    assert pricing.resolved_model == "DeepSeek-V4-Flash-0731"
+    assert pricing.pricing_basis == "peak cache-miss upper bound converted at USD/CNY 6.7809"
+    assert pricing.fx_source == "https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do"
+    assert pricing.input_token_upper_bound == 1_000_000
+    assert estimate_cost_cny(200_000, 1_000_000, pricing) == Decimal("9.5475072")
     assert estimate_cost_cny(0, 0, pricing) == Decimal("0.00")
-    assert estimate_cost_cny(262144, 9_999_999_999, pricing) == Decimal("80000.524280")
+    assert estimate_cost_cny(1_000_000, 1_000_000, pricing) == Decimal("11.934384")
 
 
 @pytest.mark.parametrize("value", (-1, True, 1.0, "1"))
@@ -40,16 +42,16 @@ def test_cost_fails_closed_when_input_exceeds_recorded_bracket() -> None:
     pricing = load_model_pricing(PRICING_PATH)
 
     with pytest.raises(ValueError, match="price bracket"):
-        estimate_cost_cny(262145, 1, pricing)
+        estimate_cost_cny(1_000_001, 1, pricing)
 
 
 @pytest.mark.parametrize(
     ("field", "original", "replacement"),
     [
-        ("input_price", '"2.00"', '"not-a-decimal"'),
-        ("input_price", '"2.00"', '"NaN"'),
-        ("output_price", '"8.00"', '"Infinity"'),
-        ("output_price", '"8.00"', '"-0.01"'),
+        ("input_price", '"2.983596"', '"not-a-decimal"'),
+        ("input_price", '"2.983596"', '"NaN"'),
+        ("output_price", '"8.950788"', '"Infinity"'),
+        ("output_price", '"8.950788"', '"-0.01"'),
     ],
 )
 def test_pricing_loader_rejects_invalid_prices(
@@ -72,17 +74,19 @@ def test_pricing_loader_rejects_invalid_prices(
         ("[not, a, mapping]", "invalid"),
         ("provider: only-one-field\n", "invalid"),
         (
-            "provider: aliyun_model_studio\n"
-            "region: cn-beijing\n"
-            "requested_model: qwen\n"
-            "resolved_model: qwen\n"
+            "provider: deepseek\n"
+            "region: global\n"
+            "requested_model: deepseek-v4-flash\n"
+            "resolved_model: DeepSeek-V4-Flash-0731\n"
             "effective_date: 2026-09-01\n"
             "currency: CNY\n"
             "unit_tokens: 1000000\n"
             "input_token_upper_bound: 1\n"
-            "input_price: '2.00'\n"
-            "output_price: '8.00'\n"
+            "input_price: '2.983596'\n"
+            "output_price: '8.950788'\n"
+            "pricing_basis: peak cache-miss upper bound\n"
             "source: http://example.com\n"
+            "fx_source: https://example.com/fx\n"
             "unexpected: true\n",
             "invalid",
         ),

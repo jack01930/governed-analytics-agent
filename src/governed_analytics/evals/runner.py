@@ -46,6 +46,11 @@ _MODEL_ERROR_CATEGORIES = frozenset(
         "provider_call_failed",
         "missing_content",
         "invalid_content",
+        "invalid_content_type",
+        "invalid_json",
+        "invalid_envelope",
+        "invalid_sql_content",
+        "invalid_assumptions",
         "missing_usage",
         "invalid_usage",
         "missing_model",
@@ -203,10 +208,24 @@ async def run_baseline(
                 if category in _MODEL_ERROR_CATEGORIES
                 else "generation_failed"
             )
+            if error.provider_model is not None:
+                resolved_models.add(error.provider_model)
+            error_cost = Decimal("0")
+            if mode == "live" and live_pricing is not None:
+                try:
+                    error_cost = estimate_cost_cny(
+                        error.input_tokens, error.output_tokens, live_pricing
+                    )
+                except Exception:
+                    error_type = "pricing_failed"
             case_results.append(
                 _error_case(
                     case.case_id,
                     generated_sql=None,
+                    latency_ms=error.latency_ms,
+                    input_tokens=error.input_tokens,
+                    output_tokens=error.output_tokens,
+                    cost=error_cost,
                     status="invalid_sql",
                     error_type=error_type,
                 )
@@ -313,6 +332,10 @@ async def run_baseline(
             ),
             requested_model=requested_model,
             resolved_models=tuple(sorted(resolved_models)),
+            pricing_effective_date=(
+                live_pricing.effective_date if live_pricing is not None else None
+            ),
+            pricing_basis=live_pricing.pricing_basis if live_pricing is not None else None,
         )
         timestamp = (now or (lambda: datetime.now(UTC)))()
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:

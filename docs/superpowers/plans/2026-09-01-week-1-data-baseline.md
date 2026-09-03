@@ -1,5 +1,8 @@
 # 第 1 周：数据基础与基线实现计划
 
+> **状态同步（2026-09-04）：** Plan A、Plan B、Plan C、本地离线门禁与 DeepSeek v1/v2 live 均已完成，
+> 两轮 live 证据已版本化归档。v2 为 5/20、有效 SQL 14/20；外部 CI 尚无运行记录，不阻塞本地进入第 2 周。
+
 > **供 Agent 执行者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐任务实施本计划。各步骤使用复选框（`- [ ]`）跟踪进度。
 
 **目标：** 在开始任何 LangGraph Agent 实现之前，建立可复现的电商数据真值层，以及可度量的直接 Text-to-SQL 基线。
@@ -145,7 +148,7 @@ class BaselineCaseResult(BaseModel):
 
 ## 执行顺序
 
-- [ ] **步骤 1：执行 Plan A，并通过数据库门禁**
+- [x] **步骤 1：执行 Plan A，并通过数据库门禁**
 
 运行：
 
@@ -155,9 +158,9 @@ docker compose config --quiet
 uv run alembic current
 ```
 
-预期：全部测试通过、Compose 配置有效，且 Alembic 报告版本 `0002 (head)`。
+预期：全部测试通过、Compose 配置有效，且 Alembic 报告版本 `0003 (head)`。
 
-- [ ] **步骤 2：执行 Plan B，并通过可复现性门禁**
+- [x] **步骤 2：执行 Plan B，并通过可复现性门禁**
 
 运行：
 
@@ -169,7 +172,7 @@ uv run pytest tests/unit/data_generation tests/integration/data_generation -v
 
 预期：两次 tiny 生成得到相同的行数和逐表摘要；15 个指标均可在已加载数据库上通过验证。
 
-- [ ] **步骤 3：以 fixture 模式执行 Plan C**
+- [x] **步骤 3：以 fixture 模式执行 Plan C**
 
 运行：
 
@@ -180,7 +183,7 @@ uv run pytest tests/unit/evals tests/integration/evals -v
 
 预期：20 个用例全部执行；fixture 模式不发起网络请求；JSON 与 Markdown 报告均生成在 `artifacts/evals/baseline/fixture/` 下。
 
-- [ ] **步骤 4：仅在用户提供 Key 后，以 live 模式执行 Plan C**
+- [x] **步骤 4：仅在用户提供 Key 后，以 live 模式执行 Plan C**
 
 运行：
 
@@ -190,7 +193,7 @@ uv run governed-eval baseline --dataset tiny --mode live --live
 
 预期：20 个用例生成一份包含结果准确率、有效 SQL 率、执行成功率、延迟、Token 用量、预估人民币成本及分类失败的报告。
 
-- [ ] **步骤 5：执行完整的第 1 周门禁**
+- [x] **步骤 5：执行完整的第 1 周门禁**
 
 运行：
 
@@ -217,18 +220,18 @@ git diff --check
 
 ## 第 1 周完成定义
 
-- [ ] PostgreSQL 17 + pgvector 可通过一条 Docker Compose 命令启动。
-- [ ] 12 张业务表全部使用显式类型、约束及已索引的外键。
-- [ ] 加载角色和只读角色均由集成测试证明；只读角色不能执行插入、更新、删除、创建或修改。
-- [ ] tiny 与 full 生成器配置固定且已版本化。
-- [ ] 使用相同配置和种子重复运行时，逐表摘要完全相同。
-- [ ] `anomaly_manifest.json` 记录异常 ID、时间窗口、影响范围、根因与预期信号。
-- [ ] 首批 15 个指标具有版本化 YAML 定义和可执行验证查询。
-- [ ] 20 个黄金问题具有版本化 Oracle SQL，以及从 tiny 数据集生成的预期输出。
-- [ ] fixture 基线确定且无网络访问。
-- [ ] live 基线获授权后记录失败，不删除困难用例。
-- [ ] GitHub Actions 在不调用付费 API 的情况下执行 lint、类型检查、单元测试、数据库集成测试、迁移、tiny 生成及 fixture 评测。
-- [ ] README 包含准确的第 1 周环境搭建、生成、验证与基线命令。
+- [x] PostgreSQL 17 + pgvector 可通过一条 Docker Compose 命令启动。
+- [x] 12 张业务表全部使用显式类型、约束及已索引的外键。
+- [x] 加载角色和只读角色均由集成测试证明；只读角色不能执行插入、更新、删除、创建或修改。
+- [x] tiny 与 full 生成器配置固定且已版本化。
+- [x] 使用相同配置和种子重复运行时，逐表摘要完全相同。
+- [x] `anomaly_manifest.json` 记录异常 ID、时间窗口、影响范围、根因与预期信号。
+- [x] 首批 15 个指标具有版本化 YAML 定义和可执行验证查询。
+- [x] 20 个黄金问题具有版本化 Oracle SQL，以及从 tiny 数据集生成的预期输出。
+- [x] fixture 基线确定且无网络访问。
+- [x] live 基线获授权后记录失败，不删除困难用例。
+- [x] GitHub Actions 在不调用付费 API 的情况下执行 lint、类型检查、单元测试、数据库集成测试、迁移、tiny 生成及 fixture 评测。
+- [x] README 包含准确的第 1 周环境搭建、生成、验证与基线命令。
 
 ## 明确延后
 
@@ -265,5 +268,5 @@ git diff --check
 - 不存在未解决标记、占位说明或无人负责的接口；
 - 规范类型只在主契约中声明一次，并分配到明确实现文件；
 - 测试与 CI 无法发起真实模型调用；
-- 缺少 API Key 只会阻塞需显式授权的 live 基线运行，不影响 Plan A/B 或 fixture 评测；
+- API Key 已在被 Git 忽略的本地 `.env` 配置，live 仍只允许显式双重授权，不影响离线评测；
 - 第 2 周及以后能力均明确延后，避免第 1 周过早膨胀为 Agent 实现。

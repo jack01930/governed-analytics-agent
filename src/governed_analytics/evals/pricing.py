@@ -61,9 +61,13 @@ class ModelPricing(BaseModel):
     input_token_upper_bound: int
     input_price: Decimal
     output_price: Decimal
+    pricing_basis: str
     source: str
+    fx_source: str | None = None
 
-    @field_validator("provider", "region", "requested_model", "resolved_model", "source")
+    @field_validator(
+        "provider", "region", "requested_model", "resolved_model", "pricing_basis", "source"
+    )
     @classmethod
     def validate_nonblank_text(cls, value: str) -> str:
         if not value.strip():
@@ -90,9 +94,11 @@ class ModelPricing(BaseModel):
             raise ValueError("price must be a finite nonnegative decimal")
         return price
 
-    @field_validator("source")
+    @field_validator("source", "fx_source")
     @classmethod
-    def validate_source_url(cls, source: str) -> str:
+    def validate_source_url(cls, source: str | None) -> str | None:
+        if source is None:
+            return None
         try:
             parsed_url = urlsplit(source)
             _ = parsed_url.port

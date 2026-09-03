@@ -1,5 +1,8 @@
 # 第 1B 周：合成数据与指标实现计划
 
+> **状态同步（2026-09-04）：** 实现步骤已完成；tiny/full 数据、8 类异常、证据清单与 15 个指标均已生成，
+> 且 tiny/full 产物校验通过。外部 CI 与 full 重新生成耗时分别保留为外部/性能复核项。
+
 > **供 Agent 执行者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐任务实施本计划。各步骤使用复选框（`- [ ]`）跟踪进度。
 
 **目标：** 生成并加载 tiny 与 full 两种规模的确定性电商数据集，发布机器可读的异常真值，并验证首批 15 个版本化指标定义。
@@ -115,7 +118,7 @@ campaigns: 30
 - 输入：上述固定规模 YAML。
 - 输出：`DatasetScale`、`GeneratorConfig`、`TableDigest`、`DatasetManifest`，以及 `named_rng(seed, namespace) -> numpy.random.Generator`。
 
-- [ ] **步骤 1：声明直接依赖和控制台入口**
+- [x] **步骤 1：声明直接依赖和控制台入口**
 
 在 `[project].dependencies` 中添加直接依赖 `numpy` 和 `pyyaml`；不得依赖传递安装。添加：
 
@@ -126,7 +129,7 @@ governed-data = "governed_analytics.data_generation.cli:main"
 
 文件存在后运行 `uv lock`；将生成的 `uv.lock` 与任务 1 一并提交。
 
-- [ ] **步骤 2：编写失败的模型与 RNG 测试**
+- [x] **步骤 2：编写失败的模型与 RNG 测试**
 
 创建 `tests/unit/data_generation/test_randomness.py`：
 
@@ -167,7 +170,7 @@ def test_tiny_config_is_frozen_and_exact() -> None:
     assert config.start_at.tzinfo is not None
 ```
 
-- [ ] **步骤 3：运行测试并确认模块缺失**
+- [x] **步骤 3：运行测试并确认模块缺失**
 
 运行：
 
@@ -177,7 +180,7 @@ uv run pytest tests/unit/data_generation/test_models.py tests/unit/data_generati
 
 预期：由于数据生成模块不存在，导入失败。
 
-- [ ] **步骤 4：实现不可变契约**
+- [x] **步骤 4：实现不可变契约**
 
 创建 `models.py`，使用 `2026-09-01-week-1-data-baseline.md` 中精确的跨计划类。向 `GeneratorConfig` 添加以下验证器：
 
@@ -211,7 +214,7 @@ def named_rng(seed: int, namespace: str) -> Generator:
     return np.random.default_rng(namespace_seed)
 ```
 
-- [ ] **步骤 5：运行测试并提交契约**
+- [x] **步骤 5：运行测试并提交契约**
 
 运行：
 
@@ -238,7 +241,7 @@ git commit -m "feat: 定义可复现数据生成契约"
 - 输入：`GeneratorConfig` 及命名流 `customers`、`products`、`campaigns`。
 - 输出：`generate_categories()`、`generate_customers(config)`、`generate_products(config)` 和 `generate_campaigns(config)`；每个函数返回列顺序与 PostgreSQL Schema 一致的 DataFrame。
 
-- [ ] **步骤 1：编写确定性维表测试**
+- [x] **步骤 1：编写确定性维表测试**
 
 创建 `tests/unit/data_generation/test_dimensions.py`：
 
@@ -268,7 +271,7 @@ def test_tiny_dimensions_have_stable_keys_and_counts() -> None:
     assert len(campaigns) == 6
 ```
 
-- [ ] **步骤 2：运行测试并确认生成函数缺失**
+- [x] **步骤 2：运行测试并确认生成函数缺失**
 
 运行：
 
@@ -278,7 +281,7 @@ uv run pytest tests/unit/data_generation/test_dimensions.py -v
 
 预期：导入 `dimensions` 或 `load_generator_config` 失败。
 
-- [ ] **步骤 3：实现固定词汇与配置加载**
+- [x] **步骤 3：实现固定词汇与配置加载**
 
 创建 `vocabulary.py`，包含本计划精确的地区、渠道元组及 20 个稳定的中文品类名。向 `models.py` 添加：
 
@@ -293,7 +296,7 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
     return GeneratorConfig.model_validate(raw)
 ```
 
-- [ ] **步骤 4：实现维表生成规则**
+- [x] **步骤 4：实现维表生成规则**
 
 在 `dimensions.py` 中使用以下精确规则：
 
@@ -312,7 +315,7 @@ def cents_to_money(cents: int) -> str:
     return str((Decimal(cents) / Decimal(100)).quantize(Decimal("0.01")))
 ```
 
-- [ ] **步骤 5：运行测试、检查类型并提交维表**
+- [x] **步骤 5：运行测试、检查类型并提交维表**
 
 运行：
 
@@ -338,7 +341,7 @@ git commit -m "feat: 生成确定性业务维表"
 - 输入：已生成维表与命名随机流。
 - 输出：异常注入前的基础 DataFrame，包括订单、订单项、支付、退款、会话、库存、归因及流水线运行。
 
-- [ ] **步骤 1：编写 tiny 事实契约测试**
+- [x] **步骤 1：编写 tiny 事实契约测试**
 
 创建 `tests/unit/data_generation/test_facts.py`：
 
@@ -361,7 +364,7 @@ def test_base_facts_are_referentially_valid_and_repeatable() -> None:
     assert first.orders["ordered_at"].max() < config.end_at
 ```
 
-- [ ] **步骤 2：运行测试并确认事实模块缺失**
+- [x] **步骤 2：运行测试并确认事实模块缺失**
 
 运行：
 
@@ -371,7 +374,7 @@ uv run pytest tests/unit/data_generation/test_facts.py -v
 
 预期：导入 `facts` 失败。
 
-- [ ] **步骤 3：实现 `GeneratedFacts` 与时间戳分布**
+- [x] **步骤 3：实现 `GeneratedFacts` 与时间戳分布**
 
 创建不可变容器：
 
@@ -401,7 +404,7 @@ class GeneratedFacts:
 - 其他日期乘数 `1.0`；
 - 采样前归一化权重。
 
-- [ ] **步骤 4：实现精确的事实生成规则**
+- [x] **步骤 4：实现精确的事实生成规则**
 
 - 每个订单一次支付；成功概率：paid/completed/refunded 为 `0.97`，cancelled 为 `0.05`，placed 为 `0.30`；
 - 支付对账前订单状态权重：placed `0.03`、paid `0.12`、completed `0.77`、cancelled `0.08`；
@@ -416,7 +419,7 @@ class GeneratedFacts:
 
 返回前，确保每个 DataFrame 都按其 identity 列排序。
 
-- [ ] **步骤 5：运行测试并提交事实生成实现**
+- [x] **步骤 5：运行测试并提交事实生成实现**
 
 运行：
 
@@ -444,7 +447,7 @@ git commit -m "feat: 生成订单与行为事实数据"
 - 输入：`GeneratedFacts`、维表、规模及异常契约表。
 - 输出：变异后的事实数据，以及序列化为 `anomaly_manifest.json` 的 `AnomalyManifest`。
 
-- [ ] **步骤 1：编写精确异常数量测试**
+- [x] **步骤 1：编写精确异常数量测试**
 
 创建 `tests/unit/data_generation/test_anomalies.py`：
 
@@ -466,7 +469,7 @@ def test_tiny_quality_anomalies_have_exact_counts() -> None:
     assert result.manifest.by_id("anomaly_refund_exceeds_payment").mutated_rows == 3
 ```
 
-- [ ] **步骤 2：运行测试并确认异常模块缺失**
+- [x] **步骤 2：运行测试并确认异常模块缺失**
 
 运行：
 
@@ -476,7 +479,7 @@ uv run pytest tests/unit/data_generation/test_anomalies.py -v
 
 预期：导入 `anomalies` 失败。
 
-- [ ] **步骤 3：定义异常模型与 JSON Schema**
+- [x] **步骤 3：定义异常模型与 JSON Schema**
 
 实现：
 
@@ -508,7 +511,7 @@ class AnomalyManifest(BaseModel):
 
 使用 `AnomalyManifest.model_json_schema()` 生成并提交 `data/manifests/anomaly_manifest.schema.json`。测试必须比较已提交 Schema 与现场生成 Schema。
 
-- [ ] **步骤 4：实现全部八种确定性变异**
+- [x] **步骤 4：实现全部八种确定性变异**
 
 精确实现本计划开头的异常契约。应用时间/范围筛选后，按主键稳定升序选择行；绝不随机采样异常行。
 
@@ -516,7 +519,7 @@ class AnomalyManifest(BaseModel):
 
 对于缺货异常，删除异常窗口内受影响 SKU 订单项的 90%，并重新计算订单/支付合计。如果订单失去最后一个订单项，则保留订单，但将状态设为 `cancelled`、金额合计设为零，并将支付标记为失败。这些规则在保持配置订单数稳定的同时，使两个根因都能在 GMV 中观测到。
 
-- [ ] **步骤 5：运行测试并提交异常真值**
+- [x] **步骤 5：运行测试并提交异常真值**
 
 运行：
 
@@ -545,7 +548,7 @@ git commit -m "feat: 注入可验证业务与质量异常"
 - 输入：已生成维表、变异后的事实数据，以及加载专用 `LoaderDatabaseSettings.loader_database_url`（`LOADER_DATABASE_URL`）。
 - 输出：规范 CSV 文件、数据库行，以及包含逐表行数/摘要的 `DatasetManifest`。
 
-- [ ] **步骤 1：编写规范摘要测试**
+- [x] **步骤 1：编写规范摘要测试**
 
 创建 `tests/unit/data_generation/test_writer.py`：
 
@@ -568,7 +571,7 @@ def test_canonical_csv_is_stable_across_input_order(tmp_path: Path) -> None:
     assert (tmp_path / "first.csv").read_bytes() == (tmp_path / "second.csv").read_bytes()
 ```
 
-- [ ] **步骤 2：实现规范写入**
+- [x] **步骤 2：实现规范写入**
 
 `write_canonical_csv` 必须：
 
@@ -580,7 +583,7 @@ def write_canonical_csv(frame: pd.DataFrame, path: Path, *, sort_by: tuple[str, 
     return sha256(path.read_bytes()).hexdigest()
 ```
 
-- [ ] **步骤 3：实现静态 COPY 注册表与加载器**
+- [x] **步骤 3：实现静态 COPY 注册表与加载器**
 
 仅在加载器边界内实例化 `LoaderDatabaseSettings`；不得在其中实例化 `DatabaseSettings` 或 `MigrationDatabaseSettings`。加载器对象不得包含只读 URL 或迁移 URL。
 
@@ -616,7 +619,7 @@ with connection.cursor().copy(
 
 该 f-string 只有在 `table_name` 与 `columns` 来自静态注册表、绝不来自 CLI 输入时才安全。
 
-- [ ] **步骤 4：编写并通过 tiny 流水线集成测试**
+- [x] **步骤 4：编写并通过 tiny 流水线集成测试**
 
 创建 `tests/integration/data_generation/test_pipeline.py`：
 
@@ -642,7 +645,7 @@ def test_tiny_pipeline_is_reproducible(tmp_path: Path) -> None:
 
 第二次加载前，`generate_and_load` 使用加载器连接只清空 12 张已知表，并重置 identity。它必须拒绝用户输入的数据库名或表名。
 
-- [ ] **步骤 5：运行测试并提交加载流水线**
+- [x] **步骤 5：运行测试并提交加载流水线**
 
 运行：
 
@@ -672,7 +675,7 @@ git commit -m "feat: 加载并校验可复现模拟数据"
 - 输入：已加载的数据库 Schema 与固定业务定义。
 - 输出：`MetricDefinition`、`load_metric_catalog(path)`、`get_metric(metric_id)`，以及 15 个已解析定义。
 
-- [ ] **步骤 1：编写目录验证测试**
+- [x] **步骤 1：编写目录验证测试**
 
 创建 `tests/unit/metrics/test_catalog.py`：
 
@@ -693,7 +696,7 @@ def test_core_catalog_has_exact_metric_ids_and_valid_sql() -> None:
 
 加载器必须拒绝重复 ID、未知来源表、不含时区的 `valid_from`，以及 SQLGlot 无法在 `select <expression>` 中解析的表达式。
 
-- [ ] **步骤 2：在 YAML 中定义精确指标语义**
+- [x] **步骤 2：在 YAML 中定义精确指标语义**
 
 创建 `data/metrics/core.yaml`，版本为 `1.0.0`、`valid_from: 2025-01-01T00:00:00Z`，并使用以下公式：
 
@@ -717,7 +720,7 @@ def test_core_catalog_has_exact_metric_ids_and_valid_sql() -> None:
 
 每个 YAML 条目包含说明、默认筛选条件、来源表清单及一个示例问题。比率以 0–1 存储，而不是百分数。
 
-- [ ] **步骤 3：实现不可变指标契约与加载器**
+- [x] **步骤 3：实现不可变指标契约与加载器**
 
 实现主计划中的精确 `MetricDefinition`。`load_metric_catalog` 返回保持文件顺序的 `dict[str, MetricDefinition]`。使用以下方式验证表达式：
 
@@ -727,7 +730,7 @@ sqlglot.parse_one(f"select {metric.expression_sql}", read="postgres")
 
 目录加载器只验证元数据；不会把用户输入拼接到可执行 SQL 中。
 
-- [ ] **步骤 4：为全部 15 个指标添加数据库健全性查询**
+- [x] **步骤 4：为全部 15 个指标添加数据库健全性查询**
 
 创建集成测试，在 `[2026-06-01, 2026-07-01)` 区间内为每个指标执行一条固定的参数化查询。断言：
 
@@ -745,7 +748,7 @@ set local search_path = public, pg_catalog;
 
 真实 PostgreSQL 集成测试（非 mock）必须在同一事务中查询 `current_setting`，并断言 `transaction_read_only = 'on'`、`statement_timeout = '10s'` 和 `search_path = 'public, pg_catalog'`。不得在通用 engine 工厂上设置事务状态。
 
-- [ ] **步骤 5：运行测试并提交指标目录**
+- [x] **步骤 5：运行测试并提交指标目录**
 
 运行：
 
@@ -775,7 +778,7 @@ git commit -m "feat: 定义首批十五个业务指标"
 - 输入：生成流水线与指标目录。
 - 输出：`governed-data generate`、`governed-data verify`、`make data-tiny` 和 `make metrics-check`。
 
-- [ ] **步骤 1：实现具有显式规模选项的 CLI 命令**
+- [x] **步骤 1：实现具有显式规模选项的 CLI 命令**
 
 使用 `argparse` 提供以下接口：
 
@@ -786,7 +789,7 @@ governed-data verify --scale {tiny,full} [--output artifacts/datasets]
 
 `generate` 加载数据并写入清单。`verify` 在临时产物目录中重新生成，比较配置/表摘要，打印存在差异的表名，并在不匹配时以状态码 1 退出。
 
-- [ ] **步骤 2：添加 Make target**
+- [x] **步骤 2：添加 Make target**
 
 ```make
 .PHONY: data-tiny data-verify metrics-check
@@ -801,7 +804,7 @@ metrics-check:
 	@uv run pytest tests/unit/metrics tests/integration/metrics -v
 ```
 
-- [ ] **步骤 3：扩展 CI，但只允许 tiny 生成**
+- [x] **步骤 3：扩展 CI，但只允许 tiny 生成**
 
 在 database job 的迁移与持久化测试之后添加：
 
@@ -813,11 +816,11 @@ metrics-check:
 
 CI 绝不能生成 full 数据集。
 
-- [ ] **步骤 4：记录可复现性与指标语义**
+- [x] **步骤 4：记录可复现性与指标语义**
 
 `docs/data-generation.md` 记录各规模行数、种子、命名 RNG、全部八种异常、产物、清单及安全重生成。`docs/metrics.md` 记录 15 个指标 ID、公式、时间字段、维度及比率表示方式。
 
-- [ ] **步骤 5：运行完整 Plan B 门禁**
+- [x] **步骤 5：运行完整 Plan B 门禁**
 
 运行：
 
@@ -833,7 +836,7 @@ git diff --check
 
 预期：生成与验证完成且摘要一致；15 个指标测试与质量检查通过。
 
-- [ ] **步骤 6：提交 Plan B 工作流**
+- [x] **步骤 6：提交 Plan B 工作流**
 
 ```bash
 git add src/governed_analytics/data_generation/cli.py Makefile .github/workflows/ci.yml docs/data-generation.md docs/metrics.md README.md
@@ -842,11 +845,11 @@ git commit -m "docs: 固化数据与指标复现流程"
 
 ## Plan B 完成门禁
 
-- [ ] tiny 生成在开发机上 60 秒内完成。
-- [ ] full 生成在 15 分钟内完成，并使用分块 COPY，而非逐行 INSERT。
-- [ ] 使用种子 `20260901` 的两次运行具有相同的逐表行数与 SHA-256 摘要。
-- [ ] 八条异常记录与精确的 tiny 变异数量及预期信号一致。
-- [ ] 异常注入后全部外键仍然有效。
-- [ ] 15 个指标定义均可解析、验证，并执行固定健全性查询。
-- [ ] Git 未暂存任何生成 CSV 或数据库卷。
-- [ ] CI 执行 tiny 生成，且不发起外部 API 请求。
+- [x] tiny 生成在开发机上 60 秒内完成（2026-09-04 实测 2.73 秒）。
+- [x] full 生成在 15 分钟内完成，并使用分块 COPY，而非逐行 INSERT（2026-09-04 完整 verify 约 98 秒）。
+- [x] 使用种子 `20260901` 的两次运行具有相同的逐表行数与 SHA-256 摘要。
+- [x] 八条异常记录与精确的 tiny 变异数量及预期信号一致。
+- [x] 异常注入后全部外键仍然有效。
+- [x] 15 个指标定义均可解析、验证，并执行固定健全性查询。
+- [x] Git 未暂存任何生成 CSV 或数据库卷。
+- [ ] CI 执行 tiny 生成，且不发起外部 API 请求（工作流静态门禁已通过，外部运行待触发）。

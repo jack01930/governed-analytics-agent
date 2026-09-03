@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from time import monotonic
+from typing import TypedDict
 
 import sqlglot
 from openai import AsyncOpenAI
@@ -12,12 +14,34 @@ from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError, field_va
 from sqlglot import exp
 
 from governed_analytics.evals.models import GeneratedSql
-from governed_analytics.models.prompts import BASELINE_SYSTEM_PROMPT_V1, build_baseline_user_prompt
+from governed_analytics.models.prompts import BASELINE_SYSTEM_PROMPT_V2, build_baseline_user_prompt
 from governed_analytics.models.protocols import SqlGenerationRequest
 
 
 class ModelAdapterError(ValueError):
-    """Stable public model-adapter error containing a safe category only."""
+    """Stable public adapter error with only safe call-accounting metadata."""
+
+    def __init__(
+        self,
+        category: str,
+        *,
+        provider_model: str | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        latency_ms: int = 0,
+    ) -> None:
+        super().__init__(category)
+        self.provider_model = provider_model
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.latency_ms = latency_ms
+
+
+class _ErrorMetadata(TypedDict):
+    provider_model: str | None
+    input_tokens: int
+    output_tokens: int
+    latency_ms: int
 
 
 class _ProviderSqlResponse(BaseModel):
@@ -43,8 +67,38 @@ class _ProviderSqlResponse(BaseModel):
         return assumptions
 
 
-def _error(category: str) -> ModelAdapterError:
-    return ModelAdapterError(category)
+def _error(
+    category: str,
+    *,
+    provider_model: str | None = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    latency_ms: int = 0,
+) -> ModelAdapterError:
+    return ModelAdapterError(
+        category,
+        provider_model=provider_model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_ms=latency_ms,
+    )
+
+
+def _validation_category(error: ValidationError) -> str:
+    """Map strict envelope failures to stable categories without retaining raw values."""
+    locations = tuple(
+        item.get("loc", ())
+        for item in error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+    )
+    if any(location and location[0] == "assumptions" for location in locations):
+        return "invalid_assumptions"
+    if any(location and location[0] == "sql" for location in locations):
+        return "invalid_sql_content"
+    return "invalid_envelope"
 
 
 def _is_single_postgres_query(sql: str) -> bool:
@@ -84,51 +138,72 @@ class OpenAICompatibleSqlGenerator:
             response = await self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "system", "content": BASELINE_SYSTEM_PROMPT_V1},
+                    {"role": "system", "content": BASELINE_SYSTEM_PROMPT_V2},
                     {"role": "user", "content": build_baseline_user_prompt(request)},
                 ],
                 temperature=0,
                 response_format={"type": "json_object"},
-                max_completion_tokens=1200,
-                extra_body={"enable_thinking": False},
+                max_tokens=1200,
+                extra_body={"thinking": {"type": "disabled"}},
             )
         except Exception:
-            raise _error("provider_call_failed") from None
+            latency_ms = max(0, round((monotonic() - started_at) * 1000))
+            raise _error("provider_call_failed", latency_ms=latency_ms) from None
         latency_ms = max(0, round((monotonic() - started_at) * 1000))
+
+        provider_model_value: object = None
+        with suppress(Exception):
+            provider_model_value = response.model
+        provider_model = (
+            provider_model_value
+            if isinstance(provider_model_value, str) and provider_model_value.strip()
+            else None
+        )
+
+        usage: object = None
+        usage_accessible = False
+        usage_fields_accessible = False
+        input_tokens: int | None = None
+        output_tokens: int | None = None
+        with suppress(Exception):
+            usage = response.usage
+            usage_accessible = True
+        if usage is not None:
+            with suppress(Exception):
+                input_tokens = _strict_positive_integer(usage.prompt_tokens)  # type: ignore[attr-defined]
+                output_tokens = _strict_positive_integer(usage.completion_tokens)  # type: ignore[attr-defined]
+                usage_fields_accessible = True
+
+        metadata: _ErrorMetadata = {
+            "provider_model": provider_model,
+            "input_tokens": input_tokens or 0,
+            "output_tokens": output_tokens or 0,
+            "latency_ms": latency_ms,
+        }
 
         try:
             content = response.choices[0].message.content
         except Exception:
-            raise _error("missing_content") from None
+            raise _error("missing_content", **metadata) from None
         if content is None:
-            raise _error("missing_content")
+            raise _error("missing_content", **metadata)
         if not isinstance(content, str):
-            raise _error("invalid_content")
+            raise _error("invalid_content_type", **metadata)
         try:
-            parsed_content = _ProviderSqlResponse.model_validate(json.loads(content))
-        except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
-            raise _error("invalid_content") from None
+            decoded = json.loads(content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raise _error("invalid_json", **metadata) from None
+        try:
+            parsed_content = _ProviderSqlResponse.model_validate(decoded)
+        except ValidationError as error:
+            raise _error(_validation_category(error), **metadata) from None
 
-        try:
-            usage = response.usage
-        except Exception:
-            raise _error("missing_usage") from None
-        if usage is None:
-            raise _error("missing_usage")
-        try:
-            input_tokens = _strict_positive_integer(usage.prompt_tokens)
-            output_tokens = _strict_positive_integer(usage.completion_tokens)
-        except Exception:
-            raise _error("missing_usage") from None
+        if not usage_accessible or usage is None or not usage_fields_accessible:
+            raise _error("missing_usage", **metadata)
         if input_tokens is None or output_tokens is None:
-            raise _error("invalid_usage")
-
-        try:
-            provider_model = response.model
-        except Exception:
-            raise _error("missing_model") from None
-        if not isinstance(provider_model, str) or not provider_model.strip():
-            raise _error("missing_model")
+            raise _error("invalid_usage", **metadata)
+        if provider_model is None:
+            raise _error("missing_model", **metadata)
         return GeneratedSql(
             sql=parsed_content.sql,
             assumptions=tuple(parsed_content.assumptions),

@@ -26,7 +26,8 @@ factory 上。
 
 ## Schema
 
-迁移 `0001` 创建以下 12 张业务表，迁移 `0002` 配置加载和只读权限：
+迁移 `0001` 创建以下 12 张业务表，`0002` 配置加载和只读权限，`0003` 为 `analytics_loader` 增加受限的
+`reset_analytics_dataset()` 数据集重置函数。当前 Alembic head 为 `0003`。
 
 容器 bootstrap 会先从 `PUBLIC` 回收数据库 `TEMPORARY` 权限；`0002` downgrade 只回收本迁移
 授予的表、序列和默认权限，不会重新授予 `PUBLIC TEMPORARY`，因此回退到 `0001` 后两个分析

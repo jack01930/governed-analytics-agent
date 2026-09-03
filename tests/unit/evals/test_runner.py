@@ -7,16 +7,24 @@ from shutil import copytree
 import pytest
 
 from governed_analytics.evals.models import GeneratedSql, QueryResult
+from governed_analytics.evals.pricing import estimate_cost_cny, load_model_pricing
 from governed_analytics.evals.runner import BaselineRunError, _load_expected_results, run_baseline
 from governed_analytics.evals.sql_guard import SqlRejected
-from governed_analytics.models.openai_compatible import ModelAdapterError
+from governed_analytics.models.openai_compatible import (
+    ModelAdapterError,
+    OpenAICompatibleSqlGenerator,
+)
 from governed_analytics.models.protocols import SqlGenerationRequest
 
 
-class _Generator:
+class _Generator(OpenAICompatibleSqlGenerator):
     def __init__(self, outcomes: dict[str, object]) -> None:
         self.outcomes = outcomes
         self.calls: list[str] = []
+
+    @property
+    def model(self) -> str:
+        return "deepseek-v4-flash"
 
     async def generate(self, request: SqlGenerationRequest) -> GeneratedSql:
         case_id = request.case_id
@@ -151,6 +159,46 @@ async def test_runner_preserves_model_adapter_category_and_sanitizes_publish_fai
             executor=fake_executor,
         )
     assert error.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_live_runner_preserves_failed_call_telemetry_and_cost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter_error = ModelAdapterError(
+        "invalid_assumptions",
+        provider_model="deepseek-v4-flash",
+        input_tokens=1000,
+        output_tokens=200,
+        latency_ms=345,
+    )
+    generator = _Generator({"G001": adapter_error})
+    pricing = load_model_pricing("data/pricing/deepseek-v4-flash-2026-09-01.yaml")
+
+    async def fake_executor(_sql: str) -> QueryResult:
+        return QueryResult(columns=("gmv",), rows=((Decimal("1"),),))
+
+    monkeypatch.setattr(
+        "governed_analytics.evals.runner.write_baseline_report",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    report = await run_baseline(
+        mode="live",
+        output_root=tmp_path,
+        generator=generator,
+        pricing=pricing,
+        executor=fake_executor,
+    )
+
+    failed = report.cases[0]
+    assert failed.error_type == "generation_invalid_assumptions"
+    assert failed.latency_ms == 345
+    assert failed.input_tokens == 1000
+    assert failed.output_tokens == 200
+    assert failed.estimated_cost_cny == estimate_cost_cny(1000, 200, pricing)
+    assert "deepseek-v4-flash" in report.resolved_models
+    assert report.pricing_effective_date == pricing.effective_date
+    assert report.pricing_basis == pricing.pricing_basis
 
 
 @pytest.mark.asyncio

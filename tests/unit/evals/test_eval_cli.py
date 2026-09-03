@@ -108,7 +108,7 @@ def test_mismatched_pricing_never_constructs_client(monkeypatch: pytest.MonkeyPa
         cli,
         "load_model_pricing",
         lambda _path: SimpleNamespace(
-            requested_model="configured-alias", resolved_model="qwen-snapshot"
+            requested_model="configured-alias", resolved_model="provider-snapshot"
         ),
     )
     monkeypatch.setattr(cli, "AsyncOpenAI", lambda **kwargs: calls.append(kwargs))

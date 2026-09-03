@@ -79,9 +79,9 @@ else
 fi
 
 key_is_set=0
-if [ -n "${MODEL_API_KEY:-}" ] || [ -n "${DASHSCOPE_API_KEY:-}" ]; then
+if [ -n "${MODEL_API_KEY:-}" ]; then
   key_is_set=1
-elif [ -f .env ] && grep -Eq '^(MODEL_API_KEY|DASHSCOPE_API_KEY)=.+$' .env; then
+elif [ -f .env ] && grep -Eq '^MODEL_API_KEY=.+$' .env; then
   key_is_set=1
 fi
 

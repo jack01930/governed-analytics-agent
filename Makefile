@@ -1,4 +1,11 @@
 PYTHON ?= python3.12
+MIGRATION_DATABASE_URL ?= postgresql+psycopg://governed_admin:governed_admin_dev@127.0.0.1:5432/governed_analytics
+LOADER_DATABASE_URL ?= postgresql+psycopg://analytics_loader:analytics_loader_dev@127.0.0.1:5432/governed_analytics
+DATABASE_URL ?= postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.0.0.1:5432/governed_analytics
+
+export MIGRATION_DATABASE_URL
+export LOADER_DATABASE_URL
+export DATABASE_URL
 
 .PHONY: doctor venv sync lint format typecheck test check db-up db-down migrate migration-check test-integration data-tiny data-full data-verify metrics-check eval-fixture
 

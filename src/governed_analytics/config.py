@@ -93,10 +93,10 @@ class ModelSettings(BaseSettings):
         hide_input_in_errors=True,
     )
 
-    model_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    model_base_url: str = "https://api.deepseek.com"
     model_api_key: SecretStr | None = None
-    model_name: str = "qwen3.7-plus"
-    eval_model_name: str = "qwen3.7-plus-2026-05-26"
+    model_name: str = "deepseek-v4-flash"
+    eval_model_name: str = "DeepSeek-V4-Flash-0731"
 
     @model_validator(mode="before")
     @classmethod
