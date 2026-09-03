@@ -1,0 +1,195 @@
+- metric_id: gmv
+  name_zh: 商品交易总额
+  name_en: Gross Merchandise Value
+  description: 已支付、已完成或已退款订单的商品行净额之和，不包含取消和仅下单订单。
+  expression_sql: "sum(oi.net_amount)"
+  time_field: o.ordered_at
+  default_filters: ["o.status in ('paid', 'completed', 'refunded')"]
+  dimensions: [region, channel, category, product, segment]
+  source_tables: [orders, order_items, products, categories, customers]
+  unit: cny
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 2026年6月各区域的商品交易总额是多少？
+- metric_id: paid_gmv
+  name_zh: 已支付交易额
+  name_en: Paid GMV
+  description: 支付成功记录的金额之和，按支付成功时间归属窗口。
+  expression_sql: "sum(p.amount)"
+  time_field: p.paid_at
+  default_filters: ["p.status = 'succeeded'"]
+  dimensions: [region, channel, segment]
+  source_tables: [payments, orders, customers]
+  unit: cny
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月成功支付的交易额是多少？
+- metric_id: net_revenue
+  name_zh: 净收入
+  name_en: Net Revenue
+  description: 标量表达式在绑定窗口内以订单时间过滤，成功支付与退款先按订单预聚合后相减，避免连接倍增；按维度分组由未来查询规划器处理。
+  expression_sql: "(with order_payments as (select p.order_id, sum(p.amount) as amount from payments p join orders o on o.order_id = p.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and p.status = 'succeeded' group by p.order_id), order_refunds as (select r.order_id, sum(r.amount) as amount from refunds r join orders o on o.order_id = r.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and r.status = 'succeeded' group by r.order_id) select coalesce((select sum(amount) from order_payments), 0) - coalesce((select sum(amount) from order_refunds), 0))"
+  time_field: o.ordered_at
+  default_filters: ["payment and refund amounts are pre-aggregated by order", "p.status = 'succeeded'", "r.status = 'succeeded'"]
+  dimensions: [region, channel, category, product]
+  source_tables: [orders, payments, refunds, order_items, products, categories]
+  unit: cny
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月按品类统计的净收入是多少？
+- metric_id: valid_order_count
+  name_zh: 有效订单数
+  name_en: Valid Order Count
+  description: 状态为已支付、已完成或已退款的去重订单数。
+  expression_sql: "count(distinct o.order_id)"
+  time_field: o.ordered_at
+  default_filters: ["o.status in ('paid', 'completed', 'refunded')"]
+  dimensions: [region, channel, segment]
+  source_tables: [orders, customers]
+  unit: count
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月有效订单有多少笔？
+- metric_id: average_order_value
+  name_zh: 平均订单价值
+  name_en: Average Order Value
+  description: 有效订单商品行净额之和除以有效去重订单数，分母为零时返回空值。
+  expression_sql: "sum(oi.net_amount) / nullif(count(distinct o.order_id), 0)"
+  time_field: o.ordered_at
+  default_filters: ["o.status in ('paid', 'completed', 'refunded')"]
+  dimensions: [region, channel, segment]
+  source_tables: [orders, order_items, customers]
+  unit: cny
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月各渠道的平均订单价值是多少？
+- metric_id: payment_success_rate
+  name_zh: 支付成功率
+  name_en: Payment Success Rate
+  description: 支付成功尝试次数除以全部支付尝试次数，比例以0到1表示。
+  expression_sql: "count(*) filter (where p.status = 'succeeded')::numeric / nullif(count(*), 0)"
+  time_field: p.created_at
+  default_filters: []
+  dimensions: [provider, channel]
+  source_tables: [payments, orders]
+  unit: ratio
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月各支付渠道的支付成功率是多少？
+- metric_id: refund_amount
+  name_zh: 成功退款金额
+  name_en: Refund Amount
+  description: 状态为成功的退款金额之和，按退款成功时间归属窗口。
+  expression_sql: "sum(r.amount)"
+  time_field: r.refunded_at
+  default_filters: ["r.status = 'succeeded'"]
+  dimensions: [reason, category, product, region]
+  source_tables: [refunds, orders, order_items, products, categories]
+  unit: cny
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月按退款原因的成功退款金额是多少？
+- metric_id: refund_rate
+  name_zh: 退款率
+  name_en: Refund Rate
+  description: 标量表达式在绑定订单窗口内以匹配订单的成功退款额除以成功支付额，两个金额先按订单预聚合；按维度分组由未来查询规划器处理。
+  expression_sql: "(with order_payments as (select p.order_id, sum(p.amount) as amount from payments p join orders o on o.order_id = p.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and p.status = 'succeeded' group by p.order_id), order_refunds as (select r.order_id, sum(r.amount) as amount from refunds r join orders o on o.order_id = r.order_id where o.ordered_at >= :start_at and o.ordered_at < :end_at and r.status = 'succeeded' group by r.order_id) select coalesce((select sum(amount) from order_refunds), 0) / nullif((select sum(amount) from order_payments), 0))"
+  time_field: o.ordered_at
+  default_filters: ["payment and refund amounts are pre-aggregated by order", "p.status = 'succeeded'", "r.status = 'succeeded'"]
+  dimensions: [category, product, region]
+  source_tables: [orders, payments, refunds, order_items, products, categories]
+  unit: ratio
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月的退款率是多少？
+- metric_id: active_customers
+  name_zh: 活跃客户数
+  name_en: Active Customers
+  description: 窗口内至少有一笔有效订单的去重客户数。
+  expression_sql: "count(distinct o.customer_id)"
+  time_field: o.ordered_at
+  default_filters: ["o.status in ('paid', 'completed', 'refunded')"]
+  dimensions: [region, segment]
+  source_tables: [orders, customers]
+  unit: count
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月活跃客户数是多少？
+- metric_id: new_customers
+  name_zh: 新增客户数
+  name_en: New Customers
+  description: 注册时间落在窗口内的客户数。
+  expression_sql: "count(distinct c.customer_id)"
+  time_field: c.registered_at
+  default_filters: []
+  dimensions: [region, segment]
+  source_tables: [customers]
+  unit: count
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月新增客户有多少？
+- metric_id: repeat_purchase_rate
+  name_zh: 复购率
+  name_en: Repeat Purchase Rate
+  description: 标量表达式以绑定窗口的活跃客户为分母，以截至窗口结束累计至少两笔有效订单的活跃客户为分子；按维度分组由未来查询规划器处理。
+  expression_sql: "(with active_customers as (select distinct o.customer_id from orders o where o.ordered_at >= :start_at and o.ordered_at < :end_at and o.status in ('paid', 'completed', 'refunded')), lifetime_orders as (select o.customer_id from orders o where o.ordered_at < :end_at and o.status in ('paid', 'completed', 'refunded') group by o.customer_id having count(distinct o.order_id) >= 2) select count(lo.customer_id)::numeric / nullif(count(ac.customer_id), 0) from active_customers ac left join lifetime_orders lo on lo.customer_id = ac.customer_id)"
+  time_field: o.ordered_at
+  default_filters: ["numerator uses lifetime valid orders through interval end", "denominator uses interval active customers"]
+  dimensions: [region, segment]
+  source_tables: [orders, customers]
+  unit: ratio
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 截至6月底活跃客户的复购率是多少？
+- metric_id: customer_acquisition_cost
+  name_zh: 客户获取成本
+  name_en: Customer Acquisition Cost
+  description: 标量表达式以绑定归因窗口中参与活动的每活动一次支出除以去重归因客户数，禁止sum(distinct spend)；按维度分组由未来查询规划器处理。
+  expression_sql: "(with interval_attributions as (select distinct a.campaign_id, o.customer_id from campaign_attributions a join orders o on o.order_id = a.order_id where a.attributed_at >= :start_at and a.attributed_at < :end_at), campaign_spend as (select mc.campaign_id, mc.spend from marketing_campaigns mc join (select distinct campaign_id from interval_attributions) ia on ia.campaign_id = mc.campaign_id) select coalesce((select sum(spend) from campaign_spend), 0) / nullif((select count(distinct customer_id) from interval_attributions), 0))"
+  time_field: a.attributed_at
+  default_filters: ["campaign spend is pre-aggregated once per campaign", "attribution falls in interval"]
+  dimensions: [campaign, channel]
+  source_tables: [marketing_campaigns, campaign_attributions, orders]
+  unit: cny
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月各活动的客户获取成本是多少？
+- metric_id: conversion_rate
+  name_zh: 转化率
+  name_en: Conversion Rate
+  description: 已转化会话数除以全部会话数，比例以0到1表示。
+  expression_sql: "count(*) filter (where s.converted)::numeric / nullif(count(*), 0)"
+  time_field: s.occurred_at
+  default_filters: []
+  dimensions: [channel, region]
+  source_tables: [web_sessions, customers]
+  unit: ratio
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月各渠道的会话转化率是多少？
+- metric_id: stockout_rate
+  name_zh: 缺货率
+  name_en: Stockout Rate
+  description: 可售库存为零的商品库存快照数除以全部商品库存快照数，比例以0到1表示。
+  expression_sql: "count(*) filter (where i.available_qty = 0)::numeric / nullif(count(*), 0)"
+  time_field: i.snapshot_at
+  default_filters: []
+  dimensions: [category, product]
+  source_tables: [inventory_snapshots, products, categories]
+  unit: ratio
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月各品类的缺货率是多少？
+- metric_id: campaign_roi
+  name_zh: 活动投资回报率
+  name_en: Campaign Return on Investment
+  description: 标量表达式先按绑定窗口的活动聚合归因收入，活动支出每活动只计一次；零支出返回空值，结果可为负或大于1，按维度分组由未来查询规划器处理。
+  expression_sql: "(with interval_revenue as (select a.campaign_id, sum(a.attributed_revenue) as amount from campaign_attributions a where a.attributed_at >= :start_at and a.attributed_at < :end_at group by a.campaign_id), campaign_spend as (select mc.campaign_id, mc.spend from marketing_campaigns mc join interval_revenue ir on ir.campaign_id = mc.campaign_id) select (coalesce((select sum(amount) from interval_revenue), 0) - coalesce((select sum(spend) from campaign_spend), 0)) / nullif((select sum(spend) from campaign_spend), 0))"
+  time_field: a.attributed_at
+  default_filters: ["campaign spend is pre-aggregated once per campaign", "attribution falls in interval", "zero spend returns null"]
+  dimensions: [campaign, channel]
+  source_tables: [marketing_campaigns, campaign_attributions]
+  unit: ratio
+  version: 1.0.0
+  valid_from: 2025-01-01T00:00:00Z
+  example_question: 6月各营销活动的投资回报率是多少？

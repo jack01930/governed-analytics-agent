@@ -1,0 +1,10 @@
+{
+  "columns": [
+    "is_stale"
+  ],
+  "rows": [
+    [
+      true
+    ]
+  ]
+}

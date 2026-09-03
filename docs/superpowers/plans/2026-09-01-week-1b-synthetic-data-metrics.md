@@ -1,36 +1,39 @@
-# Week 1B Synthetic Data and Metrics Implementation Plan
+# 第 1B 周：合成数据与指标实现计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **状态同步（2026-09-04）：** 实现步骤已完成；tiny/full 数据、8 类异常、证据清单与 15 个指标均已生成，
+> 且 tiny/full 产物校验通过。外部 CI 与 full 重新生成耗时分别保留为外部/性能复核项。
 
-**Goal:** Generate and load a deterministic ecommerce dataset at tiny and full scales, publish machine-readable anomaly truth, and validate the first fifteen versioned metric definitions.
+> **供 Agent 执行者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐任务实施本计划。各步骤使用复选框（`- [ ]`）跟踪进度。
 
-**Architecture:** Pure generator functions create canonical CSV files without database access. Named random streams make each table stable even when another generator changes. A separate loader uses PostgreSQL `COPY` through `analytics_loader`, computes database digests, and writes a manifest; metric YAML is parsed into immutable Pydantic contracts and validated independently.
+**目标：** 生成并加载 tiny 与 full 两种规模的确定性电商数据集，发布机器可读的异常真值，并验证首批 15 个版本化指标定义。
 
-**Tech Stack:** Python 3.12, NumPy, Pandas, Pydantic 2, PyYAML, psycopg 3, PostgreSQL 17, SQLGlot, Pytest.
+**架构：** 纯生成函数在不访问数据库的情况下创建规范 CSV。命名随机流保证即使其他生成器发生变化，每张表仍保持稳定。独立加载器通过 `analytics_loader` 使用 PostgreSQL `COPY`，计算数据库摘要并写入清单；指标 YAML 被解析为不可变 Pydantic 契约并独立验证。
 
-**Spec:** `GOVERNED_ANALYTICS_AGENT_PLAN.md` sections 18-23 and `docs/superpowers/plans/2026-09-01-week-1-data-baseline.md`.
+**技术栈：** Python 3.12、NumPy、Pandas、Pydantic 2、PyYAML、psycopg 3、PostgreSQL 17、SQLGlot、Pytest。
 
-## Global Constraints
+**规格依据：** `GOVERNED_ANALYTICS_AGENT_PLAN.md` 第 18–23 节，以及 `docs/superpowers/plans/2026-09-01-week-1-data-baseline.md`。
 
-- Fixed seed is `20260901`; never use module-global `random` or NumPy RNG state.
-- Data interval is `[2025-01-01T00:00:00Z, 2026-07-01T00:00:00Z)`.
-- Tiny scale is committed only as configuration and small expected fixtures; generated CSV files stay under ignored `artifacts/`.
-- Full scale targets 50,000 customers, 2,000 products, 300,000 orders, 1,200,000 web sessions, 30 campaigns, and daily inventory snapshots.
-- Money is generated as integer cents and serialized with exactly two decimal places.
-- CSV columns and row ordering are fixed per table. Digests use canonical UTF-8 CSV bytes with LF endings.
-- Every anomaly is deterministic, has an ID, time window, affected keys, root cause, mutation parameters, and expected observable signal.
-- Metric definitions are semantic metadata, not executable arbitrary templates. SQL is parsed before acceptance.
-- The generator does not call a model, network service, or external data source.
+## 全局约束
+
+- 固定种子为 `20260901`；不得使用模块全局 `random` 或 NumPy RNG 状态。
+- 数据区间为 `[2025-01-01T00:00:00Z, 2026-07-01T00:00:00Z)`。
+- tiny 规模只提交配置和小型预期 fixture；生成的 CSV 始终位于被忽略的 `artifacts/` 下。
+- full 规模目标为 50,000 个客户、2,000 个商品、300,000 个订单、1,200,000 个 Web 会话、30 个营销活动及每日库存快照。
+- 金额以整数分生成，并严格序列化为两位小数。
+- 每张表的 CSV 列与行顺序固定。摘要使用以 LF 结尾的规范 UTF-8 CSV 字节。
+- 每个异常均为确定性，包含 ID、时间窗口、受影响键、根因、变异参数及预期可观测信号。
+- 指标定义是语义元数据，不是可执行的任意模板；接收前必须解析 SQL。
+- 生成器不调用模型、网络服务或外部数据源。
 
 ---
 
-## Fixed Business Vocabulary
+## 固定业务词汇
 
-Channels: `organic`, `search`, `social`, `affiliate`, `email`.
+渠道：`organic`、`search`、`social`、`affiliate`、`email`。
 
-Customer segments: `new`, `regular`, `vip`.
+客户分群：`new`、`regular`、`vip`。
 
-Regions, in stable order:
+地区按以下稳定顺序排列：
 
 ```python
 REGIONS = (
@@ -42,11 +45,11 @@ REGIONS = (
 SOUTH_REGIONS = frozenset({"广州", "深圳", "佛山", "东莞", "厦门", "福州", "南宁", "海口"})
 ```
 
-Category codes are `CAT-001` through `CAT-020`. Product SKUs are `SKU-000001` upward. Customer, order, payment, refund, session, and campaign codes use fixed zero-padded numeric suffixes.
+品类编码为 `CAT-001` 至 `CAT-020`。商品 SKU 从 `SKU-000001` 递增。客户、订单、支付、退款、会话和营销活动编码均使用固定宽度的补零数字后缀。
 
-## Fixed Scale Configurations
+## 固定规模配置
 
-Create `data/generator/tiny.yaml`:
+创建 `data/generator/tiny.yaml`：
 
 ```yaml
 scale: tiny
@@ -59,7 +62,7 @@ orders: 3000
 campaigns: 6
 ```
 
-Create `data/generator/full.yaml`:
+创建 `data/generator/full.yaml`：
 
 ```yaml
 scale: full
@@ -72,63 +75,63 @@ orders: 300000
 campaigns: 30
 ```
 
-Derived counts are deterministic:
+派生行数是确定性的：
 
-| Table | Tiny | Full | Rule |
+| 表 | Tiny | Full | 规则 |
 |---|---:|---:|---|
-| categories | 20 | 20 | fixed |
-| order_items | approximately 6,300 | approximately 630,000 | 1-5 items, mean 2.1 |
-| payments | 3,000 | 300,000 | one attempt per order |
-| refunds | approximately 180 | approximately 18,000 | base successful refund probability 6% |
-| web_sessions | 15,000 | 1,200,000 | fixed 5x orders for tiny, 4x for full |
-| inventory_snapshots | 54,600 | 1,092,000 | one daily row per product for 546 days |
-| pipeline_runs | 1,638 | 1,638 | three daily pipelines for 546 days |
+| categories | 20 | 20 | 固定 |
+| order_items | 约 6,300 | 约 630,000 | 每单 1–5 项，均值 2.1 |
+| payments | 3,000 | 300,000 | 每个订单一次支付尝试 |
+| refunds | 约 180 | 约 18,000 | 基础成功退款概率 6% |
+| web_sessions | 15,000 | 1,200,000 | tiny 固定为订单数 5 倍，full 为 4 倍 |
+| inventory_snapshots | 54,600 | 1,092,000 | 每个商品连续 546 天每天一行 |
+| pipeline_runs | 1,638 | 1,638 | 连续 546 天每天三个流水线 |
 
-Approximate rows are recorded as actual counts in `DatasetManifest`; tests assert deterministic equality, not the approximate number.
+近似行数会以实际值记录在 `DatasetManifest` 中；测试断言确定性相等，而不是断言近似值。
 
-## Seeded Anomaly Contract
+## 固定种子异常契约
 
-| ID | Window | Mutation | Expected signal |
+| ID | 窗口 | 变异 | 预期信号 |
 |---|---|---|---|
-| `anomaly_gmv_drop_south_conversion` | 2026-06-08 to 2026-06-15 | multiply conversion probability by `0.65` for `SOUTH_REGIONS` | South GMV and converted sessions fall versus 2026-06-01 to 2026-06-08 |
-| `anomaly_gmv_drop_stockout` | 2026-06-08 to 2026-06-15 | set available quantity to zero for `SKU-000001` and `SKU-000002`; suppress their order items by `0.90` | two products contribute materially to GMV loss |
-| `anomaly_refund_spike_category` | 2026-05-04 to 2026-05-11 | raise successful refund probability from `0.06` to `0.24` for `CAT-018` | category refund rate rises at least 2x |
-| `anomaly_inventory_delay` | 2026-06-15 | omit inventory snapshot rows after 08:00 UTC and create failed pipeline run | freshness rule finds a stale watermark |
-| `anomaly_duplicate_order_items` | 2026-04-10 | copy 20 tiny / 2,000 full order item rows with the same `source_line_id` and new PK | logical duplicate count is exact |
-| `anomaly_order_amount_mismatch` | 2026-03-17 | add CNY 10.00 to `orders.payable_amount` for 10 tiny / 1,000 full orders | order-to-item reconciliation fails |
-| `anomaly_missing_region` | 2026-02-12 | set `orders.region` null for 10 tiny / 1,000 full orders | completeness rule finds exact null count |
-| `anomaly_refund_exceeds_payment` | 2026-05-20 | add CNY 50.00 above successful payment to 3 tiny / 300 full refunds | refund consistency rule finds exact violations |
+| `anomaly_gmv_drop_south_conversion` | 2026-06-08 至 2026-06-15 | 将 `SOUTH_REGIONS` 转化概率乘以 `0.65` | 与 2026-06-01 至 2026-06-08 相比，华南 GMV 和转化会话下降 |
+| `anomaly_gmv_drop_stockout` | 2026-06-08 至 2026-06-15 | 将 `SKU-000001`、`SKU-000002` 可售量置零，并抑制其订单项 `0.90` | 两个商品对 GMV 损失有实质贡献 |
+| `anomaly_refund_spike_category` | 2026-05-04 至 2026-05-11 | 将 `CAT-018` 的成功退款概率从 `0.06` 提高到 `0.24` | 品类退款率至少上升 2 倍 |
+| `anomaly_inventory_delay` | 2026-06-15 | 省略 UTC 08:00 后的库存快照，并创建失败流水线运行 | 新鲜度规则发现陈旧 watermark |
+| `anomaly_duplicate_order_items` | 2026-04-10 | 复制 20 条 tiny / 2,000 条 full 订单项，保留相同 `source_line_id` 并生成新主键 | 逻辑重复数量精确 |
+| `anomaly_order_amount_mismatch` | 2026-03-17 | 为 10 个 tiny / 1,000 个 full 订单的 `orders.payable_amount` 增加人民币 10.00 元 | 订单—订单项对账失败 |
+| `anomaly_missing_region` | 2026-02-12 | 将 10 个 tiny / 1,000 个 full 订单的 `orders.region` 置空 | 完整性规则发现精确空值数量 |
+| `anomaly_refund_exceeds_payment` | 2026-05-20 | 使 3 条 tiny / 300 条 full 退款比成功支付额多人民币 50.00 元 | 退款一致性规则发现精确违规数 |
 
-## Task 1: Generator Contracts and Named Random Streams
+## 任务 1：生成器契约与命名随机流
 
-**Files:**
-- Modify: `pyproject.toml`
-- Create: `data/generator/tiny.yaml`
-- Create: `data/generator/full.yaml`
-- Create: `src/governed_analytics/data_generation/__init__.py`
-- Create: `src/governed_analytics/data_generation/models.py`
-- Create: `src/governed_analytics/data_generation/randomness.py`
-- Create: `tests/unit/data_generation/test_models.py`
-- Create: `tests/unit/data_generation/test_randomness.py`
+**文件：**
+- 修改：`pyproject.toml`
+- 新建：`data/generator/tiny.yaml`
+- 新建：`data/generator/full.yaml`
+- 新建：`src/governed_analytics/data_generation/__init__.py`
+- 新建：`src/governed_analytics/data_generation/models.py`
+- 新建：`src/governed_analytics/data_generation/randomness.py`
+- 新建：`tests/unit/data_generation/test_models.py`
+- 新建：`tests/unit/data_generation/test_randomness.py`
 
-**Interfaces:**
-- Consumes: the fixed scale YAML above.
-- Produces: `DatasetScale`, `GeneratorConfig`, `TableDigest`, `DatasetManifest`, and `named_rng(seed, namespace) -> numpy.random.Generator`.
+**接口：**
+- 输入：上述固定规模 YAML。
+- 输出：`DatasetScale`、`GeneratorConfig`、`TableDigest`、`DatasetManifest`，以及 `named_rng(seed, namespace) -> numpy.random.Generator`。
 
-- [ ] **Step 1: Declare direct dependencies and console entry point**
+- [x] **步骤 1：声明直接依赖和控制台入口**
 
-Add direct dependencies `numpy` and `pyyaml` to `[project].dependencies`; do not rely on transitive installation. Add:
+在 `[project].dependencies` 中添加直接依赖 `numpy` 和 `pyyaml`；不得依赖传递安装。添加：
 
 ```toml
 [project.scripts]
 governed-data = "governed_analytics.data_generation.cli:main"
 ```
 
-Run `uv lock` after the file exists; commit the resulting `uv.lock` with Task 1.
+文件存在后运行 `uv lock`；将生成的 `uv.lock` 与任务 1 一并提交。
 
-- [ ] **Step 2: Write failing model and RNG tests**
+- [x] **步骤 2：编写失败的模型与 RNG 测试**
 
-Create `tests/unit/data_generation/test_randomness.py`:
+创建 `tests/unit/data_generation/test_randomness.py`：
 
 ```python
 import numpy as np
@@ -145,7 +148,7 @@ def test_named_stream_is_repeatable_and_namespace_isolated() -> None:
     assert not np.array_equal(first, customers)
 ```
 
-Create `tests/unit/data_generation/test_models.py`:
+创建 `tests/unit/data_generation/test_models.py`：
 
 ```python
 from pathlib import Path
@@ -167,19 +170,19 @@ def test_tiny_config_is_frozen_and_exact() -> None:
     assert config.start_at.tzinfo is not None
 ```
 
-- [ ] **Step 3: Run tests and verify missing modules**
+- [x] **步骤 3：运行测试并确认模块缺失**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/data_generation/test_models.py tests/unit/data_generation/test_randomness.py -v
 ```
 
-Expected: imports fail because the data-generation modules do not exist.
+预期：由于数据生成模块不存在，导入失败。
 
-- [ ] **Step 4: Implement the immutable contracts**
+- [x] **步骤 4：实现不可变契约**
 
-Create `models.py` with the exact cross-plan classes from `2026-09-01-week-1-data-baseline.md`. Add this validator to `GeneratorConfig`:
+创建 `models.py`，使用 `2026-09-01-week-1-data-baseline.md` 中精确的跨计划类。向 `GeneratorConfig` 添加以下验证器：
 
 ```python
 from typing import Self
@@ -196,7 +199,7 @@ def validate_interval(self) -> Self:
     return self
 ```
 
-Create `randomness.py`:
+创建 `randomness.py`：
 
 ```python
 from hashlib import sha256
@@ -211,36 +214,36 @@ def named_rng(seed: int, namespace: str) -> Generator:
     return np.random.default_rng(namespace_seed)
 ```
 
-- [ ] **Step 5: Run tests and commit contracts**
+- [x] **步骤 5：运行测试并提交契约**
 
-Run:
+运行：
 
 ```bash
 uv lock
 uv run pytest tests/unit/data_generation/test_models.py tests/unit/data_generation/test_randomness.py -v
 ```
 
-Expected: all tests pass.
+预期：全部测试通过。
 
 ```bash
 git add pyproject.toml uv.lock data/generator src/governed_analytics/data_generation tests/unit/data_generation
 git commit -m "feat: 定义可复现数据生成契约"
 ```
 
-## Task 2: Canonical Dimension Generators
+## 任务 2：规范维表生成器
 
-**Files:**
-- Create: `src/governed_analytics/data_generation/vocabulary.py`
-- Create: `src/governed_analytics/data_generation/dimensions.py`
-- Create: `tests/unit/data_generation/test_dimensions.py`
+**文件：**
+- 新建：`src/governed_analytics/data_generation/vocabulary.py`
+- 新建：`src/governed_analytics/data_generation/dimensions.py`
+- 新建：`tests/unit/data_generation/test_dimensions.py`
 
-**Interfaces:**
-- Consumes: `GeneratorConfig` and named streams `customers`, `products`, `campaigns`.
-- Produces: `generate_categories()`, `generate_customers(config)`, `generate_products(config)`, and `generate_campaigns(config)`, each returning a DataFrame with schema order matching PostgreSQL.
+**接口：**
+- 输入：`GeneratorConfig` 及命名流 `customers`、`products`、`campaigns`。
+- 输出：`generate_categories()`、`generate_customers(config)`、`generate_products(config)` 和 `generate_campaigns(config)`；每个函数返回列顺序与 PostgreSQL Schema 一致的 DataFrame。
 
-- [ ] **Step 1: Write deterministic dimension tests**
+- [x] **步骤 1：编写确定性维表测试**
 
-Create `tests/unit/data_generation/test_dimensions.py`:
+创建 `tests/unit/data_generation/test_dimensions.py`：
 
 ```python
 from governed_analytics.data_generation.dimensions import (
@@ -268,19 +271,19 @@ def test_tiny_dimensions_have_stable_keys_and_counts() -> None:
     assert len(campaigns) == 6
 ```
 
-- [ ] **Step 2: Run and verify missing generator functions**
+- [x] **步骤 2：运行测试并确认生成函数缺失**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/data_generation/test_dimensions.py -v
 ```
 
-Expected: import fails for `dimensions` or `load_generator_config`.
+预期：导入 `dimensions` 或 `load_generator_config` 失败。
 
-- [ ] **Step 3: Implement fixed vocabulary and config loading**
+- [x] **步骤 3：实现固定词汇与配置加载**
 
-Create `vocabulary.py` with the exact regions and channel tuples in this plan plus 20 stable Chinese category names. Add to `models.py`:
+创建 `vocabulary.py`，包含本计划精确的地区、渠道元组及 20 个稳定的中文品类名。向 `models.py` 添加：
 
 ```python
 from pathlib import Path
@@ -293,16 +296,16 @@ def load_generator_config(path: str | Path) -> GeneratorConfig:
     return GeneratorConfig.model_validate(raw)
 ```
 
-- [ ] **Step 4: Implement dimension generation rules**
+- [x] **步骤 4：实现维表生成规则**
 
-Use these exact rules in `dimensions.py`:
+在 `dimensions.py` 中使用以下精确规则：
 
-- categories: stable IDs 1-20 and codes `CAT-001` to `CAT-020`;
-- customers: sequential IDs and codes, region sampled from fixed weights, segment weights `new=0.25`, `regular=0.60`, `vip=0.15`, registration uniformly before `end_at`;
-- products: sequential IDs/SKUs, category sampled uniformly, list price sampled log-normally then clamped to CNY 19.00-4,999.00, cost ratio sampled 0.35-0.75;
-- campaigns: sequential IDs/codes, channel from non-organic channels, 14-day duration, non-overlapping start dates, spend CNY 5,000-100,000.
+- categories：稳定 ID 1–20，编码 `CAT-001` 至 `CAT-020`；
+- customers：ID 与编码顺序递增；地区按固定权重采样；分群权重为 `new=0.25`、`regular=0.60`、`vip=0.15`；注册时间在 `end_at` 前均匀分布；
+- products：ID/SKU 顺序递增；品类均匀采样；标价按对数正态分布采样后限制在人民币 19.00–4,999.00 元；成本率采样范围 0.35–0.75；
+- campaigns：ID/编码顺序递增；渠道从非自然渠道中选取；持续 14 天；开始日期互不重叠；花费人民币 5,000–100,000 元。
 
-Convert cents with:
+使用以下函数转换分：
 
 ```python
 from decimal import Decimal
@@ -312,35 +315,35 @@ def cents_to_money(cents: int) -> str:
     return str((Decimal(cents) / Decimal(100)).quantize(Decimal("0.01")))
 ```
 
-- [ ] **Step 5: Run, check types, and commit dimensions**
+- [x] **步骤 5：运行测试、检查类型并提交维表**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/data_generation/test_dimensions.py -v
 uv run mypy src/governed_analytics/data_generation
 ```
 
-Expected: tests and type checking pass.
+预期：测试和类型检查通过。
 
 ```bash
 git add src/governed_analytics/data_generation tests/unit/data_generation/test_dimensions.py
 git commit -m "feat: 生成确定性业务维表"
 ```
 
-## Task 3: Fact Generators and Business Seasonality
+## 任务 3：事实表生成器与业务季节性
 
-**Files:**
-- Create: `src/governed_analytics/data_generation/facts.py`
-- Create: `tests/unit/data_generation/test_facts.py`
+**文件：**
+- 新建：`src/governed_analytics/data_generation/facts.py`
+- 新建：`tests/unit/data_generation/test_facts.py`
 
-**Interfaces:**
-- Consumes: generated dimensions and named random streams.
-- Produces: base, pre-anomaly DataFrames for orders, items, payments, refunds, sessions, inventory, attributions, and pipeline runs.
+**接口：**
+- 输入：已生成维表与命名随机流。
+- 输出：异常注入前的基础 DataFrame，包括订单、订单项、支付、退款、会话、库存、归因及流水线运行。
 
-- [ ] **Step 1: Write a tiny fact contract test**
+- [x] **步骤 1：编写 tiny 事实契约测试**
 
-Create `tests/unit/data_generation/test_facts.py`:
+创建 `tests/unit/data_generation/test_facts.py`：
 
 ```python
 from governed_analytics.data_generation.facts import generate_base_facts
@@ -361,19 +364,19 @@ def test_base_facts_are_referentially_valid_and_repeatable() -> None:
     assert first.orders["ordered_at"].max() < config.end_at
 ```
 
-- [ ] **Step 2: Run and verify the missing fact module**
+- [x] **步骤 2：运行测试并确认事实模块缺失**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/data_generation/test_facts.py -v
 ```
 
-Expected: import fails for `facts`.
+预期：导入 `facts` 失败。
 
-- [ ] **Step 3: Implement `GeneratedFacts` and timestamp distribution**
+- [x] **步骤 3：实现 `GeneratedFacts` 与时间戳分布**
 
-Create an immutable container:
+创建不可变容器：
 
 ```python
 from dataclasses import dataclass
@@ -393,32 +396,32 @@ class GeneratedFacts:
     pipeline_runs: pd.DataFrame
 ```
 
-Generate order timestamps with weights:
+按以下权重生成订单时间戳：
 
-- December multiplier `1.25`;
-- June multiplier `0.92`;
-- Friday-Sunday multiplier `1.15`;
-- all other dates multiplier `1.0`;
-- normalize weights before sampling.
+- 12 月乘数 `1.25`；
+- 6 月乘数 `0.92`；
+- 周五至周日乘数 `1.15`；
+- 其他日期乘数 `1.0`；
+- 采样前归一化权重。
 
-- [ ] **Step 4: Implement exact fact rules**
+- [x] **步骤 4：实现精确的事实生成规则**
 
-- one payment per order; success probabilities: paid/completed/refunded `0.97`, cancelled `0.05`, placed `0.30`;
-- order status weights before payment reconciliation: placed `0.03`, paid `0.12`, completed `0.77`, cancelled `0.08`;
-- 1-5 order items with probabilities `[0.35, 0.35, 0.18, 0.08, 0.04]`;
-- item quantity 1-3 with probabilities `[0.78, 0.17, 0.05]`;
-- item discount rate sampled from `[0, 0.05, 0.10, 0.15]` with probabilities `[0.55, 0.20, 0.20, 0.05]`;
-- successful refund base probability `0.06`, amount limited to item net amount before anomaly mutation;
-- sessions: tiny `orders * 5`, full `orders * 4`; channel weights `[0.30, 0.25, 0.20, 0.10, 0.15]`; converted sessions reference an order;
-- daily inventory snapshot per product with baseline quantity 0-500 and replenishment noise;
-- attributions only for orders within campaign window, at most one row per campaign/order pair;
-- three pipeline rows per day: `orders`, `inventory`, and `sessions`, normally succeeded with watermark equal to the business date end.
+- 每个订单一次支付；成功概率：paid/completed/refunded 为 `0.97`，cancelled 为 `0.05`，placed 为 `0.30`；
+- 支付对账前订单状态权重：placed `0.03`、paid `0.12`、completed `0.77`、cancelled `0.08`；
+- 每单 1–5 个订单项，概率为 `[0.35, 0.35, 0.18, 0.08, 0.04]`；
+- 订单项数量 1–3，概率为 `[0.78, 0.17, 0.05]`；
+- 订单项折扣率从 `[0, 0.05, 0.10, 0.15]` 中采样，概率为 `[0.55, 0.20, 0.20, 0.05]`；
+- 成功退款基础概率为 `0.06`；异常变异前，退款金额不得超过订单项净额；
+- 会话：tiny 为 `orders * 5`，full 为 `orders * 4`；渠道权重为 `[0.30, 0.25, 0.20, 0.10, 0.15]`；已转化会话引用一个订单；
+- 每个商品每天一条库存快照，基础数量 0–500，并加入补货噪声；
+- 仅为营销活动窗口内的订单生成归因；每个营销活动/订单组合最多一行；
+- 每天三个流水线记录：`orders`、`inventory` 和 `sessions`；通常状态为 succeeded，watermark 等于业务日结束时间。
 
-Ensure every DataFrame is sorted by its identity column before return.
+返回前，确保每个 DataFrame 都按其 identity 列排序。
 
-- [ ] **Step 5: Run and commit fact generation**
+- [x] **步骤 5：运行测试并提交事实生成实现**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/data_generation/test_facts.py -v
@@ -426,27 +429,27 @@ uv run ruff check src/governed_analytics/data_generation/facts.py
 uv run mypy src/governed_analytics/data_generation/facts.py
 ```
 
-Expected: all commands pass.
+预期：全部命令通过。
 
 ```bash
 git add src/governed_analytics/data_generation/facts.py tests/unit/data_generation/test_facts.py
 git commit -m "feat: 生成订单与行为事实数据"
 ```
 
-## Task 4: Anomaly Injection and Truth Manifest
+## 任务 4：异常注入与真值清单
 
-**Files:**
-- Create: `src/governed_analytics/data_generation/anomalies.py`
-- Create: `data/manifests/anomaly_manifest.schema.json`
-- Create: `tests/unit/data_generation/test_anomalies.py`
+**文件：**
+- 新建：`src/governed_analytics/data_generation/anomalies.py`
+- 新建：`data/manifests/anomaly_manifest.schema.json`
+- 新建：`tests/unit/data_generation/test_anomalies.py`
 
-**Interfaces:**
-- Consumes: `GeneratedFacts`, dimensions, scale, and the anomaly contract table.
-- Produces: mutated facts and `AnomalyManifest` serialized as `anomaly_manifest.json`.
+**接口：**
+- 输入：`GeneratedFacts`、维表、规模及异常契约表。
+- 输出：变异后的事实数据，以及序列化为 `anomaly_manifest.json` 的 `AnomalyManifest`。
 
-- [ ] **Step 1: Write exact anomaly-count tests**
+- [x] **步骤 1：编写精确异常数量测试**
 
-Create `tests/unit/data_generation/test_anomalies.py`:
+创建 `tests/unit/data_generation/test_anomalies.py`：
 
 ```python
 from governed_analytics.data_generation.anomalies import inject_anomalies
@@ -466,19 +469,19 @@ def test_tiny_quality_anomalies_have_exact_counts() -> None:
     assert result.manifest.by_id("anomaly_refund_exceeds_payment").mutated_rows == 3
 ```
 
-- [ ] **Step 2: Run and verify the missing anomaly module**
+- [x] **步骤 2：运行测试并确认异常模块缺失**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/data_generation/test_anomalies.py -v
 ```
 
-Expected: import fails for `anomalies`.
+预期：导入 `anomalies` 失败。
 
-- [ ] **Step 3: Define anomaly models and JSON Schema**
+- [x] **步骤 3：定义异常模型与 JSON Schema**
 
-Implement:
+实现：
 
 ```python
 class ExpectedSignal(BaseModel):
@@ -506,48 +509,48 @@ class AnomalyManifest(BaseModel):
         return next(item for item in self.anomalies if item.anomaly_id == anomaly_id)
 ```
 
-Generate `data/manifests/anomaly_manifest.schema.json` from `AnomalyManifest.model_json_schema()` and commit it. A test must compare the committed schema to the generated schema.
+使用 `AnomalyManifest.model_json_schema()` 生成并提交 `data/manifests/anomaly_manifest.schema.json`。测试必须比较已提交 Schema 与现场生成 Schema。
 
-- [ ] **Step 4: Implement all eight deterministic mutations**
+- [x] **步骤 4：实现全部八种确定性变异**
 
-Implement the anomaly contract at the top of this plan exactly. Select rows by stable ascending primary key after applying the time/scope filter; never sample anomaly rows randomly.
+精确实现本计划开头的异常契约。应用时间/范围筛选后，按主键稳定升序选择行；绝不随机采样异常行。
 
-For the GMV conversion anomaly, deterministically flip converted South sessions from `true` to `false`, clear their `order_id`, set the previously linked orders to `cancelled`, and set their payments to `failed` with null `paid_at`. This preserves order records while removing them from valid-order GMV.
+对于 GMV 转化异常，确定性地将已转化的华南会话从 `true` 翻转为 `false`，清空其 `order_id`，将此前关联的订单设为 `cancelled`，并将其支付设为 `failed`、`paid_at` 置空。这样既保留订单记录，又将其排除在有效订单 GMV 之外。
 
-For stockout, remove 90% of affected SKU order items in the anomaly window and recompute order/payment totals. If an order loses its final item, retain the order but set it to `cancelled`, set monetary totals to zero, and mark its payment failed. These rules keep configured order counts stable while making both root causes observable in GMV.
+对于缺货异常，删除异常窗口内受影响 SKU 订单项的 90%，并重新计算订单/支付合计。如果订单失去最后一个订单项，则保留订单，但将状态设为 `cancelled`、金额合计设为零，并将支付标记为失败。这些规则在保持配置订单数稳定的同时，使两个根因都能在 GMV 中观测到。
 
-- [ ] **Step 5: Run tests and commit anomaly truth**
+- [x] **步骤 5：运行测试并提交异常真值**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/data_generation/test_anomalies.py -v
 uv run mypy src/governed_analytics/data_generation/anomalies.py
 ```
 
-Expected: exact tiny anomaly counts pass and the manifest schema is stable.
+预期：精确的 tiny 异常数量通过，清单 Schema 稳定。
 
 ```bash
 git add src/governed_analytics/data_generation/anomalies.py data/manifests tests/unit/data_generation/test_anomalies.py
 git commit -m "feat: 注入可验证业务与质量异常"
 ```
 
-## Task 5: Canonical CSV Writer, PostgreSQL Loader, and Digests
+## 任务 5：规范 CSV 写入器、PostgreSQL 加载器与摘要
 
-**Files:**
-- Create: `src/governed_analytics/data_generation/writer.py`
-- Create: `src/governed_analytics/data_generation/loader.py`
-- Create: `src/governed_analytics/data_generation/pipeline.py`
-- Create: `tests/unit/data_generation/test_writer.py`
-- Create: `tests/integration/data_generation/test_pipeline.py`
+**文件：**
+- 新建：`src/governed_analytics/data_generation/writer.py`
+- 新建：`src/governed_analytics/data_generation/loader.py`
+- 新建：`src/governed_analytics/data_generation/pipeline.py`
+- 新建：`tests/unit/data_generation/test_writer.py`
+- 新建：`tests/integration/data_generation/test_pipeline.py`
 
-**Interfaces:**
-- Consumes: generated dimensions, mutated facts, `LOADER_DATABASE_URL`.
-- Produces: canonical CSV files, database rows, and `DatasetManifest` with per-table counts/digests.
+**接口：**
+- 输入：已生成维表、变异后的事实数据，以及加载专用 `LoaderDatabaseSettings.loader_database_url`（`LOADER_DATABASE_URL`）。
+- 输出：规范 CSV 文件、数据库行，以及包含逐表行数/摘要的 `DatasetManifest`。
 
-- [ ] **Step 1: Write a canonical digest test**
+- [x] **步骤 1：编写规范摘要测试**
 
-Create `tests/unit/data_generation/test_writer.py`:
+创建 `tests/unit/data_generation/test_writer.py`：
 
 ```python
 from pathlib import Path
@@ -568,9 +571,9 @@ def test_canonical_csv_is_stable_across_input_order(tmp_path: Path) -> None:
     assert (tmp_path / "first.csv").read_bytes() == (tmp_path / "second.csv").read_bytes()
 ```
 
-- [ ] **Step 2: Implement canonical writing**
+- [x] **步骤 2：实现规范写入**
 
-`write_canonical_csv` must:
+`write_canonical_csv` 必须：
 
 ```python
 def write_canonical_csv(frame: pd.DataFrame, path: Path, *, sort_by: tuple[str, ...]) -> str:
@@ -580,9 +583,11 @@ def write_canonical_csv(frame: pd.DataFrame, path: Path, *, sort_by: tuple[str, 
     return sha256(path.read_bytes()).hexdigest()
 ```
 
-- [ ] **Step 3: Implement a static COPY registry and loader**
+- [x] **步骤 3：实现静态 COPY 注册表与加载器**
 
-Define `TABLE_LOAD_ORDER` and exact CSV column tuples in `loader.py`. Accept only names from this registry. Load in this order:
+仅在加载器边界内实例化 `LoaderDatabaseSettings`；不得在其中实例化 `DatabaseSettings` 或 `MigrationDatabaseSettings`。加载器对象不得包含只读 URL 或迁移 URL。
+
+在 `loader.py` 中定义 `TABLE_LOAD_ORDER` 及精确 CSV 列元组。只接受该注册表中的名称。按以下顺序加载：
 
 ```python
 TABLE_LOAD_ORDER = (
@@ -601,7 +606,7 @@ TABLE_LOAD_ORDER = (
 )
 ```
 
-Use psycopg COPY:
+使用 psycopg COPY：
 
 ```python
 with connection.cursor().copy(
@@ -612,11 +617,11 @@ with connection.cursor().copy(
             copy.write(chunk)
 ```
 
-The f-string is safe only because `table_name` and `columns` come from the static registry, never from CLI input.
+该 f-string 只有在 `table_name` 与 `columns` 来自静态注册表、绝不来自 CLI 输入时才安全。
 
-- [ ] **Step 4: Write and pass a tiny pipeline integration test**
+- [x] **步骤 4：编写并通过 tiny 流水线集成测试**
 
-Create `tests/integration/data_generation/test_pipeline.py`:
+创建 `tests/integration/data_generation/test_pipeline.py`：
 
 ```python
 from pathlib import Path
@@ -638,41 +643,41 @@ def test_tiny_pipeline_is_reproducible(tmp_path: Path) -> None:
     assert first.dataset_id == second.dataset_id
 ```
 
-Before the second load, `generate_and_load` truncates only the twelve known tables using the loader connection and restarts identities. It must reject database names or table names from user input.
+第二次加载前，`generate_and_load` 使用加载器连接只清空 12 张已知表，并重置 identity。它必须拒绝用户输入的数据库名或表名。
 
-- [ ] **Step 5: Run and commit the load pipeline**
+- [x] **步骤 5：运行测试并提交加载流水线**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/data_generation/test_writer.py -v
 uv run pytest tests/integration/data_generation/test_pipeline.py -v
 ```
 
-Expected: canonical digest test and two-load database reproducibility test pass.
+预期：规范摘要测试与两次加载的数据库可复现性测试通过。
 
 ```bash
 git add src/governed_analytics/data_generation tests/unit/data_generation tests/integration/data_generation
 git commit -m "feat: 加载并校验可复现模拟数据"
 ```
 
-## Task 6: First Fifteen Metric Definitions
+## 任务 6：首批 15 个指标定义
 
-**Files:**
-- Create: `src/governed_analytics/domain/metrics.py`
-- Create: `src/governed_analytics/metrics/__init__.py`
-- Create: `src/governed_analytics/metrics/catalog.py`
-- Create: `data/metrics/core.yaml`
-- Create: `tests/unit/metrics/test_catalog.py`
-- Create: `tests/integration/metrics/test_metric_queries.py`
+**文件：**
+- 新建：`src/governed_analytics/domain/metrics.py`
+- 新建：`src/governed_analytics/metrics/__init__.py`
+- 新建：`src/governed_analytics/metrics/catalog.py`
+- 新建：`data/metrics/core.yaml`
+- 新建：`tests/unit/metrics/test_catalog.py`
+- 新建：`tests/integration/metrics/test_metric_queries.py`
 
-**Interfaces:**
-- Consumes: loaded database schema and fixed business definitions.
-- Produces: `MetricDefinition`, `load_metric_catalog(path)`, `get_metric(metric_id)`, and fifteen parsed definitions.
+**接口：**
+- 输入：已加载的数据库 Schema 与固定业务定义。
+- 输出：`MetricDefinition`、`load_metric_catalog(path)`、`get_metric(metric_id)`，以及 15 个已解析定义。
 
-- [ ] **Step 1: Write catalog validation tests**
+- [x] **步骤 1：编写目录验证测试**
 
-Create `tests/unit/metrics/test_catalog.py`:
+创建 `tests/unit/metrics/test_catalog.py`：
 
 ```python
 from governed_analytics.metrics.catalog import load_metric_catalog
@@ -684,97 +689,107 @@ def test_core_catalog_has_exact_metric_ids_and_valid_sql() -> None:
     assert tuple(catalog) == (
         "gmv", "paid_gmv", "net_revenue", "valid_order_count", "average_order_value",
         "payment_success_rate", "refund_amount", "refund_rate", "active_customers",
-        "new_customers", "repeat_purchase_rate", "session_count", "conversion_rate",
+        "new_customers", "repeat_purchase_rate", "customer_acquisition_cost", "conversion_rate",
         "stockout_rate", "campaign_roi",
     )
 ```
 
-The loader must reject duplicate IDs, unknown source tables, timezone-naive `valid_from`, and expressions SQLGlot cannot parse inside `select <expression>`.
+加载器必须拒绝重复 ID、未知来源表、不含时区的 `valid_from`，以及 SQLGlot 无法在 `select <expression>` 中解析的表达式。
 
-- [ ] **Step 2: Define exact metric semantics in YAML**
+- [x] **步骤 2：在 YAML 中定义精确指标语义**
 
-Create `data/metrics/core.yaml` with version `1.0.0`, `valid_from: 2025-01-01T00:00:00Z`, and these formulas:
+创建 `data/metrics/core.yaml`，版本为 `1.0.0`、`valid_from: 2025-01-01T00:00:00Z`，并使用以下公式：
 
-| Metric ID | Expression | Time field | Unit | Allowed dimensions |
+| 指标 ID | 表达式 | 时间字段 | 单位 | 允许维度 |
 |---|---|---|---|---|
-| `gmv` | `sum(oi.net_amount)` for order status `paid, completed, refunded` | `o.ordered_at` | CNY | region, channel, category, product, segment |
-| `paid_gmv` | `sum(p.amount)` where payment succeeded | `p.paid_at` | CNY | region, channel, segment |
-| `net_revenue` | successful payment amount minus successful refund amount | `o.ordered_at` | CNY | region, channel, category, product |
-| `valid_order_count` | distinct orders with status `paid, completed, refunded` | `o.ordered_at` | count | region, channel, segment |
+| `gmv` | 订单状态为 `paid, completed, refunded` 时的 `sum(oi.net_amount)` | `o.ordered_at` | CNY | region、channel、category、product、segment |
+| `paid_gmv` | 支付成功时的 `sum(p.amount)` | `p.paid_at` | CNY | region、channel、segment |
+| `net_revenue` | 成功支付金额减去成功退款金额 | `o.ordered_at` | CNY | region、channel、category、product |
+| `valid_order_count` | 状态为 `paid, completed, refunded` 的去重订单数 | `o.ordered_at` | count | region、channel、segment |
 | `average_order_value` | `gmv / nullif(valid_order_count, 0)` | `o.ordered_at` | CNY | region, channel, segment |
-| `payment_success_rate` | succeeded payment attempts / all payment attempts | `p.created_at` | ratio | provider, channel |
-| `refund_amount` | successful refund amount | `r.refunded_at` | CNY | reason, category, product, region |
-| `refund_rate` | successful refund amount / successful payment amount for matching orders | `o.ordered_at` | ratio | category, product, region |
-| `active_customers` | distinct customers with valid orders | `o.ordered_at` | count | region, segment |
-| `new_customers` | customers registered in interval | `c.registered_at` | count | region, segment |
-| `repeat_purchase_rate` | customers with at least two valid lifetime orders by interval end / active customers | `o.ordered_at` | ratio | region, segment |
-| `session_count` | count of web sessions | `s.occurred_at` | count | channel, region |
-| `conversion_rate` | converted sessions / all sessions | `s.occurred_at` | ratio | channel, region |
-| `stockout_rate` | product snapshots with available quantity zero / all product snapshots | `i.snapshot_at` | ratio | category, product |
+| `payment_success_rate` | 成功支付尝试数 / 全部支付尝试数 | `p.created_at` | ratio | provider、channel |
+| `refund_amount` | 成功退款金额 | `r.refunded_at` | CNY | reason、category、product、region |
+| `refund_rate` | 成功退款金额 / 匹配订单的成功支付金额 | `o.ordered_at` | ratio | category、product、region |
+| `active_customers` | 拥有有效订单的去重客户数 | `o.ordered_at` | count | region、segment |
+| `new_customers` | 区间内注册客户数 | `c.registered_at` | count | region、segment |
+| `repeat_purchase_rate` | 截至区间末至少有两个有效历史订单的客户数 / 活跃客户数 | `o.ordered_at` | ratio | region、segment |
+| `customer_acquisition_cost` | 按营销活动预聚合的花费 / 区间内去重归因客户数 | `a.attributed_at` | CNY | campaign、channel |
+| `conversion_rate` | 已转化会话数 / 全部会话数 | `s.occurred_at` | ratio | channel、region |
+| `stockout_rate` | 可售量为零的商品快照数 / 全部商品快照数 | `i.snapshot_at` | ratio | category、product |
 | `campaign_roi` | `(attributed_revenue - campaign_spend) / nullif(campaign_spend, 0)` | `a.attributed_at` | ratio | campaign, channel |
 
-Each YAML entry includes description, default filters, source table list, and one example question. Ratios are stored as 0-1, not percentages.
+每个 YAML 条目包含说明、默认筛选条件、来源表清单及一个示例问题。比率以 0–1 存储，而不是百分数。
 
-- [ ] **Step 3: Implement immutable metric contracts and loader**
+- [x] **步骤 3：实现不可变指标契约与加载器**
 
-Implement the exact `MetricDefinition` from the master plan. `load_metric_catalog` returns `dict[str, MetricDefinition]` preserving file order. Validate expressions with:
+实现主计划中的精确 `MetricDefinition`。`load_metric_catalog` 返回保持文件顺序的 `dict[str, MetricDefinition]`。使用以下方式验证表达式：
 
 ```python
 sqlglot.parse_one(f"select {metric.expression_sql}", read="postgres")
 ```
 
-The catalog loader validates metadata only; it does not concatenate user input into executable SQL.
+目录加载器只验证元数据；不会把用户输入拼接到可执行 SQL 中。
 
-- [ ] **Step 4: Add database sanity queries for all fifteen metrics**
+- [x] **步骤 4：为全部 15 个指标添加数据库健全性查询**
 
-Create integration tests that execute one fixed, parameterized query per metric for `[2026-06-01, 2026-07-01)`. Assert:
+创建集成测试，在 `[2026-06-01, 2026-07-01)` 区间内为每个指标执行一条固定的参数化查询。断言：
 
-- money and counts are nonnegative;
-- ratios are either null for a zero denominator or in `[0, 1]`, except `campaign_roi`, which may be negative;
-- every query completes under `statement_timeout = '10s'` using `analytics_readonly`.
+- 金额与计数非负；
+- 分母为零时比率为空，否则位于 `[0, 1]`；`campaign_roi` 例外，它可以为负；
+- 每条查询都使用 `analytics_readonly`，并在 `statement_timeout = '10s'` 下完成。
 
-- [ ] **Step 5: Run and commit the metric catalog**
+每条固定指标查询都必须在显式事务中执行；engine 由只读专用 `DatabaseSettings.database_url` 创建。查询前，在同一连接中按以下顺序执行语句：
 
-Run:
+```sql
+set transaction read only;
+set local statement_timeout = '10s';
+set local search_path = public, pg_catalog;
+```
+
+真实 PostgreSQL 集成测试（非 mock）必须在同一事务中查询 `current_setting`，并断言 `transaction_read_only = 'on'`、`statement_timeout = '10s'` 和 `search_path = 'public, pg_catalog'`。不得在通用 engine 工厂上设置事务状态。
+
+- [x] **步骤 5：运行测试并提交指标目录**
+
+运行：
 
 ```bash
 uv run pytest tests/unit/metrics -v
 uv run pytest tests/integration/metrics -v
 ```
 
-Expected: fifteen definitions parse and all fixed validation queries complete.
+预期：15 个定义成功解析，全部固定验证查询完成。
 
 ```bash
 git add data/metrics src/governed_analytics/domain/metrics.py src/governed_analytics/metrics tests/unit/metrics tests/integration/metrics
 git commit -m "feat: 定义首批十五个业务指标"
 ```
 
-## Task 7: CLI, CI, and Data Documentation
+## 任务 7：CLI、CI 与数据文档
 
-**Files:**
-- Create: `src/governed_analytics/data_generation/cli.py`
-- Modify: `Makefile`
-- Modify: `.github/workflows/ci.yml`
-- Create: `docs/data-generation.md`
-- Create: `docs/metrics.md`
-- Modify: `README.md`
+**文件：**
+- 新建：`src/governed_analytics/data_generation/cli.py`
+- 修改：`Makefile`
+- 修改：`.github/workflows/ci.yml`
+- 新建：`docs/data-generation.md`
+- 新建：`docs/metrics.md`
+- 修改：`README.md`
 
-**Interfaces:**
-- Consumes: generator pipeline and metric catalog.
-- Produces: `governed-data generate`, `governed-data verify`, `make data-tiny`, and `make metrics-check`.
+**接口：**
+- 输入：生成流水线与指标目录。
+- 输出：`governed-data generate`、`governed-data verify`、`make data-tiny` 和 `make metrics-check`。
 
-- [ ] **Step 1: Implement CLI commands with explicit scale choices**
+- [x] **步骤 1：实现具有显式规模选项的 CLI 命令**
 
-Use `argparse` with this surface:
+使用 `argparse` 提供以下接口：
 
 ```text
 governed-data generate --scale {tiny,full} [--output artifacts/datasets]
 governed-data verify --scale {tiny,full} [--output artifacts/datasets]
 ```
 
-`generate` loads data and writes manifests. `verify` regenerates into a temporary artifact directory, compares config/table digests, prints differing table names, and exits 1 on mismatch.
+`generate` 加载数据并写入清单。`verify` 在临时产物目录中重新生成，比较配置/表摘要，打印存在差异的表名，并在不匹配时以状态码 1 退出。
 
-- [ ] **Step 2: Add Make targets**
+- [x] **步骤 2：添加 Make target**
 
 ```make
 .PHONY: data-tiny data-verify metrics-check
@@ -789,9 +804,9 @@ metrics-check:
 	@uv run pytest tests/unit/metrics tests/integration/metrics -v
 ```
 
-- [ ] **Step 3: Extend CI with tiny generation only**
+- [x] **步骤 3：扩展 CI，但只允许 tiny 生成**
 
-After migrations and persistence tests in the database job, add:
+在 database job 的迁移与持久化测试之后添加：
 
 ```yaml
       - run: uv run governed-data generate --scale tiny
@@ -799,15 +814,15 @@ After migrations and persistence tests in the database job, add:
       - run: uv run pytest tests/unit/metrics tests/integration/metrics -v
 ```
 
-CI must never generate the full dataset.
+CI 绝不能生成 full 数据集。
 
-- [ ] **Step 4: Document reproducibility and metric semantics**
+- [x] **步骤 4：记录可复现性与指标语义**
 
-`docs/data-generation.md` documents scale counts, seed, named RNGs, all eight anomalies, artifacts, manifests, and safe regeneration. `docs/metrics.md` documents the 15 metric IDs, formulas, time fields, dimensions, and ratio representation.
+`docs/data-generation.md` 记录各规模行数、种子、命名 RNG、全部八种异常、产物、清单及安全重生成。`docs/metrics.md` 记录 15 个指标 ID、公式、时间字段、维度及比率表示方式。
 
-- [ ] **Step 5: Run the complete Plan B gate**
+- [x] **步骤 5：运行完整 Plan B 门禁**
 
-Run:
+运行：
 
 ```bash
 make db-up
@@ -819,22 +834,22 @@ make check
 git diff --check
 ```
 
-Expected: generation and verification complete with identical digests; fifteen metric tests and quality checks pass.
+预期：生成与验证完成且摘要一致；15 个指标测试与质量检查通过。
 
-- [ ] **Step 6: Commit Plan B workflow**
+- [x] **步骤 6：提交 Plan B 工作流**
 
 ```bash
 git add src/governed_analytics/data_generation/cli.py Makefile .github/workflows/ci.yml docs/data-generation.md docs/metrics.md README.md
 git commit -m "docs: 固化数据与指标复现流程"
 ```
 
-## Plan B Completion Gate
+## Plan B 完成门禁
 
-- [ ] Tiny generation completes within 60 seconds on the development machine.
-- [ ] Full generation completes within 15 minutes and uses chunked COPY rather than row-by-row INSERT.
-- [ ] Two runs with seed `20260901` have identical per-table counts and SHA-256 digests.
-- [ ] Eight anomaly records match exact tiny mutation counts and expected signals.
-- [ ] All foreign keys remain valid after anomaly injection.
-- [ ] Fifteen metric definitions parse, validate, and execute fixed sanity queries.
-- [ ] No generated CSV or database volume is staged by Git.
-- [ ] CI executes tiny generation and no external API request.
+- [x] tiny 生成在开发机上 60 秒内完成（2026-09-04 实测 2.73 秒）。
+- [x] full 生成在 15 分钟内完成，并使用分块 COPY，而非逐行 INSERT（2026-09-04 完整 verify 约 98 秒）。
+- [x] 使用种子 `20260901` 的两次运行具有相同的逐表行数与 SHA-256 摘要。
+- [x] 八条异常记录与精确的 tiny 变异数量及预期信号一致。
+- [x] 异常注入后全部外键仍然有效。
+- [x] 15 个指标定义均可解析、验证，并执行固定健全性查询。
+- [x] Git 未暂存任何生成 CSV 或数据库卷。
+- [ ] CI 执行 tiny 生成，且不发起外部 API 请求（工作流静态门禁已通过，外部运行待触发）。

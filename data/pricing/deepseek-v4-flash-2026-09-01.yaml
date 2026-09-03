@@ -1,0 +1,13 @@
+provider: deepseek
+region: global
+requested_model: deepseek-v4-flash
+resolved_model: DeepSeek-V4-Flash-0731
+effective_date: 2026-09-01
+currency: CNY
+unit_tokens: 1000000
+input_token_upper_bound: 1000000
+input_price: "2.983596"
+output_price: "8.950788"
+pricing_basis: peak cache-miss upper bound converted at USD/CNY 6.7809
+source: https://api-docs.deepseek.com/quick_start/pricing
+fx_source: https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do

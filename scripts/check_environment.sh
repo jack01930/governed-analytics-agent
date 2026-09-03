@@ -32,7 +32,7 @@ else
   fail 'Python 3.12 未安装或不在 PATH'
 fi
 
-if [ -d .git ]; then
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   ok '当前目录是本地 Git 仓库'
 else
   fail '当前目录尚未初始化 Git 仓库'
@@ -79,9 +79,9 @@ else
 fi
 
 key_is_set=0
-if [ -n "${MODEL_API_KEY:-}" ] || [ -n "${DASHSCOPE_API_KEY:-}" ]; then
+if [ -n "${MODEL_API_KEY:-}" ]; then
   key_is_set=1
-elif [ -f .env ] && grep -Eq '^(MODEL_API_KEY|DASHSCOPE_API_KEY)=.+$' .env; then
+elif [ -f .env ] && grep -Eq '^MODEL_API_KEY=.+$' .env; then
   key_is_set=1
 fi
 

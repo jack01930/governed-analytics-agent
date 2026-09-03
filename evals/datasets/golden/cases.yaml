@@ -1,0 +1,140 @@
+- case_id: G001
+  question: 2026-06-08 至 2026-06-14 的 GMV 是多少？
+  category: metric
+  oracle_sql_path: evals/datasets/golden/sql/G001.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [gmv]
+- case_id: G002
+  question: 该周 GMV 相比前一周变化多少？
+  category: comparison
+  oracle_sql_path: evals/datasets/golden/sql/G002.sql
+  comparison: table
+  key_columns: []
+  numeric_columns: [current_gmv, previous_gmv, change_rate]
+- case_id: G003
+  question: 哪些地区对该周 GMV 下滑贡献最大？
+  category: contribution
+  oracle_sql_path: evals/datasets/golden/sql/G003.sql
+  comparison: top_k
+  key_columns: [region]
+  numeric_columns: [gmv_loss]
+- case_id: G004
+  question: 哪些商品对该周 GMV 下滑贡献最大？
+  category: contribution
+  oracle_sql_path: evals/datasets/golden/sql/G004.sql
+  comparison: top_k
+  key_columns: [sku]
+  numeric_columns: [gmv_loss]
+- case_id: G005
+  question: 各用户分群对该周 GMV 变化贡献如何？
+  category: contribution
+  oracle_sql_path: evals/datasets/golden/sql/G005.sql
+  comparison: table
+  key_columns: [segment]
+  numeric_columns: [previous_gmv, current_gmv, delta]
+- case_id: G006
+  question: 该周 GMV 下滑的主要原因是什么？
+  category: attribution
+  oracle_sql_path: evals/datasets/golden/sql/G006.sql
+  comparison: table
+  key_columns: [cause_type]
+  numeric_columns: [previous, current, delta]
+- case_id: G007
+  question: 2026 年 6 月支付 GMV 是多少？
+  category: metric
+  oracle_sql_path: evals/datasets/golden/sql/G007.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [paid_gmv]
+- case_id: G008
+  question: 2026 年 5 月净收入是多少？
+  category: metric
+  oracle_sql_path: evals/datasets/golden/sql/G008.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [net_revenue]
+- case_id: G009
+  question: 2026-05-04 当周退款率最高的品类有哪些？
+  category: anomaly
+  oracle_sql_path: evals/datasets/golden/sql/G009.sql
+  comparison: top_k
+  key_columns: [category_code]
+  numeric_columns: [refund_rate]
+- case_id: G010
+  question: 该退款异常周最常见的退款原因是什么？
+  category: anomaly
+  oracle_sql_path: evals/datasets/golden/sql/G010.sql
+  comparison: top_k
+  key_columns: [reason]
+  numeric_columns: [refund_count, refund_amount]
+- case_id: G011
+  question: 2026-06-08 当周各渠道转化率是多少？
+  category: metric
+  oracle_sql_path: evals/datasets/golden/sql/G011.sql
+  comparison: table
+  key_columns: [channel]
+  numeric_columns: [conversion_rate]
+- case_id: G012
+  question: 2026-06-08 当周哪些商品发生缺货？
+  category: quality
+  oracle_sql_path: evals/datasets/golden/sql/G012.sql
+  comparison: table
+  key_columns: [sku]
+  numeric_columns: [stockout_days]
+- case_id: G013
+  question: 2026 年 6 月活跃客户数是多少？
+  category: metric
+  oracle_sql_path: evals/datasets/golden/sql/G013.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [active_customers]
+- case_id: G014
+  question: 2026 年 6 月新增客户数是多少？
+  category: metric
+  oracle_sql_path: evals/datasets/golden/sql/G014.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [new_customers]
+- case_id: G015
+  question: 截至 2026-06-30 的复购率是多少？
+  category: metric
+  oracle_sql_path: evals/datasets/golden/sql/G015.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [repeat_purchase_rate]
+- case_id: G016
+  question: 2026 年第二季度 ROI 最高的营销活动有哪些？
+  category: metric
+  oracle_sql_path: evals/datasets/golden/sql/G016.sql
+  comparison: top_k
+  key_columns: [campaign_code]
+  numeric_columns: [roi]
+- case_id: G017
+  question: 2026-06-15 库存数据是否按时更新？
+  category: quality
+  oracle_sql_path: evals/datasets/golden/sql/G017.sql
+  comparison: boolean
+  key_columns: []
+  numeric_columns: []
+- case_id: G018
+  question: 2026-04-10 有多少条重复订单明细？
+  category: quality
+  oracle_sql_path: evals/datasets/golden/sql/G018.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [duplicate_rows]
+- case_id: G019
+  question: 2026-03-17 有多少订单金额与明细不一致？
+  category: quality
+  oracle_sql_path: evals/datasets/golden/sql/G019.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [mismatched_orders]
+- case_id: G020
+  question: 2026-05-20 有多少订单退款超过成功支付？
+  category: quality
+  oracle_sql_path: evals/datasets/golden/sql/G020.sql
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [over_refunded_orders]

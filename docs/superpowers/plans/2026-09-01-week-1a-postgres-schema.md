@@ -1,65 +1,68 @@
-# Week 1A PostgreSQL Schema Implementation Plan
+# 第 1A 周：PostgreSQL Schema 实现计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **状态同步（2026-09-04）：** 实现步骤已完成；本地 arm64 上数据库迁移、12 表 Schema、角色权限与集成
+> 测试通过，当前 head 为后续加入数据集重置函数的 `0003`。外部 CI amd64 尚无运行记录，相关项保持待验证。
 
-**Goal:** Deliver a Dockerized PostgreSQL 17 database with pgvector, twelve ecommerce tables, deterministic Alembic migrations, least-privilege loader/read-only roles, and executable schema contract tests.
+> **供 Agent 执行者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐任务实施本计划。各步骤使用复选框（`- [ ]`）跟踪进度。
 
-**Architecture:** Docker Compose owns the local database lifecycle. Alembic migrations, executed by an admin-only migration connection, are the sole schema source of truth. Application code uses async SQLAlchemy connections; bulk loading uses the dedicated loader role; analytics and future Agent queries use a separately tested read-only role.
+**目标：** 交付一个 Docker 化的 PostgreSQL 17 数据库，包含 pgvector、12 张电商业务表、确定性 Alembic 迁移、最小权限的加载/只读角色，以及可执行的 Schema 契约测试。
 
-**Tech Stack:** Docker Compose, `pgvector/pgvector:0.8.6-pg17-bookworm`, PostgreSQL 17, SQLAlchemy 2, Alembic 1.19, asyncpg, psycopg 3, Pydantic Settings, Pytest.
+**架构：** Docker Compose 管理本地数据库生命周期。仅由管理员迁移连接执行的 Alembic 迁移，是 Schema 的唯一真值来源。应用代码使用异步 SQLAlchemy 连接；批量加载使用专用加载角色；分析查询和未来 Agent 查询使用经过独立测试的只读角色。
 
-**Spec:** `GOVERNED_ANALYTICS_AGENT_PLAN.md` sections 18-21, 26, 38-39, and `docs/superpowers/plans/2026-09-01-week-1-data-baseline.md`.
+**技术栈：** Docker Compose、`pgvector/pgvector:0.8.6-pg17-bookworm`、PostgreSQL 17、SQLAlchemy 2、Alembic 1.19、asyncpg、psycopg 3、Pydantic Settings、Pytest。
 
-## Global Constraints
+**规格依据：** `GOVERNED_ANALYTICS_AGENT_PLAN.md` 第 18–21、26、38–39 节，以及 `docs/superpowers/plans/2026-09-01-week-1-data-baseline.md`。
 
-- Use lowercase `snake_case` identifiers without quoted mixed-case names.
-- Use `bigint generated always as identity` primary keys.
-- Use `text` for strings, `timestamptz` for instants, `date` for business dates, `numeric(14,2)` for CNY, and `boolean` for flags.
-- Index every foreign key. Composite indexes place equality columns before range columns.
-- Use database constraints for structural validity, but do not add cross-table constraints that would prevent seeded data-quality anomalies.
-- `analytics_readonly` receives only `CONNECT`, schema `USAGE`, and table `SELECT`.
-- `analytics_loader` receives table DML, `TRUNCATE`, and sequence usage for deterministic local dataset rebuilds, but no DDL privileges.
-- The admin URL is used only by Alembic and local setup commands.
-- Tests may recreate an ephemeral CI database; no command in this plan removes the developer's named Docker volume by default.
+## 全局约束
+
+- 使用小写 `snake_case` 标识符，不使用带引号的混合大小写名称。
+- 主键使用 `bigint generated always as identity`。
+- 字符串使用 `text`，时间点使用 `timestamptz`，业务日期使用 `date`，人民币金额使用 `numeric(14,2)`，标志位使用 `boolean`。
+- 为每个外键建立索引；复合索引中等值列位于范围列之前。
+- 使用数据库约束保证结构有效，但不得添加会阻止固定种子数据质量异常的跨表约束。
+- `analytics_readonly` 仅获得 `CONNECT`、Schema `USAGE` 和表 `SELECT` 权限。
+- `analytics_loader` 获得表 DML、`TRUNCATE` 及序列使用权限，用于确定性地重建本地数据集，但不拥有 DDL 权限。
+- 管理员 URL 仅供 Alembic 和本地初始化命令使用。
+- 测试可以重建临时 CI 数据库；本计划任何命令默认都不得删除开发者的命名 Docker 卷。
 
 ---
 
-## Schema Contract
+## Schema 契约
 
-| Table | Primary key | Required foreign keys | Intentional anomaly allowance |
+| 表 | 主键 | 必需外键 | 有意允许的异常 |
 |---|---|---|---|
-| `customers` | `customer_id bigint identity` | none | none |
-| `categories` | `category_id bigint identity` | none | none |
-| `products` | `product_id bigint identity` | `category_id -> categories` | none |
-| `orders` | `order_id bigint identity` | `customer_id -> customers` | `region` may be null for completeness cases |
-| `order_items` | `order_item_id bigint identity` | `order_id -> orders`, `product_id -> products` | `source_line_id` is not unique so logical duplicates can be inserted |
-| `payments` | `payment_id bigint identity` | `order_id -> orders` | totals need not match `orders` for consistency cases |
-| `refunds` | `refund_id bigint identity` | `order_id -> orders`, nullable `order_item_id -> order_items` | refund may exceed successful payment for quality cases |
-| `inventory_snapshots` | `inventory_snapshot_id bigint identity` | `product_id -> products` | freshness failure is represented by missing recent snapshots |
-| `web_sessions` | `session_id bigint identity` | nullable `customer_id -> customers`, nullable `order_id -> orders` | anonymous sessions are valid |
-| `marketing_campaigns` | `campaign_id bigint identity` | none | none |
-| `campaign_attributions` | `attribution_id bigint identity` | `campaign_id -> marketing_campaigns`, `order_id -> orders` | none |
-| `pipeline_runs` | `pipeline_run_id bigint identity` | none | failed runs may have null `finished_at` and stale watermark |
+| `customers` | `customer_id bigint identity` | 无 | 无 |
+| `categories` | `category_id bigint identity` | 无 | 无 |
+| `products` | `product_id bigint identity` | `category_id -> categories` | 无 |
+| `orders` | `order_id bigint identity` | `customer_id -> customers` | 为完整性用例允许 `region` 为空 |
+| `order_items` | `order_item_id bigint identity` | `order_id -> orders`、`product_id -> products` | `source_line_id` 不唯一，因此可注入逻辑重复行 |
+| `payments` | `payment_id bigint identity` | `order_id -> orders` | 为一致性用例允许合计金额与 `orders` 不一致 |
+| `refunds` | `refund_id bigint identity` | `order_id -> orders`、可空 `order_item_id -> order_items` | 为质量用例允许退款额超过成功支付额 |
+| `inventory_snapshots` | `inventory_snapshot_id bigint identity` | `product_id -> products` | 以缺失近期快照表示新鲜度故障 |
+| `web_sessions` | `session_id bigint identity` | 可空 `customer_id -> customers`、可空 `order_id -> orders` | 匿名会话有效 |
+| `marketing_campaigns` | `campaign_id bigint identity` | 无 | 无 |
+| `campaign_attributions` | `attribution_id bigint identity` | `campaign_id -> marketing_campaigns`、`order_id -> orders` | 无 |
+| `pipeline_runs` | `pipeline_run_id bigint identity` | 无 | 失败运行可具有空 `finished_at` 和陈旧 watermark |
 
-Deletion policy is `restrict` for business facts. Synthetic datasets are rebuilt as a whole; application code must not cascade-delete analytical history.
+业务事实表使用 `restrict` 删除策略。合成数据集整体重建；应用代码不得级联删除分析历史。
 
-## Task 1: Database Settings and Compose Service
+## 任务 1：数据库设置与 Compose 服务
 
-**Files:**
-- Create: `src/governed_analytics/config.py`
-- Create: `tests/unit/test_config.py`
-- Create: `docker-compose.yml`
-- Create: `infra/docker/postgres/init/001_bootstrap.sql`
-- Modify: `.env.example`
-- Modify: `pyproject.toml`
+**文件：**
+- 新建：`src/governed_analytics/config.py`
+- 新建：`tests/unit/test_config.py`
+- 新建：`docker-compose.yml`
+- 新建：`infra/docker/postgres/init/001_bootstrap.sql`
+- 修改：`.env.example`
+- 修改：`pyproject.toml`
 
-**Interfaces:**
-- Consumes: environment variables documented in `.env.example`.
-- Produces: `DatabaseSettings`, a healthy Compose service named `db`, and roles `analytics_loader` and `analytics_readonly`.
+**接口：**
+- 输入：`.env.example` 中记录的环境变量。
+- 输出：只读专用 `DatabaseSettings`、加载专用 `LoaderDatabaseSettings`、迁移专用 `MigrationDatabaseSettings`、名为 `db` 的健康 Compose 服务，以及 `analytics_loader` 与 `analytics_readonly` 角色。
 
-- [ ] **Step 1: Register Pytest markers and write failing settings tests**
+- [x] **步骤 1：注册 Pytest 标记并编写失败的设置测试**
 
-Add to `[tool.pytest.ini_options]` in `pyproject.toml`:
+在 `pyproject.toml` 的 `[tool.pytest.ini_options]` 中添加：
 
 ```toml
 markers = [
@@ -68,59 +71,75 @@ markers = [
 ]
 ```
 
-Create `tests/unit/test_config.py`:
+创建 `tests/unit/test_config.py`：
 
 ```python
 import pytest
 from pydantic import ValidationError
 
-from governed_analytics.config import DatabaseSettings
+from governed_analytics.config import (
+    DatabaseSettings,
+    LoaderDatabaseSettings,
+    MigrationDatabaseSettings,
+)
 
 
-def test_database_settings_accept_three_separate_roles(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://readonly:pw@db:5432/app")
-    monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql+psycopg://admin:pw@db:5432/app")
-    monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
+def test_role_scoped_settings_load_only_their_own_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://analytics_readonly:pw@db:5432/app"
+    )
+    monkeypatch.setenv(
+        "LOADER_DATABASE_URL", "postgresql+psycopg://analytics_loader:pw@db:5432/app"
+    )
+    monkeypatch.setenv(
+        "MIGRATION_DATABASE_URL", "postgresql+psycopg://governed_admin:pw@db:5432/app"
+    )
 
-    settings = DatabaseSettings(_env_file=None)
+    assert set(DatabaseSettings(_env_file=None).model_dump()) == {"database_url"}
+    assert set(LoaderDatabaseSettings(_env_file=None).model_dump()) == {
+        "loader_database_url"
+    }
+    assert set(MigrationDatabaseSettings(_env_file=None).model_dump()) == {
+        "migration_database_url"
+    }
 
-    assert settings.database_url.startswith("postgresql+asyncpg://readonly:")
-    assert settings.migration_database_url.startswith("postgresql+psycopg://admin:")
-    assert settings.loader_database_url.startswith("postgresql+psycopg://loader:")
 
-
-def test_readonly_url_cannot_equal_migration_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    shared = "postgresql+asyncpg://admin:pw@db:5432/app"
-    monkeypatch.setenv("DATABASE_URL", shared)
-    monkeypatch.setenv("MIGRATION_DATABASE_URL", shared)
-    monkeypatch.setenv("LOADER_DATABASE_URL", "postgresql+psycopg://loader:pw@db:5432/app")
-
-    with pytest.raises(ValidationError, match="must use different credentials"):
-        DatabaseSettings(_env_file=None)
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql+psycopg://analytics_readonly:pw@db:5432/app",
+        "postgresql+asyncpg://analytics_loader:pw@db:5432/app",
+        "postgresql+asyncpg://%61nalytics_readonly:pw@db:5432/app",
+        "postgresql+asyncpg://analytics_readonly:@db:5432/app",
+    ],
+)
+def test_readonly_settings_reject_invalid_driver_role_or_password(database_url: str) -> None:
+    with pytest.raises(ValidationError):
+        DatabaseSettings(database_url=database_url)
 ```
 
-- [ ] **Step 2: Run the tests and verify the missing module failure**
+为 `LoaderDatabaseSettings` 和 `MigrationDatabaseSettings` 添加等价的角色互换、driver、编码角色名及缺失密码拒绝矩阵。按 URL 语义解析凭据，并在验证前进行百分号解码；但要求使用规范的未转义用户名写法，以拒绝编码后等价的角色名。driver 与角色身份必须精确匹配：`postgresql+asyncpg` / `analytics_readonly`、`postgresql+psycopg` / `analytics_loader`，以及 `postgresql+psycopg` / `governed_admin`。每个 URL 都必须包含显式非空密码。
 
-Run:
+- [x] **步骤 2：运行测试并确认因模块缺失而失败**
+
+运行：
 
 ```bash
 uv run pytest tests/unit/test_config.py -v
 ```
 
-Expected: collection fails with `ModuleNotFoundError: No module named 'governed_analytics.config'`.
+预期：由于三个按角色隔离的设置契约尚不存在，测试收集失败。
 
-- [ ] **Step 3: Implement immutable database settings**
+- [x] **步骤 3：实现不可变数据库设置**
 
-Create `src/governed_analytics/config.py`:
+创建 `src/governed_analytics/config.py`。共享的不可变 `SettingsConfigDict` 与 URL 验证辅助函数保持私有；每个公共设置类只声明自己的 URL：
 
 ```python
-from typing import Self
-
-from pydantic import model_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class DatabaseSettings(BaseSettings):
+class _DatabaseSettingsBase(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -128,18 +147,22 @@ class DatabaseSettings(BaseSettings):
         frozen=True,
     )
 
+
+class DatabaseSettings(_DatabaseSettingsBase):
     database_url: str
-    migration_database_url: str
+
+
+class LoaderDatabaseSettings(_DatabaseSettingsBase):
     loader_database_url: str
 
-    @model_validator(mode="after")
-    def require_separate_readonly_credentials(self) -> Self:
-        if self.database_url == self.migration_database_url:
-            raise ValueError("database_url and migration_database_url must use different credentials")
-        return self
+
+class MigrationDatabaseSettings(_DatabaseSettingsBase):
+    migration_database_url: str
 ```
 
-Extend `.env.example` with these local-only URLs:
+通过私有辅助函数应用字段验证器，实现上述精确 driver、规范固定用户名及解码后非空密码契约。不提供合并式兼容对象：任何消费者都不能实例化包含其他角色秘密的设置。
+
+在 `.env.example` 中加入以下仅限本地使用的 URL：
 
 ```dotenv
 POSTGRES_DB=governed_analytics
@@ -150,11 +173,11 @@ LOADER_DATABASE_URL=postgresql+psycopg://analytics_loader:analytics_loader_dev@1
 DATABASE_URL=postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.0.0.1:5432/governed_analytics
 ```
 
-Remove the older single admin `DATABASE_URL` line so there is one canonical value per variable.
+删除旧的单一管理员 `DATABASE_URL` 行，确保每个变量只有一个规范值。
 
-- [ ] **Step 4: Add the PostgreSQL Compose service**
+- [x] **步骤 4：添加 PostgreSQL Compose 服务**
 
-Create `docker-compose.yml`:
+创建 `docker-compose.yml`：
 
 ```yaml
 services:
@@ -180,11 +203,17 @@ volumes:
   postgres_data:
 ```
 
-Create `infra/docker/postgres/init/001_bootstrap.sql`:
+创建 `infra/docker/postgres/init/001_bootstrap.sql`：
 
 ```sql
 create extension if not exists vector;
 revoke create on schema public from public;
+
+do $$
+begin
+  execute format('revoke temporary on database %I from public', current_database());
+end
+$$;
 
 do $$
 begin
@@ -209,77 +238,90 @@ end
 $$;
 ```
 
-- [ ] **Step 5: Verify settings and Compose configuration**
+- [x] **步骤 5：验证设置与 Compose 配置**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/test_config.py -v
 docker compose config --quiet
 ```
 
-Expected: two tests pass and Compose exits zero without printing validation errors.
+预期：按角色隔离的设置矩阵通过，Compose 以状态码 0 退出且不打印验证错误。
 
-- [ ] **Step 6: Commit the settings and Compose boundary**
+- [x] **步骤 6：提交设置与 Compose 边界**
 
 ```bash
 git add .env.example pyproject.toml docker-compose.yml infra/docker/postgres/init/001_bootstrap.sql src/governed_analytics/config.py tests/unit/test_config.py
 git commit -m "chore: 建立 PostgreSQL 本地环境与角色配置"
 ```
 
-## Task 2: Alembic and Connection Factories
+## 任务 2：Alembic 与连接工厂
 
-**Files:**
-- Create: `alembic.ini`
-- Create: `migrations/env.py`
-- Create: `migrations/script.py.mako`
-- Create: `migrations/versions/.gitkeep`
-- Create: `src/governed_analytics/persistence/__init__.py`
-- Create: `src/governed_analytics/persistence/database.py`
-- Test: `tests/unit/persistence/test_database.py`
+**文件：**
+- 新建：`alembic.ini`
+- 新建：`migrations/env.py`
+- 新建：`migrations/script.py.mako`
+- 新建：`migrations/versions/.gitkeep`
+- 新建：`src/governed_analytics/persistence/__init__.py`
+- 新建：`src/governed_analytics/persistence/database.py`
+- 测试：`tests/unit/persistence/test_database.py`
 
-**Interfaces:**
-- Consumes: `DatabaseSettings`.
-- Produces: `create_async_database_engine(settings) -> AsyncEngine` and a synchronous Alembic migration environment using `MIGRATION_DATABASE_URL`.
+**接口：**
+- 输入：异步应用 engine 使用只读专用 `DatabaseSettings`；Alembic 使用迁移专用 `MigrationDatabaseSettings`。
+- 输出：`create_async_database_engine(settings) -> AsyncEngine`、`set_alembic_database_url(config, database_url) -> None`，以及只使用 `MIGRATION_DATABASE_URL` 的同步 Alembic 迁移环境。
 
-- [ ] **Step 1: Write a failing engine configuration test**
+- [x] **步骤 1：编写失败的 engine 配置测试**
 
-Create `tests/unit/persistence/test_database.py`:
+创建 `tests/unit/persistence/test_database.py`：
 
 ```python
+from alembic.config import Config
+
 from governed_analytics.config import DatabaseSettings
-from governed_analytics.persistence.database import create_async_database_engine
+from governed_analytics.persistence.database import (
+    create_async_database_engine,
+    set_alembic_database_url,
+)
 
 
 def test_engine_uses_pool_pre_ping_and_bounded_pool() -> None:
     settings = DatabaseSettings(
-        database_url="postgresql+asyncpg://readonly:pw@localhost:5432/app",
-        migration_database_url="postgresql+psycopg://admin:pw@localhost:5432/app",
-        loader_database_url="postgresql+psycopg://loader:pw@localhost:5432/app",
+        database_url="postgresql+asyncpg://analytics_readonly:pw@localhost:5432/app",
     )
 
     engine = create_async_database_engine(settings)
 
     assert engine.pool.size() == 5
     assert engine.pool._pre_ping is True
+
+
+def test_alembic_database_url_round_trips_percent_encoded_credentials() -> None:
+    config = Config()
+    url = "postgresql+psycopg://governed_admin:p%40ss%25word@localhost:5432/app"
+
+    set_alembic_database_url(config, url)
+
+    assert config.get_main_option("sqlalchemy.url") == url
 ```
 
-- [ ] **Step 2: Run the test and verify the missing package failure**
+- [x] **步骤 2：运行测试并确认因包缺失而失败**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/persistence/test_database.py -v
 ```
 
-Expected: import fails because `governed_analytics.persistence.database` does not exist.
+预期：由于 `governed_analytics.persistence.database` 不存在，导入失败。
 
-- [ ] **Step 3: Implement the async engine factory**
+- [x] **步骤 3：实现异步 engine 工厂**
 
-Create `src/governed_analytics/persistence/database.py`:
+创建 `src/governed_analytics/persistence/database.py`：
 
 ```python
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from alembic.config import Config
 
 from governed_analytics.config import DatabaseSettings
 
@@ -292,60 +334,65 @@ def create_async_database_engine(settings: DatabaseSettings) -> AsyncEngine:
         max_overflow=5,
         pool_timeout=5,
     )
+
+
+def set_alembic_database_url(config: Config, database_url: str) -> None:
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 ```
 
-Create `src/governed_analytics/persistence/__init__.py` with no exports.
+创建不导出任何符号的 `src/governed_analytics/persistence/__init__.py`。
 
-- [ ] **Step 4: Initialize Alembic and make the URL environment-driven**
+- [x] **步骤 4：初始化 Alembic，并让 URL 由环境驱动**
 
-Run once:
+运行一次：
 
 ```bash
 uv run alembic init migrations
 ```
 
-Set `script_location = %(here)s/migrations` in `alembic.ini`. Do not store a real URL in the file. In `migrations/env.py`, set the URL before creating the engine:
+在 `alembic.ini` 中设置 `script_location = %(here)s/migrations`。文件中不得保存真实 URL。在 `migrations/env.py` 创建 engine 前设置 URL：
 
 ```python
-from governed_analytics.config import DatabaseSettings
+from governed_analytics.config import MigrationDatabaseSettings
+from governed_analytics.persistence.database import set_alembic_database_url
 
-settings = DatabaseSettings()
-config.set_main_option("sqlalchemy.url", settings.migration_database_url)
+settings = MigrationDatabaseSettings()
+set_alembic_database_url(config, settings.migration_database_url)
 ```
 
-Keep `target_metadata = None`; migrations in this plan are explicit SQL contracts, not ORM autogeneration.
+辅助函数负责 `Config.set_main_option` 的插值边界：仅在持久化时将 `%` 加倍，使 `Config.get_main_option` 返回原始 URL。保持 `target_metadata = None`；本计划中的迁移是显式 SQL 契约，不使用 ORM 自动生成。
 
-- [ ] **Step 5: Verify the engine and Alembic configuration**
+- [x] **步骤 5：验证 engine 与 Alembic 配置**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/persistence/test_database.py -v
 uv run alembic heads
 ```
 
-Expected: the engine test passes and `alembic heads` exits zero with no revisions yet.
+预期：engine 与 `%40`/`%25` URL 往返测试通过；`alembic heads` 以状态码 0 退出，且尚无迁移版本。
 
-- [ ] **Step 6: Commit connection infrastructure**
+- [x] **步骤 6：提交连接基础设施**
 
 ```bash
 git add alembic.ini migrations src/governed_analytics/persistence tests/unit/persistence
 git commit -m "chore: 配置数据库连接与 Alembic"
 ```
 
-## Task 3: Create the Ecommerce Schema Migration
+## 任务 3：创建电商 Schema 迁移
 
-**Files:**
-- Create: `migrations/versions/0001_create_ecommerce_schema.py`
-- Test: `tests/integration/persistence/test_schema_contract.py`
+**文件：**
+- 新建：`migrations/versions/0001_create_ecommerce_schema.py`
+- 测试：`tests/integration/persistence/test_schema_contract.py`
 
-**Interfaces:**
-- Consumes: admin migration connection and the schema contract above.
-- Produces: the twelve tables, constraints, and query indexes used by generators, metrics, and golden SQL.
+**接口：**
+- 输入：管理员迁移连接及上述 Schema 契约。
+- 输出：生成器、指标和黄金 SQL 使用的 12 张表、约束与查询索引。
 
-- [ ] **Step 1: Write the failing table and extension contract test**
+- [x] **步骤 1：编写失败的表与扩展契约测试**
 
-Create `tests/integration/persistence/test_schema_contract.py`:
+创建 `tests/integration/persistence/test_schema_contract.py`：
 
 ```python
 import os
@@ -387,20 +434,20 @@ def test_schema_contains_all_business_tables_and_vector_extension() -> None:
     assert vector_enabled == (True,)
 ```
 
-- [ ] **Step 2: Start PostgreSQL and verify the test fails before migration**
+- [x] **步骤 2：启动 PostgreSQL，并确认测试在迁移前失败**
 
-Run:
+运行：
 
 ```bash
 docker compose up -d --wait db
 uv run pytest tests/integration/persistence/test_schema_contract.py -v
 ```
 
-Expected: the assertion reports missing business tables.
+预期：断言报告业务表缺失。
 
-- [ ] **Step 3: Create revision `0001` with the exact schema**
+- [x] **步骤 3：使用精确 Schema 创建版本 `0001`**
 
-Create `migrations/versions/0001_create_ecommerce_schema.py`. Set `revision = "0001"`, `down_revision = None`, and execute the following SQL in `upgrade()`:
+创建 `migrations/versions/0001_create_ecommerce_schema.py`。设置 `revision = "0001"`、`down_revision = None`，并在 `upgrade()` 中执行以下 SQL：
 
 ```sql
 create table categories (
@@ -588,7 +635,7 @@ create index attributions_order_id_idx on campaign_attributions (order_id);
 create index pipeline_name_started_idx on pipeline_runs (pipeline_name, started_at desc);
 ```
 
-The `downgrade()` SQL drops tables in this exact order:
+`downgrade()` SQL 按以下精确顺序删除表：
 
 ```sql
 drop table if exists campaign_attributions;
@@ -605,37 +652,37 @@ drop table if exists customers;
 drop table if exists categories;
 ```
 
-- [ ] **Step 4: Apply the migration and pass the table contract test**
+- [x] **步骤 4：应用迁移并通过表契约测试**
 
-Run:
+运行：
 
 ```bash
 uv run alembic upgrade head
 uv run pytest tests/integration/persistence/test_schema_contract.py -v
 ```
 
-Expected: the test passes and confirms all twelve tables plus `vector`.
+预期：测试通过，并确认 12 张表及 `vector` 扩展全部存在。
 
-- [ ] **Step 5: Commit the schema migration**
+- [x] **步骤 5：提交 Schema 迁移**
 
 ```bash
 git add migrations/versions/0001_create_ecommerce_schema.py tests/integration/persistence/test_schema_contract.py
 git commit -m "feat: 创建电商分析数据库结构"
 ```
 
-## Task 4: Least-Privilege Grants
+## 任务 4：最小权限授权
 
-**Files:**
-- Create: `migrations/versions/0002_grant_analytics_roles.py`
-- Create: `tests/integration/persistence/test_database_roles.py`
+**文件：**
+- 新建：`migrations/versions/0002_grant_analytics_roles.py`
+- 新建：`tests/integration/persistence/test_database_roles.py`
 
-**Interfaces:**
-- Consumes: the twelve tables from revision `0001` and roles from `001_bootstrap.sql`.
-- Produces: loader DML access and read-only SELECT access, both enforced by PostgreSQL.
+**接口：**
+- 输入：版本 `0001` 的 12 张表，以及 `001_bootstrap.sql` 创建的角色。
+- 输出：由 PostgreSQL 强制执行的加载角色 DML 权限和只读角色 SELECT 权限。
 
-- [ ] **Step 1: Write failing loader/read-only privilege tests**
+- [x] **步骤 1：编写失败的加载/只读权限测试**
 
-Create `tests/integration/persistence/test_database_roles.py`:
+创建 `tests/integration/persistence/test_database_roles.py`：
 
 ```python
 import os
@@ -672,19 +719,19 @@ def test_loader_role_can_insert_but_cannot_create_tables() -> None:
             connection.execute("create table forbidden_loader_table (id bigint)")
 ```
 
-- [ ] **Step 2: Run the role tests and verify privilege failures occur too early**
+- [x] **步骤 2：运行角色测试，并确认授权前预期操作也会失败**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/integration/persistence/test_database_roles.py -v
 ```
 
-Expected: both roles fail their permitted operations because table grants do not exist yet.
+预期：由于表授权尚不存在，两个角色连各自应被允许的操作也会失败。
 
-- [ ] **Step 3: Add revision `0002` with explicit grants**
+- [x] **步骤 3：添加包含显式授权的版本 `0002`**
 
-Create `migrations/versions/0002_grant_analytics_roles.py` with `revision = "0002"` and `down_revision = "0001"`. Execute in `upgrade()`:
+创建 `migrations/versions/0002_grant_analytics_roles.py`，设置 `revision = "0002"`、`down_revision = "0001"`。在 `upgrade()` 中执行：
 
 ```sql
 grant usage on schema public to analytics_loader, analytics_readonly;
@@ -700,7 +747,7 @@ alter default privileges in schema public
 grant select on tables to analytics_readonly;
 ```
 
-Execute in `downgrade()`:
+在 `downgrade()` 中执行：
 
 ```sql
 alter default privileges in schema public revoke select on tables from analytics_readonly;
@@ -711,37 +758,37 @@ revoke usage, select on all sequences in schema public from analytics_loader;
 revoke select, insert, update, delete, truncate on all tables in schema public from analytics_loader;
 ```
 
-- [ ] **Step 4: Apply the grant migration and pass the role tests**
+- [x] **步骤 4：应用授权迁移并通过角色测试**
 
-Run:
+运行：
 
 ```bash
 uv run alembic upgrade head
 uv run pytest tests/integration/persistence/test_database_roles.py -v
 ```
 
-Expected: read-only SELECT and loader INSERT pass; DDL attempts raise `InsufficientPrivilege`.
+预期：只读角色 SELECT 和加载角色 INSERT 通过；DDL 尝试抛出 `InsufficientPrivilege`。
 
-- [ ] **Step 5: Commit role enforcement**
+- [x] **步骤 5：提交角色权限约束**
 
 ```bash
 git add migrations/versions/0002_grant_analytics_roles.py tests/integration/persistence/test_database_roles.py
 git commit -m "feat: 强制数据库最小权限角色"
 ```
 
-## Task 5: Index and Migration Contract Tests
+## 任务 5：索引与迁移契约测试
 
-**Files:**
-- Modify: `tests/integration/persistence/test_schema_contract.py`
-- Create: `tests/integration/persistence/test_migrations.py`
+**文件：**
+- 修改：`tests/integration/persistence/test_schema_contract.py`
+- 新建：`tests/integration/persistence/test_migrations.py`
 
-**Interfaces:**
-- Consumes: Alembic revisions `0001` and `0002`.
-- Produces: automated evidence that every foreign key is indexed and migration head is `0002`.
+**接口：**
+- 输入：Alembic 版本 `0001`、`0002` 与后续数据集重置版本 `0003`。
+- 输出：证明每个外键均已建立索引、当前迁移 head 为 `0003` 的自动化证据。
 
-- [ ] **Step 1: Add a foreign-key index test**
+- [x] **步骤 1：添加外键索引测试**
 
-Append to `test_schema_contract.py`:
+追加到 `test_schema_contract.py`：
 
 ```python
 @pytest.mark.integration
@@ -767,9 +814,9 @@ def test_every_foreign_key_column_is_indexed() -> None:
     assert missing == []
 ```
 
-- [ ] **Step 2: Add an Alembic head test**
+- [x] **步骤 2：添加 Alembic head 测试**
 
-Create `tests/integration/persistence/test_migrations.py`:
+创建 `tests/integration/persistence/test_migrations.py`：
 
 ```python
 import os
@@ -784,23 +831,23 @@ def test_database_is_at_expected_alembic_head() -> None:
     with psycopg.connect(url) as connection:
         revision = connection.execute("select version_num from alembic_version").fetchone()
 
-    assert revision == ("0002",)
+    assert revision == ("0003",)
 ```
 
-- [ ] **Step 3: Run all persistence integration tests**
+- [x] **步骤 3：运行全部持久化集成测试**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/integration/persistence -v
 uv run alembic current
 ```
 
-Expected: all tests pass and Alembic prints `0002 (head)`.
+预期：全部测试通过，且 Alembic 输出 `0003 (head)`。
 
-- [ ] **Step 4: Verify downgrade/upgrade on the disposable local database**
+- [x] **步骤 4：在可丢弃的本地数据库上验证降级/升级**
 
-Run only before loading generated data:
+仅在加载生成数据前运行：
 
 ```bash
 uv run alembic downgrade base
@@ -808,31 +855,31 @@ uv run alembic upgrade head
 uv run pytest tests/integration/persistence -v
 ```
 
-Expected: both migrations replay successfully and all persistence tests pass.
+预期：两个迁移均成功重放，全部持久化测试通过。
 
-- [ ] **Step 5: Commit schema contract coverage**
+- [x] **步骤 5：提交 Schema 契约覆盖**
 
 ```bash
 git add tests/integration/persistence
 git commit -m "test: 验证数据库迁移与外键索引"
 ```
 
-## Task 6: Developer Commands and CI Gate
+## 任务 6：开发命令与 CI 门禁
 
-**Files:**
-- Modify: `Makefile`
-- Create: `.github/workflows/ci.yml`
-- Create: `docs/database.md`
-- Modify: `README.md`
-- Move: `tests/test_project_bootstrap.py` to `tests/unit/test_project_bootstrap.py`
+**文件：**
+- 修改：`Makefile`
+- 新建：`.github/workflows/ci.yml`
+- 新建：`docs/database.md`
+- 修改：`README.md`
+- 移动：`tests/test_project_bootstrap.py` 至 `tests/unit/test_project_bootstrap.py`
 
-**Interfaces:**
-- Consumes: Compose, Alembic, and persistence tests.
-- Produces: stable developer commands and a network-free CI gate.
+**接口：**
+- 输入：Compose、Alembic 与持久化测试。
+- 输出：稳定的开发命令及无网络 CI 门禁。
 
-- [ ] **Step 1: Add local database commands**
+- [x] **步骤 1：添加本地数据库命令**
 
-Move the bootstrap test under `tests/unit/`, replace the existing `test` target so it runs unit tests only, and add these database targets to `Makefile`:
+将启动测试移到 `tests/unit/` 下，替换现有 `test` target，使其只运行单元测试，并在 `Makefile` 中加入以下数据库 target：
 
 ```make
 .PHONY: db-up db-down migrate migration-check test-integration
@@ -857,11 +904,11 @@ test-integration:
 	@uv run pytest tests/integration -v
 ```
 
-`db-down` stops the container but preserves the named volume. Do not add a default target that calls `docker compose down -v`.
+`db-down` 停止容器但保留命名卷。不得添加会调用 `docker compose down -v` 的默认 target。
 
-- [ ] **Step 2: Add GitHub Actions without paid model calls**
+- [x] **步骤 2：添加不调用付费模型的 GitHub Actions**
 
-Create `.github/workflows/ci.yml`:
+创建 `.github/workflows/ci.yml`：
 
 ```yaml
 name: CI
@@ -902,22 +949,22 @@ jobs:
       - run: uv run pytest tests/integration/persistence -v
 ```
 
-- [ ] **Step 3: Document role and migration boundaries**
+- [x] **步骤 3：记录角色与迁移边界**
 
-Create `docs/database.md` with:
+创建 `docs/database.md`，内容包括：
 
-- the three connection URLs and which commands may use each;
-- the twelve-table schema diagram or table list;
-- `make db-up`, `make migrate`, `make test-integration`, and `make db-down`;
-- the rule that only Alembic changes schema;
-- the rule that Agent queries always use `analytics_readonly`;
-- a warning that local example passwords are development-only.
+- 三个连接 URL 及各自允许使用的命令；
+- 12 表 Schema 图或表清单；
+- `make db-up`、`make migrate`、`make test-integration` 和 `make db-down`；
+- 只有 Alembic 可以修改 Schema 的规则；
+- Agent 查询始终使用 `analytics_readonly` 的规则；
+- 本地示例密码仅限开发环境的警告。
 
-Add a Database section to `README.md` linking to `docs/database.md`.
+在 `README.md` 中添加数据库章节，并链接到 `docs/database.md`。
 
-- [ ] **Step 4: Run the complete Plan A gate**
+- [x] **步骤 4：运行完整 Plan A 门禁**
 
-Run:
+运行：
 
 ```bash
 make doctor
@@ -929,23 +976,23 @@ uv run pytest tests/integration/persistence -v
 git diff --check
 ```
 
-Expected: zero environment errors, quality checks pass, database is healthy at revision `0002`, persistence tests pass, and no whitespace errors are reported.
+预期：环境错误为零、质量检查通过、数据库健康且位于版本 `0003`、持久化测试通过，并且不报告空白字符错误。
 
-- [ ] **Step 5: Commit Plan A developer workflow**
+- [x] **步骤 5：提交 Plan A 开发工作流**
 
 ```bash
 git add Makefile .github/workflows/ci.yml docs/database.md README.md tests/test_project_bootstrap.py tests/unit/test_project_bootstrap.py
 git commit -m "ci: 验证数据库迁移与权限边界"
 ```
 
-## Plan A Completion Gate
+## Plan A 完成门禁
 
-- [ ] `docker compose up -d --wait db` succeeds on arm64 and CI amd64.
-- [ ] `vector` extension exists.
-- [ ] Exactly twelve business tables exist after `alembic upgrade head`.
-- [ ] Every foreign key column is covered by an index.
-- [ ] `analytics_readonly` can SELECT and cannot perform DML or DDL.
-- [ ] `analytics_loader` can load data and cannot perform DDL.
-- [ ] `uv run alembic downgrade base && uv run alembic upgrade head` succeeds on the disposable empty database.
-- [ ] Unit and persistence integration tests pass.
-- [ ] No paid API or model key is used.
+- [ ] `docker compose up -d --wait db` 在 arm64 和 CI amd64 上均成功（arm64 已通过；外部 CI 待运行）。
+- [x] `vector` 扩展存在。
+- [x] 执行 `alembic upgrade head` 后恰好存在 12 张业务表。
+- [x] 每个外键列都由索引覆盖。
+- [x] `analytics_readonly` 可以执行 SELECT，但不能执行 DML 或 DDL。
+- [x] `analytics_loader` 可以加载数据，但不能执行 DDL。
+- [x] `uv run alembic downgrade base && uv run alembic upgrade head` 可在可丢弃的空数据库上成功执行。
+- [x] 单元测试与持久化集成测试通过。
+- [x] Plan A 未使用付费 API 或模型 Key。

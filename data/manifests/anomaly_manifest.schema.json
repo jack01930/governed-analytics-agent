@@ -1,0 +1,143 @@
+{
+  "$defs": {
+    "AnomalyRecord": {
+      "additionalProperties": false,
+      "description": "Immutable, machine-readable truth for one deterministic anomaly.",
+      "properties": {
+        "affected_keys": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Affected Keys",
+          "type": "array"
+        },
+        "anomaly_id": {
+          "title": "Anomaly Id",
+          "type": "string"
+        },
+        "end_at": {
+          "format": "date-time",
+          "title": "End At",
+          "type": "string"
+        },
+        "expected_signals": {
+          "items": {
+            "$ref": "#/$defs/ExpectedSignal"
+          },
+          "title": "Expected Signals",
+          "type": "array"
+        },
+        "mutated_rows": {
+          "minimum": 0,
+          "title": "Mutated Rows",
+          "type": "integer"
+        },
+        "mutation": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "title": "Mutation",
+          "type": "object"
+        },
+        "root_cause": {
+          "title": "Root Cause",
+          "type": "string"
+        },
+        "start_at": {
+          "format": "date-time",
+          "title": "Start At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "anomaly_id",
+        "start_at",
+        "end_at",
+        "root_cause",
+        "affected_keys",
+        "mutation",
+        "mutated_rows",
+        "expected_signals"
+      ],
+      "title": "AnomalyRecord",
+      "type": "object"
+    },
+    "ExpectedSignal": {
+      "additionalProperties": false,
+      "description": "A metric-level effect expected from one injected root cause.",
+      "properties": {
+        "metric_id": {
+          "title": "Metric Id",
+          "type": "string"
+        },
+        "operator": {
+          "enum": [
+            "decrease",
+            "increase",
+            "equals",
+            "stale"
+          ],
+          "title": "Operator",
+          "type": "string"
+        },
+        "threshold": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Threshold"
+        }
+      },
+      "required": [
+        "metric_id",
+        "operator",
+        "threshold"
+      ],
+      "title": "ExpectedSignal",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The ordered source of truth for all injected anomalies.",
+  "properties": {
+    "anomalies": {
+      "items": {
+        "$ref": "#/$defs/AnomalyRecord"
+      },
+      "title": "Anomalies",
+      "type": "array"
+    },
+    "dataset_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Dataset Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "dataset_id",
+    "anomalies"
+  ],
+  "title": "AnomalyManifest",
+  "type": "object"
+}

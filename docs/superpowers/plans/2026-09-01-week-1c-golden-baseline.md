@@ -1,100 +1,103 @@
-# Week 1C Golden Questions and Text-to-SQL Baseline Implementation Plan
+# 第 1C 周：黄金问题与 Text-to-SQL 基线实现计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **状态同步（2026-09-03）：** 20 个核心问题、Oracle、fixture、执行/评分/报告和 DeepSeek live 适配已完成；
+> v1/v2 live 报告均已原样保留，v2 结构化响应与失败计量契约已验证。详细门禁保留为复核清单。
 
-**Goal:** Build twenty oracle-backed business questions and a safe, measurable direct Text-to-SQL baseline that establishes the pre-Agent accuracy, failure, latency, and cost reference.
+> **供 Agent 执行者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，逐任务实施本计划。各步骤使用复选框（`- [ ]`）跟踪进度。
 
-**Architecture:** Golden cases and oracle SQL are versioned data contracts. A model-independent `SqlGenerator` Protocol separates fixture and live adapters. Generated SQL passes a narrow baseline guard and executes with PostgreSQL read-only credentials inside a read-only, time-bounded transaction; scorers compare normalized result sets and generate JSON/Markdown reports.
+**目标：** 构建 20 个由 Oracle 支撑的业务问题，以及安全、可度量的直接 Text-to-SQL 基线，用于建立 Agent 实现前的准确率、失败、延迟与成本参照。
 
-**Tech Stack:** Python 3.12, Pydantic 2, SQLGlot, SQLAlchemy async, OpenAI Python SDK 3.6, PyYAML, Pytest.
+**架构：** 黄金用例与 Oracle SQL 是版本化数据契约。与模型无关的 `SqlGenerator` Protocol 隔离 fixture 与 live 适配器。生成的 SQL 先通过窄范围基线守卫，再使用 PostgreSQL 只读凭据，在只读且有时间上限的事务中执行；评分器比较规范化结果集，并生成 JSON/Markdown 报告。
 
-**Spec:** `GOVERNED_ANALYTICS_AGENT_PLAN.md` sections 20-21 and 35-37, plus `docs/superpowers/plans/2026-09-01-week-1-data-baseline.md`.
+**技术栈：** Python 3.12、Pydantic 2、SQLGlot、异步 SQLAlchemy、OpenAI Python SDK 3.6、PyYAML、Pytest。
 
-## Global Constraints
+**规格依据：** `GOVERNED_ANALYTICS_AGENT_PLAN.md` 第 20–21、35–37 节，以及 `docs/superpowers/plans/2026-09-01-week-1-data-baseline.md`。
 
-- The baseline is one model request followed by one generated SQL query. It has no planning loop, tools, retries, LangGraph, or hidden repair step.
-- Tests and CI use fixture mode and make zero external requests.
-- Live mode requires `MODEL_API_KEY` plus both CLI flags `--mode live --live`.
-- Use model alias `qwen3.7-plus` for exploration; record the resolved model returned by the provider.
-- Use `AsyncOpenAI.chat.completions.create` against the configured OpenAI-compatible base URL. Do not assume the provider supports OpenAI Responses-specific features.
-- Ask for JSON object output containing only `sql` and `assumptions`; parse it with Pydantic after SDK return.
-- Never request or store hidden chain-of-thought. `assumptions` contains short business assumptions only.
-- Generated SQL runs as `analytics_readonly`, in a read-only transaction, with 10-second statement timeout and 500-row default result limit.
-- Never delete difficult cases or overwrite prior reports. Each run gets a stable timestamped directory and records every failure.
-- Price metadata is versioned separately from code and records source/effective date.
+## 全局约束
+
+- 基线只进行一次模型请求，随后执行一次生成 SQL。它不包含规划循环、工具、重试、LangGraph 或隐藏修复步骤。
+- 测试与 CI 使用 fixture 模式，不发起外部请求。
+- live 模式必须提供 `MODEL_API_KEY`，并同时使用 CLI 标志 `--mode live --live`。
+- live 基线使用模型别名 `deepseek-v4-flash` 的非思考模式；记录 provider 返回的 resolved model。
+- 对配置的 OpenAI-compatible Base URL 调用 `AsyncOpenAI.chat.completions.create`。不得假设 provider 支持 OpenAI Responses 专属能力。
+- 要求输出只包含 `sql` 与 `assumptions` 的 JSON 对象；SDK 返回后使用 Pydantic 解析。
+- 不得请求或存储隐藏思维链。`assumptions` 只包含简短业务假设。
+- 生成 SQL 以 `analytics_readonly` 身份运行，位于只读事务中，语句超时为 10 秒，默认结果上限为 500 行。
+- 不得删除困难用例或覆盖历史报告。每次运行使用稳定的带时间戳目录，并记录全部失败。
+- 价格元数据与代码分别版本化，并记录来源/生效日期。
 
 ---
 
-## Twenty Golden Cases
+## 20 个黄金用例
 
-| ID | Question | Oracle output | Comparison |
+| ID | 问题 | Oracle 输出 | 比较方式 |
 |---|---|---|---|
-| `G001` | 2026-06-08 至 2026-06-14 的 GMV 是多少？ | one row: `gmv` | scalar |
+| `G001` | 2026-06-08 至 2026-06-14 的 GMV 是多少？ | 单行：`gmv` | scalar |
 | `G002` | 该周 GMV 相比前一周变化多少？ | `current_gmv`, `previous_gmv`, `change_rate` | table |
-| `G003` | 哪些地区对该周 GMV 下滑贡献最大？ | top 5 `region`, `gmv_loss` | top_k |
-| `G004` | 哪些商品对该周 GMV 下滑贡献最大？ | top 5 `sku`, `gmv_loss` | top_k |
+| `G003` | 哪些地区对该周 GMV 下滑贡献最大？ | 前 5 个 `region`、`gmv_loss` | top_k |
+| `G004` | 哪些商品对该周 GMV 下滑贡献最大？ | 前 5 个 `sku`、`gmv_loss` | top_k |
 | `G005` | 各用户分群对该周 GMV 变化贡献如何？ | `segment`, previous/current/delta | table |
-| `G006` | 该周 GMV 下滑的主要原因是什么？ | South conversion delta plus two stockout SKU deltas | table |
-| `G007` | 2026 年 6 月支付 GMV 是多少？ | one row: `paid_gmv` | scalar |
-| `G008` | 2026 年 5 月净收入是多少？ | one row: `net_revenue` | scalar |
-| `G009` | 2026-05-04 当周退款率最高的品类有哪些？ | top 5 category/refund_rate | top_k |
+| `G006` | 该周 GMV 下滑的主要原因是什么？ | 华南转化变化 + 两个缺货 SKU 的变化 | table |
+| `G007` | 2026 年 6 月支付 GMV 是多少？ | 单行：`paid_gmv` | scalar |
+| `G008` | 2026 年 5 月净收入是多少？ | 单行：`net_revenue` | scalar |
+| `G009` | 2026-05-04 当周退款率最高的品类有哪些？ | 前 5 个 category/refund_rate | top_k |
 | `G010` | 该退款异常周最常见的退款原因是什么？ | reason/refund_count/refund_amount | top_k |
-| `G011` | 2026-06-08 当周各渠道转化率是多少？ | channel/session_count/conversion_rate | table |
+| `G011` | 2026-06-08 当周各渠道转化率是多少？ | channel/conversion_rate | table |
 | `G012` | 2026-06-08 当周哪些商品发生缺货？ | sku/stockout_days | table |
-| `G013` | 2026 年 6 月活跃客户数是多少？ | one row: `active_customers` | scalar |
-| `G014` | 2026 年 6 月新增客户数是多少？ | one row: `new_customers` | scalar |
-| `G015` | 截至 2026-06-30 的复购率是多少？ | one row: `repeat_purchase_rate` | scalar |
-| `G016` | 2026 年第二季度 ROI 最高的营销活动有哪些？ | top 5 campaign/roi | top_k |
-| `G017` | 2026-06-15 库存数据是否按时更新？ | one row: `is_stale` | boolean |
-| `G018` | 2026-04-10 有多少条重复订单明细？ | one row: `duplicate_rows` | scalar |
-| `G019` | 2026-03-17 有多少订单金额与明细不一致？ | one row: `mismatched_orders` | scalar |
-| `G020` | 2026-05-20 有多少订单退款超过成功支付？ | one row: `over_refunded_orders` | scalar |
+| `G013` | 2026 年 6 月活跃客户数是多少？ | 单行：`active_customers` | scalar |
+| `G014` | 2026 年 6 月新增客户数是多少？ | 单行：`new_customers` | scalar |
+| `G015` | 截至 2026-06-30 的复购率是多少？ | 单行：`repeat_purchase_rate` | scalar |
+| `G016` | 2026 年第二季度 ROI 最高的营销活动有哪些？ | 前 5 个 campaign/roi | top_k |
+| `G017` | 2026-06-15 库存数据是否按时更新？ | 单行：`is_stale` | boolean |
+| `G018` | 2026-04-10 有多少条重复订单明细？ | 单行：`duplicate_rows` | scalar |
+| `G019` | 2026-03-17 有多少订单金额与明细不一致？ | 单行：`mismatched_orders` | scalar |
+| `G020` | 2026-05-20 有多少订单退款超过成功支付？ | 单行：`over_refunded_orders` | scalar |
 
-All date intervals use half-open UTC boundaries. For example, “2026-06-08 当周” is `[2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z)`.
+全部日期区间使用 UTC 半开边界。例如，“2026-06-08 当周”表示 `[2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z)`。
 
-## Oracle SQL Contract
+## Oracle SQL 契约
 
-Create one file per case under `evals/datasets/golden/sql/G001.sql` through `G020.sql`. SQL uses these fixed patterns:
+在 `evals/datasets/golden/sql/G001.sql` 至 `G020.sql` 中为每个用例创建一个文件。SQL 使用以下固定模式：
 
-- `G001`: sum `order_items.net_amount` joined to valid orders in the target interval.
-- `G002`: conditional aggregate for previous and current intervals; `change_rate = (current - previous) / nullif(previous, 0)`.
-- `G003`: previous/current region CTEs, full outer join, `gmv_loss = previous - current`, descending positive loss.
-- `G004`: same pattern by `products.sku`.
-- `G005`: same pattern by `customers.segment`, returning all three segments.
-- `G006`: return exactly three evidence rows with `cause_type` keys `south_conversion`, `SKU-000001`, and `SKU-000002`; each row has previous/current/delta.
-- `G007`: sum succeeded `payments.amount` where `paid_at` is in June.
-- `G008`: succeeded payment total minus succeeded refund total for orders placed in May.
-- `G009`: refund amount divided by succeeded payment amount for orders/items grouped by category in the anomaly week.
-- `G010`: succeeded refunds grouped by reason in the anomaly week, ordered by refund amount descending.
-- `G011`: sessions and converted sessions grouped by channel; ratio uses `nullif(count(*), 0)`.
-- `G012`: count distinct snapshot dates with `available_qty = 0` per SKU in the target week.
-- `G013`: count distinct customers with valid June orders.
-- `G014`: count customers registered in June.
-- `G015`: customers with at least two valid orders by 2026-07-01 divided by customers with at least one.
-- `G016`: attributed revenue minus spend divided by spend for campaigns overlapping Q2, ordered descending.
-- `G017`: select the latest inventory `pipeline_runs` row on 2026-06-15 and return one boolean `is_stale` from status or watermark before `2026-06-15T23:59:59Z`.
-- `G018`: group `order_items.source_line_id` for orders on 2026-04-10; sum `count(*) - 1` for groups above one.
-- `G019`: compare each order's `payable_amount` to summed item `net_amount + shipping_amount` for orders on 2026-03-17; tolerance CNY 0.01.
-- `G020`: compare successful refund sum to successful payment sum per order for refunds on 2026-05-20.
+- `G001`：连接目标区间内的有效订单，汇总 `order_items.net_amount`。
+- `G002`：对上一窗口与当前窗口做条件聚合；`change_rate = (current - previous) / nullif(previous, 0)`。
+- `G003`：上一/当前地区 CTE、full outer join，`gmv_loss = previous - current`，按正损失降序。
+- `G004`：按 `products.sku` 使用相同模式。
+- `G005`：按 `customers.segment` 使用相同模式，返回全部三个分群。
+- `G006`：恰好返回三行证据，`cause_type` 键为 `south_conversion`、`SKU-000001`、`SKU-000002`；每行包含 previous/current/delta。
+- `G007`：汇总 `paid_at` 位于 6 月的成功 `payments.amount`。
+- `G008`：5 月下单订单的成功支付总额减去成功退款总额。
+- `G009`：异常周内按品类分组的订单/订单项，退款金额除以成功支付金额。
+- `G010`：异常周成功退款按原因分组，并按退款金额降序。
+- `G011`：会话与已转化会话在内部按渠道分组；Oracle 只输出 `channel` 和 `conversion_rate`，比率使用 `nullif(count(*), 0)`。
+- `G012`：按 SKU 统计目标周内 `available_qty = 0` 的不同快照日期数。
+- `G013`：统计拥有 6 月有效订单的去重客户数。
+- `G014`：统计 6 月注册客户数。
+- `G015`：截至 2026-07-01 至少有两个有效订单的客户数，除以至少有一个有效订单的客户数。
+- `G016`：对与第二季度重叠的营销活动计算（归因收入减花费）/花费，并降序排列。
+- `G017`：选择 2026-06-15 最新的库存 `pipeline_runs` 行，根据状态或早于 `2026-06-15T23:59:59Z` 的 watermark 返回一个布尔值 `is_stale`。
+- `G018`：对 2026-04-10 订单按 `order_items.source_line_id` 分组；对数量大于一的组汇总 `count(*) - 1`。
+- `G019`：对 2026-03-17 的订单，比较每个订单的 `payable_amount` 与订单项 `net_amount + shipping_amount` 合计；容差人民币 0.01 元。
+- `G020`：对 2026-05-20 的退款，按订单比较成功退款总额与成功支付总额。
 
-Every oracle SQL file starts with a comment containing case ID and metric version, contains one read-only statement, has explicit aliases, and ends with deterministic `order by` for multi-row output.
+每个 Oracle SQL 文件都以包含用例 ID 与指标版本的注释开头，只包含一条只读语句，使用显式别名，并在多行输出时以确定性的 `order by` 结尾。
 
-## Task 1: Golden Case Contracts and Registry
+## 任务 1：黄金用例契约与注册表
 
-**Files:**
-- Create: `src/governed_analytics/evals/__init__.py`
-- Create: `src/governed_analytics/evals/models.py`
-- Create: `src/governed_analytics/evals/golden.py`
-- Create: `evals/datasets/golden/cases.yaml`
-- Create: `tests/unit/evals/test_golden_registry.py`
+**文件：**
+- 新建：`src/governed_analytics/evals/__init__.py`
+- 新建：`src/governed_analytics/evals/models.py`
+- 新建：`src/governed_analytics/evals/golden.py`
+- 新建：`evals/datasets/golden/cases.yaml`
+- 新建：`tests/unit/evals/test_golden_registry.py`
 
-**Interfaces:**
-- Consumes: the twenty-case table and Oracle SQL contract.
-- Produces: `GoldenCase`, `BaselineCaseResult`, `load_golden_cases(path) -> tuple[GoldenCase, ...]`.
+**接口：**
+- 输入：20 用例表与 Oracle SQL 契约。
+- 输出：`GoldenCase`、`BaselineCaseResult`、`load_golden_cases(path) -> tuple[GoldenCase, ...]`。
 
-- [ ] **Step 1: Write a failing registry test**
+- [x] **步骤 1：编写失败的注册表测试**
 
-Create `tests/unit/evals/test_golden_registry.py`:
+创建 `tests/unit/evals/test_golden_registry.py`：
 
 ```python
 from governed_analytics.evals.golden import load_golden_cases
@@ -109,19 +112,19 @@ def test_week_one_registry_has_twenty_unique_ordered_cases() -> None:
     assert all(case.oracle_sql_path.is_file() for case in cases)
 ```
 
-- [ ] **Step 2: Run and verify missing eval modules**
+- [x] **步骤 2：运行测试并确认评测模块缺失**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/evals/test_golden_registry.py -v
 ```
 
-Expected: imports fail for `governed_analytics.evals`.
+预期：导入 `governed_analytics.evals` 失败。
 
-- [ ] **Step 3: Implement immutable contracts**
+- [x] **步骤 3：实现不可变契约**
 
-Implement the exact `GoldenCase` and `BaselineCaseResult` from the master plan. Add:
+实现主计划中精确的 `GoldenCase` 与 `BaselineCaseResult`。添加：
 
 ```python
 class GeneratedSql(BaseModel):
@@ -150,9 +153,9 @@ class BaselineRunReport(BaseModel):
     cases: tuple[BaselineCaseResult, ...]
 ```
 
-- [ ] **Step 4: Create the YAML registry and loader**
+- [x] **步骤 4：创建 YAML 注册表与加载器**
 
-`cases.yaml` contains all twenty IDs/questions/categories/paths/comparison modes from this plan. Use `key_columns`:
+`cases.yaml` 包含本计划全部 20 个 ID/问题/类别/路径/比较模式。使用以下 `key_columns`：
 
 - `G003`: `region`;
 - `G004`, `G012`: `sku`;
@@ -163,41 +166,41 @@ class BaselineRunReport(BaseModel):
 - `G011`: `channel`;
 - `G016`: `campaign_code`.
 
-Use numeric columns named in the Oracle output. `load_golden_cases` resolves SQL paths relative to the repository root, rejects duplicate IDs, and verifies IDs match `G[0-9]{3}`.
+使用 Oracle 输出中命名的数值列。`load_golden_cases` 相对仓库根目录解析 SQL 路径，拒绝重复 ID，并验证 ID 匹配 `G[0-9]{3}`。
 
-- [ ] **Step 5: Add all twenty Oracle SQL files and pass registry tests**
+- [x] **步骤 5：添加全部 20 个 Oracle SQL 文件并通过注册表测试**
 
-Write the exact queries described in the Oracle SQL Contract. Parse each with `sqlglot.parse_one(sql, read="postgres")` during loading.
+编写 Oracle SQL 契约所述的精确查询。加载时使用 `sqlglot.parse_one(sql, read="postgres")` 解析每条查询。
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/evals/test_golden_registry.py -v
 ```
 
-Expected: one test passes with twenty ordered cases.
+预期：一个包含 20 个有序用例的测试通过。
 
-- [ ] **Step 6: Commit golden contracts**
+- [x] **步骤 6：提交黄金契约**
 
 ```bash
 git add src/governed_analytics/evals evals/datasets/golden tests/unit/evals
 git commit -m "feat: 定义二十条黄金业务问题"
 ```
 
-## Task 2: Materialize Versioned Oracle Results
+## 任务 2：物化版本化 Oracle 结果
 
-**Files:**
-- Create: `src/governed_analytics/evals/oracle.py`
-- Create: `evals/datasets/golden/expected/.gitkeep`
-- Create: `tests/integration/evals/test_oracles.py`
+**文件：**
+- 新建：`src/governed_analytics/evals/oracle.py`
+- 新建：`evals/datasets/golden/expected/.gitkeep`
+- 新建：`tests/integration/evals/test_oracles.py`
 
-**Interfaces:**
-- Consumes: tiny loaded dataset and twenty Oracle SQL files.
-- Produces: `materialize_oracles(cases, output_dir) -> dict[str, QueryResult]` and versioned expected JSON files.
+**接口：**
+- 输入：已加载的 tiny 数据集与 20 个 Oracle SQL 文件。
+- 输出：`materialize_oracles(cases, output_dir) -> dict[str, QueryResult]` 及版本化预期 JSON 文件。
 
-- [ ] **Step 1: Write an Oracle execution test**
+- [x] **步骤 1：编写 Oracle 执行测试**
 
-Create `tests/integration/evals/test_oracles.py`:
+创建 `tests/integration/evals/test_oracles.py`：
 
 ```python
 from pathlib import Path
@@ -220,25 +223,25 @@ def test_all_oracles_execute_and_materialize(tmp_path: Path) -> None:
     assert results["G020"].rows[0][0] == 3
 ```
 
-- [ ] **Step 2: Run and verify missing Oracle executor**
+- [x] **步骤 2：运行测试并确认 Oracle 执行器缺失**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/integration/evals/test_oracles.py -v
 ```
 
-Expected: import fails for `oracle`.
+预期：导入 `oracle` 失败。
 
-- [ ] **Step 3: Implement read-only Oracle execution**
+- [x] **步骤 3：实现只读 Oracle 执行**
 
-Use `DatabaseSettings.database_url`, an async engine, `SET TRANSACTION READ ONLY`, and `SET LOCAL statement_timeout = '10s'`. Convert `Decimal` and timestamps to JSON strings through Pydantic serialization. Sort object keys and end JSON files with one newline.
+使用只读专用 `DatabaseSettings.database_url` 与异步 engine。每条 Oracle 语句都必须在显式事务中运行，并先在同一连接上执行 `SET TRANSACTION READ ONLY`、`SET LOCAL statement_timeout = '10s'` 和 `SET LOCAL search_path = public, pg_catalog`。通过 Pydantic 序列化将 `Decimal` 与时间戳转换为 JSON 字符串。对象键排序，JSON 文件以一个换行结尾。真实 Oracle 集成测试必须在该事务中查询 `current_setting`，并断言 `transaction_read_only = 'on'`、`statement_timeout = '10s'` 和 `search_path = 'public, pg_catalog'`。
 
-Expose a synchronous command wrapper that uses `asyncio.run` only at the CLI boundary; internal functions remain async.
+提供同步命令包装器，仅在 CLI 边界使用 `asyncio.run`；内部函数保持异步。
 
-- [ ] **Step 4: Materialize and commit tiny expected results**
+- [x] **步骤 4：物化并提交 tiny 预期结果**
 
-Run:
+运行：
 
 ```bash
 uv run python -m governed_analytics.evals.oracle \
@@ -247,30 +250,30 @@ uv run python -m governed_analytics.evals.oracle \
 uv run pytest tests/integration/evals/test_oracles.py -v
 ```
 
-Expected: twenty JSON files are created and exact seeded anomaly counts pass.
+预期：创建 20 个 JSON 文件，且固定种子异常的精确数量通过。
 
 ```bash
 git add src/governed_analytics/evals/oracle.py evals/datasets/golden/expected tests/integration/evals/test_oracles.py
 git commit -m "test: 固化黄金查询预期结果"
 ```
 
-## Task 3: Model Protocol, Prompt, and Fixture Adapter
+## 任务 3：模型 Protocol、Prompt 与 Fixture 适配器
 
-**Files:**
-- Create: `src/governed_analytics/models/__init__.py`
-- Create: `src/governed_analytics/models/protocols.py`
-- Create: `src/governed_analytics/models/prompts.py`
-- Create: `src/governed_analytics/models/fixtures.py`
-- Create: `evals/fixtures/baseline_sql.json`
-- Create: `tests/unit/models/test_fixture_generator.py`
+**文件：**
+- 新建：`src/governed_analytics/models/__init__.py`
+- 新建：`src/governed_analytics/models/protocols.py`
+- 新建：`src/governed_analytics/models/prompts.py`
+- 新建：`src/governed_analytics/models/fixtures.py`
+- 新建：`evals/fixtures/baseline_sql.json`
+- 新建：`tests/unit/models/test_fixture_generator.py`
 
-**Interfaces:**
-- Consumes: question, schema summary, metric context, fixture SQL.
-- Produces: `SqlGenerationRequest`, `SqlGenerator`, and `FixtureSqlGenerator.generate(request) -> GeneratedSql`.
+**接口：**
+- 输入：问题、Schema 摘要、指标上下文及 fixture SQL。
+- 输出：`SqlGenerationRequest`、`SqlGenerator`，以及 `FixtureSqlGenerator.generate(request) -> GeneratedSql`。
 
-- [ ] **Step 1: Write a network-free fixture adapter test**
+- [x] **步骤 1：编写无网络 fixture 适配器测试**
 
-Create `tests/unit/models/test_fixture_generator.py`:
+创建 `tests/unit/models/test_fixture_generator.py`：
 
 ```python
 import pytest
@@ -297,9 +300,9 @@ async def test_fixture_generator_returns_case_sql_without_network() -> None:
     assert result.output_tokens == 0
 ```
 
-- [ ] **Step 2: Define the model-independent interface**
+- [x] **步骤 2：定义与模型无关的接口**
 
-Create `protocols.py`:
+创建 `protocols.py`：
 
 ```python
 from typing import Protocol
@@ -322,9 +325,9 @@ class SqlGenerator(Protocol):
     async def generate(self, request: SqlGenerationRequest) -> GeneratedSql: ...
 ```
 
-- [ ] **Step 3: Freeze the baseline prompt**
+- [x] **步骤 3：冻结基线 Prompt**
 
-`prompts.py` exports `BASELINE_SYSTEM_PROMPT_V1` with these requirements:
+`prompts.py` 导出满足以下要求的 `BASELINE_SYSTEM_PROMPT_V1`：
 
 ```text
 You generate exactly one PostgreSQL read-only query for the supplied ecommerce question.
@@ -334,43 +337,43 @@ Return one JSON object with keys "sql" and "assumptions".
 The SQL must be one SELECT or WITH query. Do not include Markdown fences.
 ```
 
-`build_baseline_user_prompt(request)` labels the question, schema context, and metric context in a stable order.
+`build_baseline_user_prompt(request)` 以稳定顺序标记问题、Schema 上下文与指标上下文。
 
-- [ ] **Step 4: Add twenty fixture responses**
+- [x] **步骤 4：添加 20 条 fixture 响应**
 
-`evals/fixtures/baseline_sql.json` maps every case ID to its Oracle SQL text. This fixture validates orchestration, safety, execution, scoring, and reporting; its score is never presented as live model quality.
+`evals/fixtures/baseline_sql.json` 将每个用例 ID 映射到对应 Oracle SQL 文本。该 fixture 用于验证编排、安全、执行、评分与报告；其分数绝不能表述为 live 模型质量。
 
-- [ ] **Step 5: Run and commit model boundaries**
+- [x] **步骤 5：运行测试并提交模型边界**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/models/test_fixture_generator.py -v
 uv run mypy src/governed_analytics/models
 ```
 
-Expected: tests and typing pass with no network access.
+预期：在无网络访问的情况下，测试与类型检查通过。
 
 ```bash
 git add src/governed_analytics/models evals/fixtures tests/unit/models
 git commit -m "feat: 隔离基线模型接口与离线夹具"
 ```
 
-## Task 4: Narrow Baseline SQL Guard and Executor
+## 任务 4：窄范围基线 SQL 守卫与执行器
 
-**Files:**
-- Create: `src/governed_analytics/evals/sql_guard.py`
-- Create: `src/governed_analytics/evals/executor.py`
-- Create: `tests/unit/evals/test_sql_guard.py`
-- Create: `tests/integration/evals/test_readonly_executor.py`
+**文件：**
+- 新建：`src/governed_analytics/evals/sql_guard.py`
+- 新建：`src/governed_analytics/evals/executor.py`
+- 新建：`tests/unit/evals/test_sql_guard.py`
+- 新建：`tests/integration/evals/test_readonly_executor.py`
 
-**Interfaces:**
-- Consumes: model-generated SQL.
-- Produces: `validate_baseline_sql(sql) -> str` and `execute_readonly_sql(sql) -> QueryResult`.
+**接口：**
+- 输入：模型生成的 SQL。
+- 输出：`validate_baseline_sql(sql) -> str` 与 `execute_readonly_sql(sql) -> QueryResult`。
 
-- [ ] **Step 1: Write guard allow/deny tests**
+- [x] **步骤 1：编写守卫允许/拒绝测试**
 
-Create `tests/unit/evals/test_sql_guard.py`:
+创建 `tests/unit/evals/test_sql_guard.py`：
 
 ```python
 import pytest
@@ -405,9 +408,9 @@ def test_guard_rejects_unsafe_sql(sql: str) -> None:
         validate_baseline_sql(sql)
 ```
 
-- [ ] **Step 2: Implement AST validation**
+- [x] **步骤 2：实现 AST 验证**
 
-Parse with `sqlglot.parse(sql, read="postgres")`; require exactly one expression and require it to be an `exp.Query`. Reject any descendant of these classes:
+使用 `sqlglot.parse(sql, read="postgres")` 解析；要求恰好一个表达式，且必须为 `exp.Query`。拒绝以下类的任何后代节点：
 
 ```python
 DENIED_NODES = (
@@ -424,7 +427,7 @@ DENIED_NODES = (
 )
 ```
 
-Reject function names:
+拒绝以下函数名：
 
 ```python
 DENIED_FUNCTIONS = frozenset(
@@ -432,59 +435,60 @@ DENIED_FUNCTIONS = frozenset(
 )
 ```
 
-Add or reduce the outer query limit to 500 using SQLGlot AST, then serialize in PostgreSQL dialect. Week 2 replaces this narrow guard with the full policy engine.
+使用 SQLGlot AST 添加外层查询上限或将其缩减为 500，再序列化为 PostgreSQL 方言。第 2 周将用完整策略引擎替换该窄范围守卫。
 
-- [ ] **Step 3: Implement the read-only executor**
+- [x] **步骤 3：实现只读执行器**
 
-Use:
+使用：
 
 ```python
 async with engine.connect() as connection:
     async with connection.begin():
         await connection.execute(text("set transaction read only"))
         await connection.execute(text("set local statement_timeout = '10s'"))
+        await connection.execute(text("set local search_path = public, pg_catalog"))
         result = await connection.execute(text(validated_sql))
         rows = tuple(tuple(row) for row in result.fetchall())
         return QueryResult(columns=tuple(result.keys()), rows=rows)
 ```
 
-Create the engine exclusively from `DatabaseSettings.database_url`.
+engine 只能由只读专用 `DatabaseSettings.database_url` 创建。不得将事务状态添加到通用 engine 工厂。真实 PostgreSQL 执行器集成测试必须通过该执行器事务查询 `current_setting`，并断言 `transaction_read_only = 'on'`、`statement_timeout = '10s'` 及 `search_path = 'public, pg_catalog'`。
 
-- [ ] **Step 4: Prove database permissions backstop the guard**
+- [x] **步骤 4：证明数据库权限是守卫的后备防线**
 
-Create an integration test that monkeypatches `validate_baseline_sql` to return `insert into categories ...` and asserts PostgreSQL raises `InsufficientPrivilege`. This proves a guard bypass still cannot write.
+创建集成测试，将 `validate_baseline_sql` monkeypatch 为返回 `insert into categories ...`，并断言 PostgreSQL 抛出 `InsufficientPrivilege`。这证明即使绕过守卫也无法写入。
 
-- [ ] **Step 5: Run and commit baseline execution safety**
+- [x] **步骤 5：运行测试并提交基线执行安全实现**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/evals/test_sql_guard.py -v
 uv run pytest tests/integration/evals/test_readonly_executor.py -v
 ```
 
-Expected: all allow/deny cases pass and the read-only database rejects DML.
+预期：全部允许/拒绝用例通过，只读数据库拒绝 DML。
 
 ```bash
 git add src/governed_analytics/evals/sql_guard.py src/governed_analytics/evals/executor.py tests/unit/evals/test_sql_guard.py tests/integration/evals/test_readonly_executor.py
 git commit -m "feat: 安全执行只读基线查询"
 ```
 
-## Task 5: Result Scoring and Reports
+## 任务 5：结果评分与报告
 
-**Files:**
-- Create: `src/governed_analytics/evals/scorers.py`
-- Create: `src/governed_analytics/evals/reporting.py`
-- Create: `tests/unit/evals/test_scorers.py`
-- Create: `tests/unit/evals/test_reporting.py`
+**文件：**
+- 新建：`src/governed_analytics/evals/scorers.py`
+- 新建：`src/governed_analytics/evals/reporting.py`
+- 新建：`tests/unit/evals/test_scorers.py`
+- 新建：`tests/unit/evals/test_reporting.py`
 
-**Interfaces:**
-- Consumes: `GoldenCase`, expected `QueryResult`, actual `QueryResult`, and `BaselineCaseResult`.
-- Produces: `score_result(...) -> Decimal`, aggregate `BaselineRunReport`, JSON and Markdown reports.
+**接口：**
+- 输入：`GoldenCase`、预期 `QueryResult`、实际 `QueryResult` 与 `BaselineCaseResult`。
+- 输出：`score_result(...) -> Decimal`、聚合 `BaselineRunReport`、JSON 与 Markdown 报告。
 
-- [ ] **Step 1: Write exact scorer tests**
+- [x] **步骤 1：编写精确评分器测试**
 
-Cover these cases:
+覆盖以下用例：
 
 ```python
 def test_scalar_uses_absolute_cent_tolerance() -> None:
@@ -501,18 +505,18 @@ def test_top_k_returns_overlap_fraction() -> None:
     assert score_top_k(("A", "B", "C"), ("A", "C", "D")) == Decimal("0.666667")
 ```
 
-- [ ] **Step 2: Implement comparison semantics**
+- [x] **步骤 2：实现比较语义**
 
-- scalar: one numeric value within absolute or relative tolerance;
-- table: exact key set, exact nonnumeric cells, numeric tolerance per cell, row order ignored;
-- top_k: key overlap divided by expected K, rounded to six decimals;
-- boolean: exact normalized boolean match.
+- scalar：一个数值，位于绝对或相对容差内；
+- table：键集合精确相同、非数值单元格精确相同、每个数值单元格按容差比较，忽略行顺序；
+- top_k：键重合数除以预期 K，四舍五入到六位小数；
+- boolean：规范化布尔值精确匹配。
 
-Case status is `passed` only when score equals 1. A valid partial `top_k` result remains `wrong_answer` with partial score.
+仅当分数等于 1 时，用例状态才为 `passed`。有效但部分正确的 `top_k` 结果仍标记为 `wrong_answer`，并保留部分分数。
 
-- [ ] **Step 3: Implement aggregate metrics**
+- [x] **步骤 3：实现聚合指标**
 
-Calculate:
+计算：
 
 ```python
 result_accuracy = sum(case.score for case in cases) / Decimal(len(cases))
@@ -521,11 +525,11 @@ execution_success_rate = executed_cases / Decimal(len(cases))
 total_cost_cny = sum(case.estimated_cost_cny for case in cases)
 ```
 
-Round displayed rates to four decimals and costs to six decimals; preserve unrounded per-case values in JSON.
+展示的比率四舍五入到四位小数，成本四舍五入到六位小数；JSON 中保留未舍入的逐用例值。
 
-- [ ] **Step 4: Generate immutable JSON and Markdown reports**
+- [x] **步骤 4：生成不可变 JSON 与 Markdown 报告**
 
-Directory format:
+目录格式：
 
 ```text
 artifacts/evals/baseline/<mode>/<YYYYMMDDTHHMMSSZ>-<run_id>/
@@ -535,50 +539,51 @@ artifacts/evals/baseline/<mode>/<YYYYMMDDTHHMMSSZ>-<run_id>/
     └── G001.json
 ```
 
-Markdown includes dataset ID, prompt version, requested/resolved model, result accuracy, valid SQL rate, execution rate, total/average cost, P50/P95 latency, failure counts, and a 20-row case table. It explicitly labels fixture reports “harness validation, not model quality.”
+Markdown 包含数据集 ID、Prompt 版本、请求/实际模型、结果准确率、有效 SQL 率、执行率、总/平均成本、P50/P95 延迟、失败数量及 20 行用例表。fixture 报告必须明确标注“评测链路验证，不代表模型质量”。
 
-- [ ] **Step 5: Run and commit scoring/reporting**
+- [x] **步骤 5：运行测试并提交评分/报告实现**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/evals/test_scorers.py tests/unit/evals/test_reporting.py -v
 ```
 
-Expected: scorer edge cases and snapshot-normalized report tests pass.
+预期：评分器边界用例与快照规范化报告测试通过。
 
 ```bash
 git add src/governed_analytics/evals/scorers.py src/governed_analytics/evals/reporting.py tests/unit/evals/test_scorers.py tests/unit/evals/test_reporting.py
 git commit -m "feat: 评估基线结果并生成报告"
 ```
 
-## Task 6: OpenAI-Compatible Live Adapter and Cost Accounting
+## 任务 6：OpenAI-compatible Live 适配器与成本核算
 
-**Files:**
-- Create: `src/governed_analytics/models/openai_compatible.py`
-- Create: `src/governed_analytics/evals/pricing.py`
-- Create: `data/pricing/qwen3.7-plus-2026-09-01.yaml`
-- Modify: `src/governed_analytics/config.py`
-- Create: `tests/unit/models/test_openai_compatible.py`
-- Create: `tests/unit/evals/test_pricing.py`
+**文件：**
+- 新建：`src/governed_analytics/models/openai_compatible.py`
+- 新建：`src/governed_analytics/evals/pricing.py`
+- 新建：`data/pricing/deepseek-v4-flash-2026-09-01.yaml`
+- 修改：`src/governed_analytics/config.py`
+- 新建：`tests/unit/models/test_openai_compatible.py`
+- 新建：`tests/unit/evals/test_pricing.py`
 
-**Interfaces:**
-- Consumes: `AsyncOpenAI`, `SqlGenerationRequest`, model settings, pricing YAML.
-- Produces: `OpenAICompatibleSqlGenerator` and `estimate_cost_cny(...) -> Decimal`.
+**接口：**
+- 输入：`AsyncOpenAI`、`SqlGenerationRequest`、模型设置及价格 YAML。
+- 输出：`OpenAICompatibleSqlGenerator` 与 `estimate_cost_cny(...) -> Decimal`。
 
-- [ ] **Step 1: Write a fake SDK response test**
+- [x] **步骤 1：编写伪 SDK 响应测试**
 
-Use a typed fake object whose `chat.completions.create` async method records arguments and returns content:
+使用具有类型的伪对象，其 `chat.completions.create` 异步方法记录参数并返回以下内容：
 
 ```json
 {"sql":"select count(*) as order_count from orders","assumptions":["有效订单口径由指标目录提供"]}
 ```
 
-Assert the adapter sends `model`, stable messages, `temperature=0`, `response_format={"type": "json_object"}`, and `max_completion_tokens=1200`; assert returned usage and provider model are preserved.
+断言适配器发送 `model`、稳定消息、`temperature=0`、`response_format={"type": "json_object"}`、
+`max_tokens=1200` 和 `thinking.type=disabled`；同时断言返回的 usage 与 provider model 得以保留。
 
-- [ ] **Step 2: Implement the adapter with client injection**
+- [x] **步骤 2：通过 client 注入实现适配器**
 
-Add model settings to `src/governed_analytics/config.py`:
+向 `src/governed_analytics/config.py` 添加模型设置：
 
 ```python
 from pydantic import SecretStr
@@ -592,15 +597,15 @@ class ModelSettings(BaseSettings):
         frozen=True,
     )
 
-    model_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    model_base_url: str = "https://api.deepseek.com"
     model_api_key: SecretStr | None = None
-    model_name: str = "qwen3.7-plus"
-    eval_model_name: str = "qwen3.7-plus-2026-05-26"
+    model_name: str = "deepseek-v4-flash"
+    eval_model_name: str = "DeepSeek-V4-Flash-0731"
 ```
 
-The CLI unwraps `model_api_key` only while constructing `AsyncOpenAI`; logs and reports never serialize the `SecretStr`.
+CLI 仅在构造 `AsyncOpenAI` 时解包 `model_api_key`；日志与报告绝不序列化 `SecretStr`。
 
-Constructor:
+构造函数：
 
 ```python
 class OpenAICompatibleSqlGenerator:
@@ -609,7 +614,7 @@ class OpenAICompatibleSqlGenerator:
         self._model = model
 ```
 
-Call the installed SDK surface:
+调用已安装 SDK 的以下接口：
 
 ```python
 response = await self._client.chat.completions.create(
@@ -620,28 +625,32 @@ response = await self._client.chat.completions.create(
     ],
     temperature=0,
     response_format={"type": "json_object"},
-    max_completion_tokens=1200,
+    max_tokens=1200,
+    extra_body={"thinking": {"type": "disabled"}},
 )
 ```
 
-Validate `response.choices[0].message.content` with a private Pydantic response model. Treat missing content, invalid JSON, or absent usage as categorized adapter errors; usage may be zero only in fixture mode.
+使用私有 Pydantic 响应模型验证 `response.choices[0].message.content`。将内容缺失、JSON 无效或 usage 缺失分类为适配器错误；仅 fixture 模式允许 usage 为零。
 
-- [ ] **Step 3: Version Qwen pricing metadata**
+- [x] **步骤 3：版本化 DeepSeek 价格元数据**
 
-Create:
+创建：
 
 ```yaml
-provider: aliyun_model_studio
-model: qwen3.7-plus
+provider: deepseek
+requested_model: deepseek-v4-flash
+resolved_model: DeepSeek-V4-Flash-0731
 effective_date: 2026-09-01
 currency: CNY
 unit_tokens: 1000000
-input_price: "2.00"
-output_price: "8.00"
-source: https://help.aliyun.com/zh/model-studio/model-pricing
+input_price: "2.983596"
+output_price: "8.950788"
+pricing_basis: peak cache-miss upper bound converted at USD/CNY 6.7809
+source: https://api-docs.deepseek.com/quick_start/pricing
+fx_source: https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do
 ```
 
-Cost formula uses `Decimal` only:
+成本公式只使用 `Decimal`：
 
 ```python
 cost = (
@@ -650,40 +659,40 @@ cost = (
 )
 ```
 
-- [ ] **Step 4: Run and commit the live adapter**
+- [x] **步骤 4：运行测试并提交 live 适配器**
 
-Run:
+运行：
 
 ```bash
 uv run pytest tests/unit/models/test_openai_compatible.py tests/unit/evals/test_pricing.py -v
 ```
 
-Expected: fake client arguments, response parsing, and exact Decimal cost tests pass without a network request.
+预期：在不发起网络请求的情况下，伪 client 参数、响应解析及精确 Decimal 成本测试通过。
 
 ```bash
 git add src/governed_analytics/config.py src/governed_analytics/models/openai_compatible.py src/governed_analytics/evals/pricing.py data/pricing tests/unit/models/test_openai_compatible.py tests/unit/evals/test_pricing.py
 git commit -m "feat: 接入兼容模型并记录调用成本"
 ```
 
-## Task 7: Baseline Runner, CLI, CI, and Documentation
+## 任务 7：基线执行器、CLI、CI 与文档
 
-**Files:**
-- Create: `src/governed_analytics/evals/runner.py`
-- Create: `src/governed_analytics/evals/cli.py`
-- Create: `tests/integration/evals/test_baseline_runner.py`
-- Modify: `pyproject.toml`
-- Modify: `Makefile`
-- Modify: `.github/workflows/ci.yml`
-- Create: `docs/evals.md`
-- Modify: `README.md`
+**文件：**
+- 新建：`src/governed_analytics/evals/runner.py`
+- 新建：`src/governed_analytics/evals/cli.py`
+- 新建：`tests/integration/evals/test_baseline_runner.py`
+- 修改：`pyproject.toml`
+- 修改：`Makefile`
+- 修改：`.github/workflows/ci.yml`
+- 新建：`docs/evals.md`
+- 修改：`README.md`
 
-**Interfaces:**
-- Consumes: cases, schema/metric context, fixture or live generator, guard, executor, Oracle results, scorers, pricing.
-- Produces: `governed-eval baseline` and complete baseline reports.
+**接口：**
+- 输入：用例、Schema/指标上下文、fixture 或 live 生成器、守卫、执行器、Oracle 结果、评分器与价格。
+- 输出：`governed-eval baseline` 及完整基线报告。
 
-- [ ] **Step 1: Add the console entry point**
+- [x] **步骤 1：添加控制台入口**
 
-Add:
+添加：
 
 ```toml
 [project.scripts]
@@ -691,9 +700,9 @@ governed-data = "governed_analytics.data_generation.cli:main"
 governed-eval = "governed_analytics.evals.cli:main"
 ```
 
-- [ ] **Step 2: Write the fixture runner integration test**
+- [x] **步骤 2：编写 fixture 执行器集成测试**
 
-Create `tests/integration/evals/test_baseline_runner.py`:
+创建 `tests/integration/evals/test_baseline_runner.py`：
 
 ```python
 from pathlib import Path
@@ -716,31 +725,31 @@ async def test_fixture_baseline_executes_all_cases_without_cost(tmp_path: Path) 
     assert all(case.status == "passed" for case in report.cases)
 ```
 
-- [ ] **Step 3: Implement one-pass case execution**
+- [x] **步骤 3：实现单次通过的用例执行**
 
-For each case, exactly once:
+对每个用例严格执行一次：
 
-1. create `SqlGenerationRequest`;
-2. call `generator.generate` once;
-3. validate SQL once;
-4. execute SQL once;
-5. compare to committed Oracle result;
-6. record result, latency, usage, cost, and any failure category.
+1. 创建 `SqlGenerationRequest`；
+2. 调用一次 `generator.generate`；
+3. 验证一次 SQL；
+4. 执行一次 SQL；
+5. 与已提交的 Oracle 结果比较；
+6. 记录结果、延迟、usage、成本及任何失败类别。
 
-Catch and classify only at the case boundary. Continue to the next case after a failure. Do not retry or repair SQL in Week 1.
+只在用例边界捕获并分类异常。失败后继续下一个用例。第 1 周不得重试或修复 SQL。
 
-- [ ] **Step 4: Enforce live authorization in the CLI**
+- [x] **步骤 4：在 CLI 中强制执行 live 授权**
 
-CLI surface:
+CLI 接口：
 
 ```text
 governed-eval baseline --dataset tiny --mode fixture
 governed-eval baseline --dataset tiny --mode live --live
 ```
 
-If mode is live and `--live` is absent, exit 2 with `Live model calls require --live`. If the key is absent, exit 2 with `MODEL_API_KEY is not configured`. Reject full dataset baseline in Week 1.
+若模式为 live 但缺少 `--live`，以状态码 2 退出并提示 `Live model calls require --live`。若 Key 缺失，以状态码 2 退出并提示 `MODEL_API_KEY is not configured`。第 1 周拒绝对 full 数据集运行基线。
 
-- [ ] **Step 5: Add fixture-only Make and CI commands**
+- [x] **步骤 5：添加仅限 fixture 的 Make 与 CI 命令**
 
 ```make
 .PHONY: eval-fixture
@@ -749,23 +758,23 @@ eval-fixture:
 	@uv run governed-eval baseline --dataset tiny --mode fixture
 ```
 
-Add to CI after tiny data/metric checks:
+在 CI 的 tiny 数据/指标检查之后添加：
 
 ```yaml
       - run: uv run governed-eval baseline --dataset tiny --mode fixture
 ```
 
-Do not add `MODEL_API_KEY` to CI and do not run live mode.
+不得向 CI 添加 `MODEL_API_KEY`，也不得运行 live 模式。
 
-- [ ] **Step 6: Document report interpretation and OpenAI-compatible boundary**
+- [x] **步骤 6：记录报告解读与 OpenAI-compatible 边界**
 
-`docs/evals.md` documents case schema, Oracle materialization, scorer semantics, failure categories, fixture/live distinction, price snapshot, explicit live authorization, and the fact that live results are the baseline—not fixture 100%.
+`docs/evals.md` 记录用例 Schema、Oracle 物化、评分器语义、失败类别、fixture/live 区别、价格快照、显式 live 授权，以及“live 结果才是基线，fixture 的 100% 不是模型成绩”这一事实。
 
-Reference the official Chat Completions surface used by the adapter: `https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions`.
+引用适配器使用的官方 Chat Completions 接口：`https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions`。
 
-- [ ] **Step 7: Run the complete Plan C gate**
+- [x] **步骤 7：运行完整 Plan C 门禁**
 
-Run:
+运行：
 
 ```bash
 make db-up
@@ -778,22 +787,22 @@ uv run pytest tests/integration/evals -v
 git diff --check
 ```
 
-Expected: twenty fixture cases pass, no external call occurs, all quality checks pass, and reports are generated under ignored artifacts.
+预期：20 个 fixture 用例通过，不发起外部调用，全部质量检查通过，报告生成在被忽略的 artifacts 下。
 
-- [ ] **Step 8: Commit Plan C workflow**
+- [x] **步骤 8：提交 Plan C 工作流**
 
 ```bash
 git add pyproject.toml uv.lock src/governed_analytics/evals src/governed_analytics/models Makefile .github/workflows/ci.yml docs/evals.md README.md
 git commit -m "feat: 建立可复现 Text-to-SQL 基线"
 ```
 
-## Plan C Completion Gate
+## Plan C 完成门禁
 
-- [ ] Twenty case definitions, twenty Oracle SQL files, and twenty expected JSON files are versioned.
-- [ ] Exact anomaly cases return seeded counts `20`, `10`, and `3` for G018-G020 on tiny data.
-- [ ] Fixture mode executes all twenty cases with zero tokens, zero CNY cost, and no network.
-- [ ] Unsafe/multiple SQL is rejected before execution; PostgreSQL permissions independently reject DML.
-- [ ] Reports include accuracy, valid SQL rate, execution rate, P50/P95 latency, tokens, cost, and all failures.
-- [ ] Live calls require explicit double authorization and never run in CI.
-- [ ] The first authorized live report is retained even if its accuracy is poor.
-- [ ] No LangGraph or repair loop is present, preserving the value of this baseline comparison.
+- [x] 20 个用例定义、20 个 Oracle SQL 文件及 20 个预期 JSON 文件均已版本化。
+- [x] 在 tiny 数据上，精确异常用例 G018–G020 分别返回固定种子数量 `20`、`10`、`3`。
+- [x] fixture 模式执行全部 20 个用例，Token 为零、人民币成本为零、无网络访问。
+- [x] 不安全/多语句 SQL 在执行前被拒；PostgreSQL 权限独立拒绝 DML。
+- [x] 报告包含准确率、有效 SQL 率、执行率、P50/P95 延迟、Token、成本及全部失败。
+- [x] live 调用需要显式双重授权，且绝不在 CI 中运行。
+- [x] 首次获授权的 live 报告即使准确率很差也要保留。
+- [x] 不存在 LangGraph 或修复循环，从而保留该基线比较的价值。

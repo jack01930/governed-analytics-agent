@@ -6,9 +6,10 @@
 
 ## 结论
 
-项目仓库和本地开发环境已经具备开始第一周实现的条件。目前没有开工硬阻塞。
+项目仓库和本地开发环境已经通过第 1 周离线实现与复核。目前没有进入第 2 周的硬阻塞。
 
-模型 API Key 在真实模型联调前补齐即可；本机 `psql` 属于可选项，不阻塞开发，因为可以使用 PostgreSQL 容器内的客户端。
+DeepSeek API Key 已按用户授权写入被 Git 忽略的本地 `.env`，并已完成 v1/v2 live 基线；本机 `psql`
+属于可选项，不阻塞开发，因为可以使用 PostgreSQL 容器内的客户端。
 
 ## 已就绪
 
@@ -30,13 +31,14 @@
 
 ## 尚需处理
 
-### 1. 配置模型 API Key——真实模型联调前必须
+### 1. 配置模型 API Key——已完成
 
 ```bash
 cp .env.example .env
 ```
 
-然后只编辑本地 `.env` 中的 `MODEL_API_KEY`。检查脚本只判断是否存在，不输出密钥。任何真实密钥都不得写入 `.env.example`、文档、测试夹具或 Git 历史。
+本机 `.env` 已配置 `MODEL_API_KEY`。检查脚本只判断是否存在，不输出密钥。任何真实密钥都不得写入
+`.env.example`、文档、测试夹具或 Git 历史。
 
 ### 2. 本机 psql——可选
 
@@ -54,7 +56,7 @@ psql --version
 
 远程仓库使用 `jack01930/governed-analytics-agent`，初始可见性为 private。达到第 3～4 周可投递 MVP 且通过安全检查后，再由用户确认是否改为 public。
 
-## 开工门禁
+## 第 1 周启动门禁（历史记录）
 
 开始第 1 周功能实现前：
 
@@ -67,7 +69,7 @@ psql --version
 - [x] Git 作者信息已配置
 - [x] 使用 `uv` 管理 Python 依赖
 - [x] 创建 `pyproject.toml` 和锁文件
-- [ ] 真实模型联调前配置 API Key
+- [x] 真实模型联调前配置 API Key
 - [x] GitHub 远程仓库使用 private 可见性
 
 运行以下命令可随时复查：

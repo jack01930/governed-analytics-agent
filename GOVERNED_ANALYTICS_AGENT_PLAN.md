@@ -1,10 +1,11 @@
 # Governed Analytics Agent 项目计划设计文档
 
 > 面向电商运营的可治理数据分析智能体
-> 文档版本：v1.0
+> 文档版本：v1.1
 > 制定日期：2026-09-01
+> 最近同步：2026-09-03
 > 项目周期：8 周
-> 当前阶段：项目脚手架与启动环境完成，业务功能尚未开始实现
+> 当前阶段：第 1 周 Baseline 与 DeepSeek v1/v2 live 已完成；依据 v2 实测进入第 2 周评测有效性与安全工具层
 
 ---
 
@@ -21,7 +22,8 @@
 5. 8 周实施计划；
 6. 项目验收、作品集与面试交付要求。
 
-本项目当前只完成规划。除非用户另行明确要求，不得据此自动创建云资源、产生付费、公开发布服务或开始大规模实现。
+本项目已完成第 1 周离线实现与 DeepSeek v1/v2 live 基线，正在执行由实测导出的第 2 周安全工具层。除非用户另行明确要求，
+不得自动创建云资源、产生付费或公开发布服务。
 
 ---
 
@@ -107,7 +109,7 @@ Agent 应完成：
 - 固定黄金评测问题；
 - 安全攻击用例；
 - 故障注入用例；
-- 千问 API Key 或兼容的模型 API Key。
+- DeepSeek API Key（仅用于显式授权的 live 基线）。
 
 ## 4. 范围内事项
 
@@ -187,8 +189,8 @@ Agent 应完成：
 - 第 3～4 周必须形成可投递 MVP；
 - 第 6 周完成核心版；
 - 第 8 周完成扩展与求职材料；
-- 模型开发别名：qwen3.7-plus；
-- 正式评测快照：qwen3.7-plus-2026-05-26；
+- 模型开发别名：deepseek-v4-flash；
+- 正式评测版本快照：DeepSeek-V4-Flash-0731；
 - 模型层必须通过 OpenAI-compatible 接口抽象；
 - 总 API 与部署预算目标：200～500 元；
 - 单任务平均模型成本目标：不高于 0.3 元；
@@ -251,7 +253,7 @@ Agent 应完成：
 
 ### 10.1 假设
 
-- 用户能获得一个可用的千问或 OpenAI-compatible API Key；
+- 用户能获得一个可用的 DeepSeek API Key；
 - 用户电脑可运行 PostgreSQL、FastAPI 和 Streamlit 容器；
 - 30 万订单规模可在目标机器上稳定运行；
 - 公开 Demo 可以使用受限模拟数据；
@@ -302,8 +304,8 @@ Agent 应完成：
 - OpenTelemetry 或兼容 Trace
 - MCP Python SDK/FastMCP
 - OpenAI-compatible 模型适配层
-- 开发模型 qwen3.7-plus
-- 评测模型快照 qwen3.7-plus-2026-05-26
+- 开发模型 deepseek-v4-flash（非思考模式）
+- 评测版本快照 DeepSeek-V4-Flash-0731
 
 三、架构原则
 
@@ -405,19 +407,19 @@ Agent 应完成：
 
 核心指标：
 
-- Result Accuracy
-- Task Success Rate
-- Safety Block Rate
-- Recovery Rate
+- 结果准确率（Result Accuracy）
+- 任务成功率（Task Success Rate）
+- 安全拦截率（Safety Block Rate）
+- 恢复率（Recovery Rate）
 - 平均成本
 - P50/P95 延迟
 
 初始目标：
 
-- Result Accuracy >= 80%
-- Task Success Rate >= 85%
-- Safety Block Rate = 100%
-- Recovery Rate >= 80%
+- 结果准确率（Result Accuracy）>= 80%
+- 任务成功率（Task Success Rate）>= 85%
+- 安全拦截率（Safety Block Rate）= 100%
+- 恢复率（Recovery Rate）>= 80%
 - 平均单任务成本 <= 0.3 元
 - P95 延迟 <= 45 秒
 
@@ -1263,7 +1265,7 @@ Streamlit 不得直接导入数据库或 Agent 模块，只能调用 FastAPI。
 
 ## 36. 评分方式
 
-### 36.1 Result Accuracy
+### 36.1 结果准确率（Result Accuracy）
 
 - 标量允许配置误差；
 - 表格按列选择后排序比较；
@@ -1271,7 +1273,7 @@ Streamlit 不得直接导入数据库或 Agent 模块，只能调用 FastAPI。
 - 时间范围必须一致；
 - 不只检查 SQL 是否执行成功。
 
-### 36.2 Task Success
+### 36.2 任务成功率（Task Success）
 
 组合评分：
 
@@ -1282,7 +1284,7 @@ Streamlit 不得直接导入数据库或 Agent 模块，只能调用 FastAPI。
 - 未执行禁止动作；
 - 最终输出完整。
 
-### 36.3 Tool Correctness
+### 36.3 工具正确率（Tool Correctness）
 
 通过 Trace 做确定性检查：
 
@@ -1493,20 +1495,29 @@ governed-analytics-agent/
 
 任务：
 
+- 版本化保留 core v1，并建立每题自包含的 core-v2；
+- 把结果正确率与输出字段契约合规率拆分报告；
 - 实现 Schema Tool；
+- 实现 Metric Tool；
 - 实现 Profile Tool；
-- 实现 SQLGlot 策略；
+- 实现分层 SQLGlot 策略，区分只读安全与固定评测确定性；
 - 配置数据库只读角色；
 - 实现超时、行数限制和脱敏；
 - 实现 Execute SQL Tool；
-- 完成安全单元测试。
+- 完成正常查询误杀测试与安全攻击测试；
+- 扩展 paraphrase、boundary、safety 三个独立评测套件。
 
 门禁：
 
 - 所有 DDL/DML 测试被拒绝；
 - 多语句被拒绝；
-- 普通查询可运行；
+- 普通查询可运行，合法只读语料误杀率为 0%；
 - 数据库账号本身无法写入。
+
+2026-09-03 DeepSeek v2 裸基线为 5/20，14/20 SQL 可执行。实测还发现六条 core 问题依赖未提供的前文、
+`MAX` / `EXISTS` 合法查询被窄 Guard 误杀、scalar 列别名影响结果分，以及复杂归因输出达到 token 上限。
+本周先修正这些测量与策略边界，再用 Schema/Metric/Profile/Execute Tool 改善真实语义错误。完整证据与优先级见
+`docs/reports/week-1-deepseek-live-v2-analysis-2026-09-03.md`。
 
 ## 第 3 周：LangGraph 与 FastAPI
 
@@ -1745,9 +1756,9 @@ MCP、第二模型和公开云部署可以延期，不能牺牲核心质量。
 
 - LangGraph SQL Agent 官方教程：https://docs.langchain.com/oss/python/langgraph/sql-agent
 - OpenAI Agents SDK 官方概览：https://developers.openai.com/api/docs/guides/agents
-- Qwen Function Calling：https://help.aliyun.com/zh/model-studio/qwen-function-calling
-- Qwen3.7 Plus 模型信息：https://help.aliyun.com/zh/model-studio/qwen3-7-plus
-- 阿里云百炼模型价格：https://help.aliyun.com/zh/model-studio/model-pricing
+- DeepSeek API 快速开始：https://api-docs.deepseek.com/
+- DeepSeek Chat Completions：https://api-docs.deepseek.com/api/create-chat-completion/
+- DeepSeek 模型与价格：https://api-docs.deepseek.com/quick_start/pricing/
 - MCP Python SDK：https://github.com/modelcontextprotocol/python-sdk
 - WrenAI：https://github.com/Canner/WrenAI
 - DB-GPT：https://github.com/eosphoros-ai/DB-GPT

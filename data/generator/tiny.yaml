@@ -1,0 +1,8 @@
+scale: tiny
+seed: 20260901
+start_at: 2025-01-01T00:00:00Z
+end_at: 2026-07-01T00:00:00Z
+customers: 500
+products: 100
+orders: 3000
+campaigns: 6

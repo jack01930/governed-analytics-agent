@@ -1,0 +1,239 @@
+{
+  "cases": [
+    {
+      "case_id": "G001",
+      "error_type": null,
+      "estimated_cost_cny": "0.011940351192",
+      "generated_sql": "select sum(oi.net_amount) as gmv from orders o join order_items oi on o.order_id = oi.order_id where o.ordered_at >= '2026-06-08T00:00:00Z' and o.ordered_at < '2026-06-15T00:00:00Z' and o.status in ('paid','completed','refunded')",
+      "input_tokens": 3435,
+      "latency_ms": 5402,
+      "output_tokens": 189,
+      "score": "1",
+      "status": "passed"
+    },
+    {
+      "case_id": "G002",
+      "error_type": "sql_rejected",
+      "estimated_cost_cny": "0.013071134076",
+      "generated_sql": "WITH current_week AS (SELECT COALESCE(SUM(oi.net_amount), 0) AS gmv FROM orders o JOIN order_items oi ON o.order_id = oi.order_id WHERE o.status IN ('paid', 'completed', 'refunded') AND o.ordered_at >= date_trunc('week', CURRENT_DATE) - INTERVAL '1 week' AND o.ordered_at < date_trunc('week', CURRENT_DATE)), previous_week AS (SELECT COALESCE(SUM(oi.net_amount), 0) AS gmv FROM orders o JOIN order_items oi ON o.order_id = oi.order_id WHERE o.status IN ('paid', 'completed', 'refunded') AND o.ordered_at >= date_trunc('week', CURRENT_DATE) - INTERVAL '2 weeks' AND o.ordered_at < date_trunc('week', CURRENT_DATE) - INTERVAL '1 week') SELECT current_week.gmv - previous_week.gmv AS gmv_change FROM current_week, previous_week;",
+      "input_tokens": 3424,
+      "latency_ms": 2565,
+      "output_tokens": 319,
+      "score": "0",
+      "status": "invalid_sql"
+    },
+    {
+      "case_id": "G003",
+      "error_type": null,
+      "estimated_cost_cny": "0.014118376272",
+      "generated_sql": "WITH weekly_gmv AS (SELECT o.region, SUM(oi.net_amount) AS gmv FROM orders o JOIN order_items oi ON o.order_id = oi.order_id WHERE o.ordered_at >= '2025-03-03T00:00:00Z' AND o.ordered_at < '2025-03-10T00:00:00Z' AND o.status IN ('paid', 'completed', 'refunded') GROUP BY o.region), prev_week_gmv AS (SELECT o.region, SUM(oi.net_amount) AS gmv FROM orders o JOIN order_items oi ON o.order_id = oi.order_id WHERE o.ordered_at >= '2025-02-24T00:00:00Z' AND o.ordered_at < '2025-03-03T00:00:00Z' AND o.status IN ('paid', 'completed', 'refunded') GROUP BY o.region) SELECT COALESCE(p.region, w.region) AS region, COALESCE(p.gmv, 0) AS prev_gmv, COALESCE(w.gmv, 0) AS curr_gmv, COALESCE(w.gmv, 0) - COALESCE(p.gmv, 0) AS gmv_change FROM prev_week_gmv p FULL OUTER JOIN weekly_gmv w ON p.region = w.region ORDER BY gmv_change ASC;",
+      "input_tokens": 3424,
+      "latency_ms": 3455,
+      "output_tokens": 436,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G004",
+      "error_type": "sql_rejected",
+      "estimated_cost_cny": "0.014673325128",
+      "generated_sql": "WITH weekly_gmv AS (SELECT date_trunc('week', o.ordered_at) AS week, p.product_id, p.product_name, SUM(oi.net_amount) AS gmv FROM orders o JOIN order_items oi ON o.order_id = oi.order_id JOIN products p ON oi.product_id = p.product_id WHERE o.status IN ('paid', 'completed', 'refunded') AND o.ordered_at >= date_trunc('week', now()) - interval '1 week' AND o.ordered_at < date_trunc('week', now()) GROUP BY week, p.product_id, p.product_name), prev_week_gmv AS (SELECT p.product_id, p.product_name, SUM(oi.net_amount) AS gmv FROM orders o JOIN order_items oi ON o.order_id = oi.order_id JOIN products p ON oi.product_id = p.product_id WHERE o.status IN ('paid', 'completed', 'refunded') AND o.ordered_at >= date_trunc('week', now()) - interval '2 weeks' AND o.ordered_at < date_trunc('week', now()) - interval '1 week' GROUP BY p.product_id, p.product_name), diff AS (SELECT COALESCE(w.product_id, p.product_id) AS product_id, COALESCE(w.product_name, p.product_name) AS product_name, COALESCE(w.gmv, 0) - COALESCE(p.gmv, 0) AS gmv_change FROM weekly_gmv w FULL OUTER JOIN prev_week_gmv p ON w.product_id = p.product_id) SELECT product_id, product_name, gmv_change FROM diff WHERE gmv_change < 0 ORDER BY gmv_change ASC LIMIT 10;",
+      "input_tokens": 3424,
+      "latency_ms": 3869,
+      "output_tokens": 498,
+      "score": "0",
+      "status": "invalid_sql"
+    },
+    {
+      "case_id": "G005",
+      "error_type": "sql_rejected",
+      "estimated_cost_cny": "0.015583321908",
+      "generated_sql": "WITH weekly_gmv AS (SELECT c.segment, date_trunc('week', o.ordered_at) AS week_start, SUM(oi.net_amount) AS gmv FROM orders o JOIN order_items oi ON o.order_id = oi.order_id JOIN customers c ON o.customer_id = c.customer_id WHERE o.status IN ('paid', 'completed', 'refunded') AND o.ordered_at >= date_trunc('week', now()) - interval '1 week' AND o.ordered_at < date_trunc('week', now()) GROUP BY c.segment, date_trunc('week', o.ordered_at)), prev_week_gmv AS (SELECT c.segment, SUM(oi.net_amount) AS gmv FROM orders o JOIN order_items oi ON o.order_id = oi.order_id JOIN customers c ON o.customer_id = c.customer_id WHERE o.status IN ('paid', 'completed', 'refunded') AND o.ordered_at >= date_trunc('week', now()) - interval '2 weeks' AND o.ordered_at < date_trunc('week', now()) - interval '1 week' GROUP BY c.segment), current_week AS (SELECT segment, gmv FROM weekly_gmv WHERE week_start = date_trunc('week', now())), prev_week AS (SELECT segment, gmv FROM weekly_gmv WHERE week_start = date_trunc('week', now()) - interval '1 week') SELECT COALESCE(c.segment, 'unknown') AS segment, COALESCE(c.gmv, 0) AS current_gmv, COALESCE(p.gmv, 0) AS prev_gmv, COALESCE(c.gmv, 0) - COALESCE(p.gmv, 0) AS gmv_change, CASE WHEN COALESCE(p.gmv, 0) = 0 THEN NULL ELSE (COALESCE(c.gmv, 0) - COALESCE(p.gmv, 0)) / NULLIF(COALESCE(p.gmv, 0), 0) END AS contribution_pct FROM (SELECT segment, gmv FROM current_week) c FULL OUTER JOIN (SELECT segment, gmv FROM prev_week) p ON c.segment = p.segment ORDER BY gmv_change DESC;",
+      "input_tokens": 3426,
+      "latency_ms": 4435,
+      "output_tokens": 599,
+      "score": "0",
+      "status": "invalid_sql"
+    },
+    {
+      "case_id": "G006",
+      "error_type": "generation_invalid_json",
+      "estimated_cost_cny": "0.020950811112",
+      "generated_sql": null,
+      "input_tokens": 3422,
+      "latency_ms": 6161,
+      "output_tokens": 1200,
+      "score": "0",
+      "status": "invalid_sql"
+    },
+    {
+      "case_id": "G007",
+      "error_type": null,
+      "estimated_cost_cny": "0.011424189084",
+      "generated_sql": "SELECT COALESCE(SUM(p.amount),0) AS paid_gmv FROM payments p JOIN orders o ON p.order_id = o.order_id WHERE p.status = 'succeeded' AND p.paid_at >= '2026-06-01T00:00:00Z' AND p.paid_at < '2026-07-01T00:00:00Z'",
+      "input_tokens": 3427,
+      "latency_ms": 1818,
+      "output_tokens": 134,
+      "score": "1",
+      "status": "passed"
+    },
+    {
+      "case_id": "G008",
+      "error_type": null,
+      "estimated_cost_cny": "0.012957757428",
+      "generated_sql": "WITH order_payments AS (SELECT p.order_id, SUM(p.amount) AS amount FROM payments p JOIN orders o ON o.order_id = p.order_id WHERE o.ordered_at >= '2026-05-01T00:00:00Z' AND o.ordered_at < '2026-06-01T00:00:00Z' AND p.status = 'succeeded' GROUP BY p.order_id), order_refunds AS (SELECT r.order_id, SUM(r.amount) AS amount FROM refunds r JOIN orders o ON o.order_id = r.order_id WHERE o.ordered_at >= '2026-05-01T00:00:00Z' AND o.ordered_at < '2026-06-01T00:00:00Z' AND r.status = 'succeeded' GROUP BY r.order_id) SELECT COALESCE((SELECT SUM(amount) FROM order_payments), 0) - COALESCE((SELECT SUM(amount) FROM order_refunds), 0) AS value",
+      "input_tokens": 3425,
+      "latency_ms": 2546,
+      "output_tokens": 306,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G009",
+      "error_type": null,
+      "estimated_cost_cny": "0.013817033076",
+      "generated_sql": "WITH order_payments AS (SELECT p.order_id, SUM(p.amount) AS amount FROM payments p JOIN orders o ON o.order_id = p.order_id WHERE o.ordered_at >= '2026-05-04T00:00:00Z' AND o.ordered_at < '2026-05-11T00:00:00Z' AND p.status = 'succeeded' GROUP BY p.order_id), order_refunds AS (SELECT r.order_id, SUM(r.amount) AS amount FROM refunds r JOIN orders o ON o.order_id = r.order_id WHERE o.ordered_at >= '2026-05-04T00:00:00Z' AND o.ordered_at < '2026-05-11T00:00:00Z' AND r.status = 'succeeded' GROUP BY r.order_id), category_refund_rate AS (SELECT c.category_id, c.category_name, COALESCE((SELECT SUM(amount) FROM order_refunds), 0) / NULLIF((SELECT SUM(amount) FROM order_payments), 0) AS refund_rate FROM categories c) SELECT category_name, refund_rate FROM category_refund_rate ORDER BY refund_rate DESC NULLS LAST LIMIT 10;",
+      "input_tokens": 3428,
+      "latency_ms": 3451,
+      "output_tokens": 401,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G010",
+      "error_type": null,
+      "estimated_cost_cny": "0.011686745532",
+      "generated_sql": "SELECT r.reason, COUNT(*) AS cnt FROM refunds r JOIN orders o ON r.order_id = o.order_id WHERE r.status = 'succeeded' AND o.ordered_at >= '2024-01-01T00:00:00Z' AND o.ordered_at < '2024-01-08T00:00:00Z' GROUP BY r.reason ORDER BY cnt DESC LIMIT 1;",
+      "input_tokens": 3422,
+      "latency_ms": 2090,
+      "output_tokens": 165,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G011",
+      "error_type": null,
+      "estimated_cost_cny": "0.011489828196",
+      "generated_sql": "SELECT channel, COUNT(*) FILTER (WHERE converted)::numeric / NULLIF(COUNT(*), 0) AS conversion_rate FROM web_sessions WHERE occurred_at >= '2026-06-08T00:00:00Z' AND occurred_at < '2026-06-15T00:00:00Z' GROUP BY channel",
+      "input_tokens": 3428,
+      "latency_ms": 2678,
+      "output_tokens": 141,
+      "score": "1",
+      "status": "passed"
+    },
+    {
+      "case_id": "G012",
+      "error_type": null,
+      "estimated_cost_cny": "0.011776253412",
+      "generated_sql": "SELECT p.product_id, p.product_name FROM inventory_snapshots i JOIN products p ON p.product_id = i.product_id WHERE i.snapshot_at >= '2026-06-08T00:00:00Z' AND i.snapshot_at < '2026-06-15T00:00:00Z' AND i.available_qty = 0 GROUP BY p.product_id, p.product_name ORDER BY p.product_id;",
+      "input_tokens": 3428,
+      "latency_ms": 2345,
+      "output_tokens": 173,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G013",
+      "error_type": null,
+      "estimated_cost_cny": "0.011573368884",
+      "generated_sql": "SELECT COUNT(DISTINCT o.customer_id) AS active_customers FROM orders o WHERE o.ordered_at >= '2026-06-01T00:00:00Z' AND o.ordered_at < '2026-07-01T00:00:00Z' AND o.status IN ('paid', 'completed', 'refunded')",
+      "input_tokens": 3426,
+      "latency_ms": 2148,
+      "output_tokens": 151,
+      "score": "1",
+      "status": "passed"
+    },
+    {
+      "case_id": "G014",
+      "error_type": null,
+      "estimated_cost_cny": "0.011448057852",
+      "generated_sql": "select count(distinct customer_id) as value from customers where registered_at >= '2026-06-01T00:00:00Z' and registered_at < '2026-07-01T00:00:00Z'",
+      "input_tokens": 3426,
+      "latency_ms": 1646,
+      "output_tokens": 137,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G015",
+      "error_type": null,
+      "estimated_cost_cny": "0.012725036940",
+      "generated_sql": "WITH active_customers AS (SELECT DISTINCT o.customer_id FROM orders o WHERE o.ordered_at >= '2025-07-01' AND o.ordered_at < '2026-07-01' AND o.status IN ('paid','completed','refunded')), lifetime_orders AS (SELECT o.customer_id FROM orders o WHERE o.ordered_at < '2026-07-01' AND o.status IN ('paid','completed','refunded') GROUP BY o.customer_id HAVING COUNT(DISTINCT o.order_id) >= 2) SELECT COUNT(lo.customer_id)::numeric / NULLIF(COUNT(ac.customer_id),0) AS repeat_purchase_rate FROM active_customers ac LEFT JOIN lifetime_orders lo ON lo.customer_id = ac.customer_id;",
+      "input_tokens": 3428,
+      "latency_ms": 2649,
+      "output_tokens": 279,
+      "score": "1",
+      "status": "passed"
+    },
+    {
+      "case_id": "G016",
+      "error_type": null,
+      "estimated_cost_cny": "0.012933888660",
+      "generated_sql": "WITH interval_revenue AS (SELECT a.campaign_id, SUM(a.attributed_revenue) AS revenue FROM campaign_attributions a WHERE a.attributed_at >= '2026-04-01T00:00:00Z' AND a.attributed_at < '2026-07-01T00:00:00Z' GROUP BY a.campaign_id), campaign_spend AS (SELECT mc.campaign_id, mc.spend FROM marketing_campaigns mc JOIN interval_revenue ir ON ir.campaign_id = mc.campaign_id) SELECT mc.campaign_id, mc.campaign_name, (ir.revenue - cs.spend) / NULLIF(cs.spend, 0) AS roi FROM interval_revenue ir JOIN campaign_spend cs ON ir.campaign_id = cs.campaign_id JOIN marketing_campaigns mc ON mc.campaign_id = ir.campaign_id ORDER BY roi DESC;",
+      "input_tokens": 3426,
+      "latency_ms": 3145,
+      "output_tokens": 303,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G017",
+      "error_type": "sql_rejected",
+      "estimated_cost_cny": "0.011430156276",
+      "generated_sql": "select case when max(snapshot_at) >= '2026-06-15'::date and max(snapshot_at) < '2026-06-16'::date then 'yes' else 'no' end as is_updated from inventory_snapshots where snapshot_at >= '2026-06-15'::date and snapshot_at < '2026-06-16'::date",
+      "input_tokens": 3426,
+      "latency_ms": 1884,
+      "output_tokens": 135,
+      "score": "0",
+      "status": "invalid_sql"
+    },
+    {
+      "case_id": "G018",
+      "error_type": null,
+      "estimated_cost_cny": "0.011519664156",
+      "generated_sql": "select count(*) as duplicate_order_item_count from (select order_id, product_id, source_line_id, count(*) as cnt from order_items where order_id in (select order_id from orders where ordered_at >= '2026-04-10 00:00:00' and ordered_at < '2026-04-11 00:00:00') group by order_id, product_id, source_line_id having count(*) > 1) as dup;",
+      "input_tokens": 3426,
+      "latency_ms": 2545,
+      "output_tokens": 145,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G019",
+      "error_type": null,
+      "estimated_cost_cny": "0.011647958784",
+      "generated_sql": "SELECT COUNT(*) AS mismatched_orders FROM orders o WHERE o.ordered_at >= '2026-03-17T00:00:00Z' AND o.ordered_at < '2026-03-18T00:00:00Z' AND o.payable_amount <> (SELECT COALESCE(SUM(oi.net_amount), 0) FROM order_items oi WHERE oi.order_id = o.order_id);",
+      "input_tokens": 3427,
+      "latency_ms": 1878,
+      "output_tokens": 159,
+      "score": "0",
+      "status": "wrong_answer"
+    },
+    {
+      "case_id": "G020",
+      "error_type": "sql_rejected",
+      "estimated_cost_cny": "0.012820512012",
+      "generated_sql": "SELECT COUNT(*) AS value FROM orders o WHERE o.ordered_at >= '2026-05-20T00:00:00Z' AND o.ordered_at < '2026-05-21T00:00:00Z' AND o.status = 'refunded' AND EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.order_id AND p.status = 'succeeded') AND EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.order_id AND r.status = 'succeeded') AND (SELECT COALESCE(SUM(r.amount), 0) FROM refunds r WHERE r.order_id = o.order_id AND r.status = 'succeeded') > (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.order_id = o.order_id AND p.status = 'succeeded');",
+      "input_tokens": 3427,
+      "latency_ms": 4642,
+      "output_tokens": 290,
+      "score": "0",
+      "status": "invalid_sql"
+    }
+  ],
+  "dataset_id": "a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2",
+  "execution_success_rate": "0.7",
+  "mode": "live",
+  "model": "deepseek-v4-flash",
+  "pricing_basis": "peak cache-miss upper bound converted at USD/CNY 6.7809",
+  "pricing_effective_date": "2026-09-01",
+  "prompt_version": "baseline-system-v2+ecommerce-schema-v1+metrics-v1+sha256:ca0f1d30dcb41c9c6634ac0bfb15e65ac2283ae4ccbfc11897b8e164dd681e25",
+  "requested_model": "deepseek-v4-flash",
+  "resolved_models": [
+    "deepseek-v4-flash"
+  ],
+  "result_accuracy": "0.25",
+  "run_id": "65c87bf0355047a9b23243f70756e3f4",
+  "total_cost_cny": "0.259587769980",
+  "valid_sql_rate": "0.7"
+}

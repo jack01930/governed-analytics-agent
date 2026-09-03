@@ -1,0 +1,35 @@
+{
+  "schema_version": "governed-analytics-live-evidence-manifest-v1",
+  "created_at": "2026-09-04T00:03:54+08:00",
+  "source_git_head": "3667995a5583b4deb628c0db8c95fe2151a2426c",
+  "archive_commit": "recorded by the Git commit containing this manifest",
+  "redacted": true,
+  "redaction_policy": "exclude credentials, authorization data, environment values and full provider responses; retain generated SQL over synthetic data",
+  "runs": [
+    {
+      "label": "v1",
+      "run_id": "bf0e1dba448245e98988805103fd950d",
+      "dataset_id": "a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2",
+      "prompt_version": "baseline-system-v1+ecommerce-schema-v1+metrics-v1+sha256:ca0f1d30dcb41c9c6634ac0bfb15e65ac2283ae4ccbfc11897b8e164dd681e25",
+      "files": [
+        {"path":"v1/report.json","bytes":6003,"sha256":"0d4d1d6c02e70d01b83720dfbe887edc6d6a8d33ac045ad99bce4927c8ec91d1"},
+        {"path":"v1/report.md","bytes":2463,"sha256":"398168f8369948dd047f29aeca1dd3f77c83efdf663f29e04d20fa30cad98ae6"}
+      ]
+    },
+    {
+      "label": "v2",
+      "run_id": "65c87bf0355047a9b23243f70756e3f4",
+      "dataset_id": "a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2",
+      "prompt_version": "baseline-system-v2+ecommerce-schema-v1+metrics-v1+sha256:ca0f1d30dcb41c9c6634ac0bfb15e65ac2283ae4ccbfc11897b8e164dd681e25",
+      "pricing_effective_date": "2026-09-01",
+      "files": [
+        {"path":"v2/report.json","bytes":16004,"sha256":"6fc2b048db8b61d73a33c3b36d74107ac6918edabeb08fbaa6b07c0196bb7466"},
+        {"path":"v2/report.md","bytes":2297,"sha256":"28d1dfb2069f65aa7f3f5591da1e573a90042586e810af0ee7f5f0027edfa204"}
+      ]
+    }
+  ],
+  "derived_files": [
+    {"path":"week-1-live-baselines.json","bytes":9348,"sha256":"4253e1295188d41fb7512e2370814a3dc71430d539ce5074aa63666036405189"},
+    {"path":"week-1-live-baselines.md","bytes":2929,"sha256":"640b63f853268bbc1a1f4f2abf4293c35cc595c2e357b89ee9d5cb27e1948559"}
+  ]
+}

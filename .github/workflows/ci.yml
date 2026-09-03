@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - run: uv run ruff check .
+      - run: uv run mypy
+      - run: uv run pytest tests/unit -v
+
+  database:
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_DB: governed_analytics
+      POSTGRES_USER: governed_admin
+      POSTGRES_PASSWORD: governed_admin_dev
+      MIGRATION_DATABASE_URL: postgresql+psycopg://governed_admin:governed_admin_dev@127.0.0.1:5432/governed_analytics
+      LOADER_DATABASE_URL: postgresql+psycopg://analytics_loader:analytics_loader_dev@127.0.0.1:5432/governed_analytics
+      DATABASE_URL: postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.0.0.1:5432/governed_analytics
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v10
+      - run: uv sync --locked --all-groups
+      - run: docker compose up -d --wait db
+      - run: uv run alembic upgrade head
+      - run: uv run pytest tests/integration/persistence -v
+      - run: uv run governed-data generate --scale tiny
+      - run: uv run governed-data verify --scale tiny
+      - run: uv run pytest tests/unit/metrics tests/integration/metrics -v
+      - run: uv run governed-eval baseline --dataset tiny --mode fixture
