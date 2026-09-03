@@ -12,6 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _EXPECTED_EVALUATION_CASE_IDS = tuple(f"G{number:03d}" for number in range(1, 21))
 
+type NormalizedFinishReason = Literal[
+    "stop", "length", "content_filter", "tool_calls", "other", "unknown"
+]
+
 
 class _FrozenWireModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -86,6 +90,14 @@ class GeneratedSql(_FrozenWireModel):
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     latency_ms: int = Field(ge=0)
+    finish_reason: NormalizedFinishReason | None = None
+    output_truncated: bool = False
+
+    @model_validator(mode="after")
+    def _validate_generation_telemetry(self) -> GeneratedSql:
+        if self.output_truncated != (self.finish_reason == "length"):
+            raise ValueError("output_truncated must match a length finish reason")
+        return self
 
 
 class QueryResult(_FrozenWireModel):

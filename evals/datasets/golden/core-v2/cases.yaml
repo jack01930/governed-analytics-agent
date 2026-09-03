@@ -1,0 +1,300 @@
+- case_id: C201
+  suite: core-v2
+  intent_id: C201
+  question: '在 ordered_at 位于 [2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z) 内，对订单状态为 paid、completed 或 refunded 的订单明细 net_amount 求和，GMV 是多少？无记录时返回 0。'
+  category: metric
+  difficulty: easy
+  risk_tags: [time_window, aggregation]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G001
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [gmv]
+  oracle_sql_path: evals/datasets/golden/sql/G001.sql
+- case_id: C202
+  suite: core-v2
+  intent_id: C202
+  question: '对比 ordered_at 位于 [2026-06-01T00:00:00Z, 2026-06-08T00:00:00Z) 与 [2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z) 内、status 为 paid、completed 或 refunded 的订单明细 net_amount 总和；无记录时 GMV 按 0，返回 current_gmv、previous_gmv，以及 (current_gmv - previous_gmv) / previous_gmv 的 change_rate；previous_gmv 为 0 时 change_rate 返回 NULL。'
+  category: comparison
+  difficulty: medium
+  risk_tags: [time_window, comparison, aggregation]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G002
+  comparison: table
+  key_columns: []
+  numeric_columns: [current_gmv, previous_gmv, change_rate]
+  oracle_sql_path: evals/datasets/golden/sql/G002.sql
+- case_id: C203
+  suite: core-v2
+  intent_id: C203
+  question: '按 region 比较 ordered_at 位于 [2026-06-01T00:00:00Z, 2026-06-08T00:00:00Z) 与 [2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z) 内、status 为 paid、completed 或 refunded 的订单明细 net_amount 总和；某 region 在任一窗口无符合订单时该窗口 GMV 按 0，仅保留 GMV 下降的地区，按 previous_gmv - current_gmv 得到 gmv_loss，并按 gmv_loss 降序、region 升序返回前五名。'
+  category: contribution
+  difficulty: hard
+  risk_tags: [time_window, comparison, top_k]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G003
+  comparison: top_k
+  key_columns: [region]
+  numeric_columns: [gmv_loss]
+  oracle_sql_path: evals/datasets/golden/sql/G003.sql
+- case_id: C204
+  suite: core-v2
+  intent_id: C204
+  question: '按 SKU 比较 ordered_at 位于 [2026-06-01T00:00:00Z, 2026-06-08T00:00:00Z) 与 [2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z) 内、status 为 paid、completed 或 refunded 的订单明细 net_amount 总和；某 SKU 在任一窗口无符合订单时该窗口 GMV 按 0，仅保留 GMV 下降的商品，按 previous_gmv - current_gmv 得到 gmv_loss，并按 gmv_loss 降序、sku 升序返回前五名。'
+  category: contribution
+  difficulty: hard
+  risk_tags: [time_window, comparison, top_k]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G004
+  comparison: top_k
+  key_columns: [sku]
+  numeric_columns: [gmv_loss]
+  oracle_sql_path: evals/datasets/golden/sql/G004.sql
+- case_id: C205
+  suite: core-v2
+  intent_id: C205
+  question: '按客户 segment 比较 ordered_at 位于 [2026-06-01T00:00:00Z, 2026-06-08T00:00:00Z) 与 [2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z) 内、status 为 paid、completed 或 refunded 的订单明细 net_amount 总和；保留任一窗口出现的全部 segment，缺失一侧按 0，返回 previous_gmv、current_gmv、delta（current - previous），并按 segment 升序排列。'
+  category: contribution
+  difficulty: hard
+  risk_tags: [time_window, comparison, segmentation]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G005
+  comparison: table
+  key_columns: [segment]
+  numeric_columns: [previous_gmv, current_gmv, delta]
+  oracle_sql_path: evals/datasets/golden/sql/G005.sql
+- case_id: C206
+  suite: core-v2
+  intent_id: C206
+  question: '比较 [2026-06-01T00:00:00Z, 2026-06-08T00:00:00Z) 与 [2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z)：south_conversion 是 occurred_at 位于各窗口、客户地区属于东莞、佛山、南宁、厦门、广州、海口、深圳、福州的 web session 中 converted = true 的会话数除以全部会话数；另计算 ordered_at 位于各窗口的 SKU-000001、SKU-000002 在 status 为 paid、completed 或 refunded 订单中的明细 net_amount 总和。任一窗口无对应会话或 SKU 明细时该项值为 0；固定保留这三项（即使没有下滑），按 south_conversion、SKU-000001、SKU-000002 顺序返回 cause_type、previous、current 和 delta（current - previous）。'
+  category: attribution
+  difficulty: hard
+  risk_tags: [time_window, attribution, comparison]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G006
+  comparison: table
+  key_columns: [cause_type]
+  numeric_columns: [previous, current, delta]
+  oracle_sql_path: evals/datasets/golden/sql/G006.sql
+- case_id: C207
+  suite: core-v2
+  intent_id: C207
+  question: '对 paid_at 位于 [2026-06-01T00:00:00Z, 2026-07-01T00:00:00Z) 且 status 为 succeeded 的支付记录汇总 amount，paid_gmv 是多少？无记录时返回 0。'
+  category: metric
+  difficulty: easy
+  risk_tags: [time_window, payment]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G007
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [paid_gmv]
+  oracle_sql_path: evals/datasets/golden/sql/G007.sql
+- case_id: C208
+  suite: core-v2
+  intent_id: C208
+  question: '对 ordered_at 位于 [2026-05-01T00:00:00Z, 2026-06-01T00:00:00Z) 的订单，按订单分别汇总所有 status 为 succeeded 的支付 amount 与退款 amount，再以支付总额减退款总额返回 net_revenue；任一侧无记录时按 0。'
+  category: metric
+  difficulty: easy
+  risk_tags: [time_window, revenue]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G008
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [net_revenue]
+  oracle_sql_path: evals/datasets/golden/sql/G008.sql
+- case_id: C209
+  suite: core-v2
+  intent_id: C209
+  question: '对 ordered_at 位于 [2026-05-04T00:00:00Z, 2026-05-11T00:00:00Z) 的订单，按品类计算退款率：分母是包含该品类的订单之 succeeded 支付总额（同一品类内每笔订单只计一次），分子是该品类订单明细对应的 succeeded 退款总额；保留只有支付或只有退款的品类，分母为 0 时 refund_rate 为 NULL，按 refund_rate 降序（NULL 最后）、category_code 升序返回前五个品类。'
+  category: anomaly
+  difficulty: hard
+  risk_tags: [time_window, refund, top_k]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G009
+  comparison: top_k
+  key_columns: [category_code]
+  numeric_columns: [refund_rate]
+  oracle_sql_path: evals/datasets/golden/sql/G009.sql
+- case_id: C210
+  suite: core-v2
+  intent_id: C210
+  question: '对 refunded_at 位于 [2026-05-04T00:00:00Z, 2026-05-11T00:00:00Z) 且 status 为 succeeded 的退款，按 reason 汇总 refund_count 与 refund_amount；按 refund_amount 降序、reason 升序返回前五个原因。'
+  category: anomaly
+  difficulty: hard
+  risk_tags: [time_window, refund, top_k]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G010
+  comparison: top_k
+  key_columns: [reason]
+  numeric_columns: [refund_count, refund_amount]
+  oracle_sql_path: evals/datasets/golden/sql/G010.sql
+- case_id: C211
+  suite: core-v2
+  intent_id: C211
+  question: '对 occurred_at 位于 [2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z) 的会话，按 channel 计算 converted 为 true 的会话数除以全部会话数的 conversion_rate，并按 channel 升序返回。'
+  category: metric
+  difficulty: medium
+  risk_tags: [time_window, conversion, grouping]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G011
+  comparison: table
+  key_columns: [channel]
+  numeric_columns: [conversion_rate]
+  oracle_sql_path: evals/datasets/golden/sql/G011.sql
+- case_id: C212
+  suite: core-v2
+  intent_id: C212
+  question: '对 snapshot_at 位于 [2026-06-08T00:00:00Z, 2026-06-15T00:00:00Z) 且 available_qty = 0 的库存快照，按 SKU 统计发生缺货的去重 UTC 自然日数 stockout_days，并按 stockout_days 降序、sku 升序返回。'
+  category: quality
+  difficulty: medium
+  risk_tags: [time_window, inventory, grouping]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G012
+  comparison: table
+  key_columns: [sku]
+  numeric_columns: [stockout_days]
+  oracle_sql_path: evals/datasets/golden/sql/G012.sql
+- case_id: C213
+  suite: core-v2
+  intent_id: C213
+  question: '对 ordered_at 位于 [2026-06-01T00:00:00Z, 2026-07-01T00:00:00Z) 且 status 为 paid、completed 或 refunded 的订单，统计去重 customer_id 数量 active_customers。'
+  category: metric
+  difficulty: easy
+  risk_tags: [time_window, customer]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G013
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [active_customers]
+  oracle_sql_path: evals/datasets/golden/sql/G013.sql
+- case_id: C214
+  suite: core-v2
+  intent_id: C214
+  question: '统计 registered_at 位于 [2026-06-01T00:00:00Z, 2026-07-01T00:00:00Z) 的客户数量 new_customers。'
+  category: metric
+  difficulty: easy
+  risk_tags: [time_window, customer]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G014
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [new_customers]
+  oracle_sql_path: evals/datasets/golden/sql/G014.sql
+- case_id: C215
+  suite: core-v2
+  intent_id: C215
+  question: '以 ordered_at 位于 [2026-06-01T00:00:00Z, 2026-07-01T00:00:00Z) 内至少有一笔 status 为 paid、completed 或 refunded 订单的去重客户作为 active_customers；其中在 2026-07-01T00:00:00Z 前累计拥有至少两个不同、且 status 为 paid、completed 或 refunded 的订单之客户占比是多少？返回 repeat_purchase_rate；active_customers 为 0 时返回 NULL。'
+  category: metric
+  difficulty: medium
+  risk_tags: [time_window, customer, ratio]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G015
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [repeat_purchase_rate]
+  oracle_sql_path: evals/datasets/golden/sql/G015.sql
+- case_id: C216
+  suite: core-v2
+  intent_id: C216
+  question: '选择 start_at < 2026-07-01T00:00:00Z 且 end_at > 2026-04-01T00:00:00Z 的营销活动，用 attributed_at 位于 [2026-04-01T00:00:00Z, 2026-07-01T00:00:00Z) 的 attributed_revenue 总额按 (attributed_revenue - spend) / spend 计算 ROI；活动无窗口内归因收入时 attributed_revenue 按 0，spend 为 0 时 ROI 为 NULL，按 roi 降序（NULL 最后）、campaign_code 升序返回前五名。'
+  category: metric
+  difficulty: medium
+  risk_tags: [time_window, marketing, top_k]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G016
+  comparison: top_k
+  key_columns: [campaign_code]
+  numeric_columns: [roi]
+  oracle_sql_path: evals/datasets/golden/sql/G016.sql
+- case_id: C217
+  suite: core-v2
+  intent_id: C217
+  question: '检查 started_at 位于 [2026-06-15T00:00:00Z, 2026-06-16T00:00:00Z) 的 inventory pipeline，按 started_at 降序、pipeline_run_id 降序取最新一次运行：若没有运行、status 不是 succeeded、watermark 为空，或 watermark 早于 2026-06-15T23:59:59Z，则返回 is_stale = true，否则返回 false。'
+  category: quality
+  difficulty: medium
+  risk_tags: [time_window, inventory, freshness]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G017
+  comparison: boolean
+  key_columns: []
+  numeric_columns: []
+  oracle_sql_path: evals/datasets/golden/sql/G017.sql
+- case_id: C218
+  suite: core-v2
+  intent_id: C218
+  question: '对 ordered_at 位于 [2026-04-10T00:00:00Z, 2026-04-11T00:00:00Z) 的订单明细，按 source_line_id 分组，仅对 count(*) > 1 的组将 count(*) - 1 作为多余重复行数，并汇总为 duplicate_rows；无重复时返回 0。'
+  category: quality
+  difficulty: medium
+  risk_tags: [time_window, duplicate, quality]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G018
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [duplicate_rows]
+  oracle_sql_path: evals/datasets/golden/sql/G018.sql
+- case_id: C219
+  suite: core-v2
+  intent_id: C219
+  question: '对 ordered_at 位于 [2026-03-17T00:00:00Z, 2026-03-18T00:00:00Z) 且至少有一条订单明细的订单，若 payable_amount 与“订单明细 net_amount 之和 + shipping_amount”的绝对差大于 0.01，则视为不一致；返回 mismatched_orders。'
+  category: quality
+  difficulty: medium
+  risk_tags: [time_window, reconciliation, quality]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G019
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [mismatched_orders]
+  oracle_sql_path: evals/datasets/golden/sql/G019.sql
+- case_id: C220
+  suite: core-v2
+  intent_id: C220
+  question: '按订单汇总 refunded_at 位于 [2026-05-20T00:00:00Z, 2026-05-21T00:00:00Z) 且 status 为 succeeded 的退款 amount，并与该订单全部 status 为 succeeded 的支付 amount 比较（没有成功支付时按 0）；统计退款总额严格大于支付总额的订单数 over_refunded_orders。'
+  category: quality
+  difficulty: hard
+  risk_tags: [time_window, refund, reconciliation]
+  expected_behavior: execute
+  source: week2-self-contained-core
+  review_status: approved
+  legacy_case_id: G020
+  comparison: scalar
+  key_columns: []
+  numeric_columns: [over_refunded_orders]
+  oracle_sql_path: evals/datasets/golden/sql/G020.sql

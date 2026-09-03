@@ -1,0 +1,1 @@
+select "CUSTOMER_CODE" from "CUSTOMERS"

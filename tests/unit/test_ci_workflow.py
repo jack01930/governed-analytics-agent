@@ -19,11 +19,13 @@ def _normalized(run_steps: list[str]) -> list[str]:
 
 def _assert_database_runs_are_safe(workflow: str) -> None:
     normalized = _normalized(_database_run_steps(workflow))
-    assert normalized[-4:] == [
+    assert normalized[-6:] == [
         "uv run governed-data generate --scale tiny",
         "uv run governed-data verify --scale tiny",
         "uv run pytest tests/unit/metrics tests/integration/metrics -v",
+        "uv run pytest tests/integration/tools -v",
         "uv run governed-eval baseline --dataset tiny --mode fixture",
+        "uv run governed-eval week2 --dataset tiny --mode fixture",
     ]
     forbidden = (
         "--scale full",
@@ -57,6 +59,9 @@ jobs:
       - run: uv run governed-data generate --scale tiny
       - run: uv run governed-data verify --scale tiny
       - run: uv run pytest tests/unit/metrics tests/integration/metrics -v
+      - run: uv run pytest tests/integration/tools -v
+      - run: uv run governed-eval baseline --dataset tiny --mode fixture
+      - run: uv run governed-eval week2 --dataset tiny --mode fixture
 """
     with pytest.raises(AssertionError):
         _assert_database_runs_are_safe(workflow)

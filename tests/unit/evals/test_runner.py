@@ -14,7 +14,7 @@ from governed_analytics.models.openai_compatible import (
     ModelAdapterError,
     OpenAICompatibleSqlGenerator,
 )
-from governed_analytics.models.protocols import SqlGenerationRequest
+from governed_analytics.models.protocols import EvaluationGenerationRequest, SqlGenerationRequest
 
 
 class _Generator(OpenAICompatibleSqlGenerator):
@@ -26,7 +26,9 @@ class _Generator(OpenAICompatibleSqlGenerator):
     def model(self) -> str:
         return "deepseek-v4-flash"
 
-    async def generate(self, request: SqlGenerationRequest) -> GeneratedSql:
+    async def generate(
+        self, request: SqlGenerationRequest | EvaluationGenerationRequest
+    ) -> GeneratedSql:
         case_id = request.case_id
         self.calls.append(case_id)
         outcome = self.outcomes.get(case_id)

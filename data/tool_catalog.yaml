@@ -1,0 +1,12 @@
+version: 1
+tables:
+  customers:
+    customer_code: sensitive
+  orders:
+    order_code: sensitive
+  payments:
+    payment_code: sensitive
+  refunds:
+    refund_code: sensitive
+  web_sessions:
+    session_code: sensitive

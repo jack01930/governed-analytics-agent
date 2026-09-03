@@ -1,0 +1,4 @@
+{
+  "columns": ["current_gmv", "previous_gmv", "change_rate"],
+  "rows": [["17893.50", "50873.80", "-0.64827671610927432195"]]
+}

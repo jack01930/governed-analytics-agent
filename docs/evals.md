@@ -1,4 +1,4 @@
-# Text-to-SQL 基线评测
+# Text-to-SQL 与 Week 2 分层评测
 
 Week 1 使用 20 条版本化黄金业务问题（`G001` 到 `G020`）建立直接 Text-to-SQL 基线。每条问题有一条受控
 Oracle 查询及其在 tiny 数据集上物化的只读结果；Oracle 是评测真值，不会发送给模型。模型上下文固定来自
@@ -59,3 +59,52 @@ USD/CNY 6.7809 快照换算为输入 CNY 2.983596、输出 CNY 8.950788/百万 t
 有效 SQL 14/20、估算总成本 CNY 0.259588，逐题根因和第 2 周计划见
 [v2 分析](reports/week-1-deepseek-live-v2-analysis-2026-09-03.md)。可克隆的脱敏原报告、SHA-256 与全部 case
 计量见 [live 证据归档](reports/evidence/README.md)。
+
+## Week 2 活跃评测协议
+
+Week 2 不修改 core-v1 或历史 live 报告，而是新增独立的 `week2-evaluation-v1` 协议：
+
+| 套件 | 数量 | 目的 | 分母 |
+| --- | ---: | --- | --- |
+| core-v2 | 20 | 把 core-v1 的日期、窗口和业务对象改为每题自包含 | 业务结果与字段契约 |
+| paraphrase | 20 | 检查同一意图的同义、口语和语序变化 | 业务结果与字段契约 |
+| boundary | 10 | 检查半开时间窗、NULL、严格比较和稳定 top-k | 业务结果与字段契约 |
+| safety | 20 | 检查写操作、多语句、系统表、危险函数、敏感输出等攻击 | 安全拒绝率 |
+
+业务例共 50 条，分别报告 `result_accuracy`、`output_contract_rate`、`valid_sql_rate` 和
+`execution_success_rate`；20 条 safety 不混入业务正确率。safety 只有实际拒绝码与预期拒绝码完全相同才算
+通过。报告还记录规范化的 `finish_reason`、`output_truncated`、tokens、成本、延迟、数据集 ID、套件哈希、
+实现哈希、查询指纹，以及定价快照哈希和请求/解析模型，但不保存生成 SQL、Provider 原始响应、端点或凭据。
+实现哈希覆盖会影响评测的源码、迁移、治理配置和锁定依赖，使脱离 Git 的本地报告也能区分策略或评分实现变化。
+
+离线全流程命令为：
+
+```bash
+make eval-week2-fixture
+```
+
+它执行 50 次 Oracle fixture 生成和 50 次只读数据库查询，并直接用策略验证 20 条安全 SQL；不读取
+`MODEL_API_KEY`，不创建网络客户端。2026-09-04 的验收运行结果为 50/50 业务结果正确、50/50 字段契约
+合规、20/20 安全规则匹配，tokens 与成本均为 0。这个 70/70 是 harness 验证，不能与 Week 1 DeepSeek
+live 的 5/20 相减后宣称模型提升。
+
+本次最终 fixture 的 run ID 为 `4f9f6872a315429da139accecc7a6771`，suite manifest SHA-256 为
+`ec5e210d8be4391903904ef65f4c1dcd5b8c7d0898a020f61e4486054ad0277d`，implementation SHA-256 为
+`e7c20ed70bd2754a5e4f41c06b4f5a35b3cd6447e1481c642075c0386a25d744`；它绑定的 Week 1 报告规范化内容
+SHA-256 为 `91e24468a0d37601154a02b502868136f7352551b1059bbafbe7508451d3ef11`。成本状态为完整，未定价调用为 0。
+
+## Week 2 live 边界
+
+live 入口已经实现，但尚未运行。只有用户再次明确授权一次付费调用后，才冻结当前 suite hash、dataset、
+prompt/context、模型和价格，再执行：
+
+```bash
+uv run governed-eval week2 --dataset tiny --mode live --live
+```
+
+缺少 `--live`、非 tiny 数据集、空 Key、模型与价格快照不匹配时，CLI 都会在构造网络客户端之前失败。正式
+运行会在首个模型请求前独占报告 staging、检查最终目标并验证当前文件系统支持原子 no-replace；冲突、不可写
+或原子能力缺失时直接停止。随后逐题校验 Provider 返回模型是否属于价格快照声明的请求/解析模型；无法绑定
+价格的响应记为 `pricing_failed` 且不执行其 SQL，同时将成本完整性标为 false、禁止声明历史可比。运行仍是
+一题一次生成、一次执行、无重试；失败题不得删除或挑选性重跑。完整比较结论见
+[Week 1 → Week 2 对比报告](reports/week-1-to-week-2-comparison-2026-09-04.md)。

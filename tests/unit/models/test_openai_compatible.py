@@ -35,9 +35,12 @@ def _response(
     model: object = "deepseek-v4-flash",
     prompt_tokens: object = 17,
     completion_tokens: object = 9,
+    finish_reason: object = None,
 ) -> object:
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        choices=[
+            SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish_reason)
+        ],
         model=model,
         usage=SimpleNamespace(
             prompt_tokens=prompt_tokens,
@@ -85,6 +88,8 @@ async def test_live_adapter_sends_complete_one_pass_contract_and_preserves_metad
     assert result.input_tokens == 17
     assert result.output_tokens == 9
     assert result.latency_ms == 1234
+    assert result.finish_reason is None
+    assert result.output_truncated is False
     assert client.completions.calls == [
         {
             "model": "deepseek-v4-flash",
@@ -118,9 +123,7 @@ async def test_live_adapter_makes_exactly_one_call_and_sanitizes_sdk_failures() 
 async def test_invalid_assumptions_preserves_safe_call_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = _FakeClient(
-        _response(content='{"sql":"select 1","assumptions":"none"}')
-    )
+    client = _FakeClient(_response(content='{"sql":"select 1","assumptions":"none"}'))
     generator = OpenAICompatibleSqlGenerator(client, "deepseek-v4-flash")  # type: ignore[arg-type]
     moments = iter((100.0, 100.25))
     monkeypatch.setattr(
@@ -136,6 +139,63 @@ async def test_invalid_assumptions_preserves_safe_call_metadata(
     assert error.output_tokens == 9
     assert error.latency_ms == 250
     assert "select 1" not in repr(error)
+
+
+@pytest.mark.asyncio
+async def test_live_adapter_preserves_safe_length_telemetry_when_json_is_truncated() -> None:
+    raw_content = '{"sql":"select 1 as value","assumptions":['
+    client = _FakeClient(_response(content=raw_content, finish_reason="length"))
+    generator = OpenAICompatibleSqlGenerator(client, "deepseek-v4-flash")  # type: ignore[arg-type]
+
+    with pytest.raises(ModelAdapterError, match=r"^invalid_json$") as captured:
+        await generator.generate(_request())
+
+    error = captured.value
+    assert error.finish_reason == "length"
+    assert error.output_truncated is True
+    assert raw_content not in str(error)
+    assert raw_content not in repr(error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_reason", "expected"),
+    [
+        ("stop", "stop"),
+        ("content_filter", "content_filter"),
+        ("tool_calls", "tool_calls"),
+        ("function_call", "other"),
+        ("Length", "unknown"),
+        ("provider-secret-reason", "unknown"),
+        (7, "unknown"),
+    ],
+)
+async def test_live_adapter_normalises_finish_reason_without_leaking_provider_values(
+    raw_reason: object, expected: str
+) -> None:
+    generator = OpenAICompatibleSqlGenerator(
+        cast(AsyncOpenAI, _FakeClient(_response(finish_reason=raw_reason))),
+        "deepseek-v4-flash",
+    )
+
+    result = await generator.generate(_request())
+
+    assert result.finish_reason == expected
+    assert result.output_truncated is False
+    assert "provider-secret-reason" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_live_adapter_marks_length_as_truncated_even_when_json_is_complete() -> None:
+    generator = OpenAICompatibleSqlGenerator(
+        cast(AsyncOpenAI, _FakeClient(_response(finish_reason="length"))),
+        "deepseek-v4-flash",
+    )
+
+    result = await generator.generate(_request())
+
+    assert result.finish_reason == "length"
+    assert result.output_truncated is True
 
 
 @pytest.mark.asyncio
@@ -185,6 +245,8 @@ async def test_invalid_assumptions_preserves_safe_call_metadata(
         (_response(prompt_tokens=0), "invalid_usage"),
         (_response(completion_tokens=True), "invalid_usage"),
         (_response(model=" "), "missing_model"),
+        (_response(model="provider-model\nsecret-marker"), "missing_model"),
+        (_response(model="sk-0123456789abcdef0123456789abcdef"), "missing_model"),
     ],
 )
 async def test_live_adapter_classifies_invalid_provider_responses(
@@ -197,9 +259,13 @@ async def test_live_adapter_classifies_invalid_provider_responses(
 
     assert error.value.__cause__ is None
     assert "select 1" not in str(error.value)
+    assert "secret-marker" not in str(error.value)
 
 
-@pytest.mark.parametrize("model", ("", " \t ", 1, b"deepseek-v4-flash"))
+@pytest.mark.parametrize(
+    "model",
+    ("", " \t ", 1, b"deepseek-v4-flash", "sk-0123456789abcdef0123456789abcdef"),
+)
 def test_live_adapter_rejects_invalid_requested_model(model: object) -> None:
     with pytest.raises(ModelAdapterError, match=r"^invalid_request$"):
         OpenAICompatibleSqlGenerator(object(), model)  # type: ignore[arg-type]

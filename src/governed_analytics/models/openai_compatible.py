@@ -13,9 +13,11 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError, field_validator
 from sqlglot import exp
 
-from governed_analytics.evals.models import GeneratedSql
+from governed_analytics.evals.models import GeneratedSql, NormalizedFinishReason
 from governed_analytics.models.prompts import BASELINE_SYSTEM_PROMPT_V2, build_baseline_user_prompt
-from governed_analytics.models.protocols import SqlGenerationRequest
+from governed_analytics.models.protocols import EvaluationGenerationRequest, SqlGenerationRequest
+
+_SAFE_MODEL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class ModelAdapterError(ValueError):
@@ -29,12 +31,16 @@ class ModelAdapterError(ValueError):
         input_tokens: int = 0,
         output_tokens: int = 0,
         latency_ms: int = 0,
+        finish_reason: NormalizedFinishReason | None = None,
+        output_truncated: bool = False,
     ) -> None:
         super().__init__(category)
         self.provider_model = provider_model
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.latency_ms = latency_ms
+        self.finish_reason = finish_reason
+        self.output_truncated = output_truncated
 
 
 class _ErrorMetadata(TypedDict):
@@ -42,6 +48,8 @@ class _ErrorMetadata(TypedDict):
     input_tokens: int
     output_tokens: int
     latency_ms: int
+    finish_reason: NormalizedFinishReason | None
+    output_truncated: bool
 
 
 class _ProviderSqlResponse(BaseModel):
@@ -74,6 +82,8 @@ def _error(
     input_tokens: int = 0,
     output_tokens: int = 0,
     latency_ms: int = 0,
+    finish_reason: NormalizedFinishReason | None = None,
+    output_truncated: bool = False,
 ) -> ModelAdapterError:
     return ModelAdapterError(
         category,
@@ -81,6 +91,8 @@ def _error(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         latency_ms=latency_ms,
+        finish_reason=finish_reason,
+        output_truncated=output_truncated,
     )
 
 
@@ -118,21 +130,46 @@ def _strict_positive_integer(value: object) -> int | None:
     return None
 
 
+def _safe_model_identifier(value: object) -> str | None:
+    if (
+        isinstance(value, str)
+        and _SAFE_MODEL_IDENTIFIER.fullmatch(value) is not None
+        and not value.lower().startswith(("sk-", "pk-", "bearer-"))
+    ):
+        return value
+    return None
+
+
+def _normalise_finish_reason(value: object) -> NormalizedFinishReason | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "unknown"
+    if value in {"stop", "length", "content_filter", "tool_calls"}:
+        return value  # type: ignore[return-value]
+    if value == "function_call":
+        return "other"
+    return "unknown"
+
+
 class OpenAICompatibleSqlGenerator:
     """Generate one structured SQL answer through an already-created SDK client."""
 
     def __init__(self, client: AsyncOpenAI, model: str) -> None:
-        if not isinstance(model, str) or not model.strip():
+        safe_model = _safe_model_identifier(model)
+        if safe_model is None:
             raise _error("invalid_request")
         self._client = client
-        self._model = model
+        self._model = safe_model
 
     @property
     def model(self) -> str:
         """Return the configured request alias without exposing client configuration."""
         return self._model
 
-    async def generate(self, request: SqlGenerationRequest) -> GeneratedSql:
+    async def generate(
+        self, request: SqlGenerationRequest | EvaluationGenerationRequest
+    ) -> GeneratedSql:
         started_at = monotonic()
         try:
             response = await self._client.chat.completions.create(
@@ -154,11 +191,7 @@ class OpenAICompatibleSqlGenerator:
         provider_model_value: object = None
         with suppress(Exception):
             provider_model_value = response.model
-        provider_model = (
-            provider_model_value
-            if isinstance(provider_model_value, str) and provider_model_value.strip()
-            else None
-        )
+        provider_model = _safe_model_identifier(provider_model_value)
 
         usage: object = None
         usage_accessible = False
@@ -179,10 +212,22 @@ class OpenAICompatibleSqlGenerator:
             "input_tokens": input_tokens or 0,
             "output_tokens": output_tokens or 0,
             "latency_ms": latency_ms,
+            "finish_reason": None,
+            "output_truncated": False,
         }
 
         try:
-            content = response.choices[0].message.content
+            choice = response.choices[0]
+        except Exception:
+            raise _error("missing_content", **metadata) from None
+        raw_finish_reason: object = None
+        with suppress(Exception):
+            raw_finish_reason = choice.finish_reason
+        finish_reason = _normalise_finish_reason(raw_finish_reason)
+        metadata["finish_reason"] = finish_reason
+        metadata["output_truncated"] = finish_reason == "length"
+        try:
+            content = choice.message.content
         except Exception:
             raise _error("missing_content", **metadata) from None
         if content is None:
@@ -211,4 +256,6 @@ class OpenAICompatibleSqlGenerator:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             latency_ms=latency_ms,
+            finish_reason=finish_reason,
+            output_truncated=finish_reason == "length",
         )

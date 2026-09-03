@@ -14,8 +14,9 @@ from openai import AsyncOpenAI
 from governed_analytics.config import ModelSettings
 from governed_analytics.evals.pricing import ModelPricing, load_model_pricing
 from governed_analytics.evals.runner import BaselineRunError, run_baseline
+from governed_analytics.evals.week2_runner import Week2RunError, run_week2_evaluation
 from governed_analytics.models.openai_compatible import OpenAICompatibleSqlGenerator
-from governed_analytics.models.protocols import SqlGenerator
+from governed_analytics.models.protocols import EvaluationSqlGenerator, SqlGenerator
 
 _PRICING_PATH = "data/pricing/deepseek-v4-flash-2026-09-01.yaml"
 
@@ -36,6 +37,10 @@ def _parser() -> argparse.ArgumentParser:
     baseline.add_argument("--dataset", required=True, choices=("tiny", "full"))
     baseline.add_argument("--mode", required=True, choices=("fixture", "live"))
     baseline.add_argument("--live", action="store_true")
+    week2 = command.add_parser("week2")
+    week2.add_argument("--dataset", required=True, choices=("tiny", "full"))
+    week2.add_argument("--mode", required=True, choices=("fixture", "live"))
+    week2.add_argument("--live", action="store_true")
     return parser
 
 
@@ -66,18 +71,54 @@ def _run(
         raise BaselineRunError("baseline client cleanup failed") from None
 
 
+def _run_week2(
+    *,
+    mode: Literal["fixture", "live"],
+    generator: EvaluationSqlGenerator | None = None,
+    pricing: ModelPricing | None = None,
+    client: AsyncOpenAI | None = None,
+) -> None:
+    async def execute() -> None:
+        try:
+            await run_week2_evaluation(mode=mode, generator=generator, pricing=pricing)
+        finally:
+            if client is not None:
+                # The report may already contain 50 paid, immutable outcomes.
+                # A best-effort transport cleanup must never relabel that run as
+                # failed and encourage an accidental paid rerun.
+                with suppress(Exception):
+                    await client.close()
+
+    try:
+        asyncio.run(execute())
+    except Week2RunError:
+        raise
+    except Exception:
+        raise Week2RunError("Week 2 client cleanup failed") from None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
     except _CliArgumentError:
         return _failure("Invalid governed-eval arguments")
+    is_week2 = args.command == "week2"
     if args.dataset != "tiny":
-        return _failure("Week 1 baseline supports only dataset tiny")
+        return _failure(
+            "Week 2 evaluation supports only dataset tiny"
+            if is_week2
+            else "Week 1 baseline supports only dataset tiny"
+        )
     if args.mode == "fixture":
         try:
-            _run(mode="fixture")
-        except BaselineRunError:
-            return _failure("Fixture baseline failed")
+            if is_week2:
+                _run_week2(mode="fixture")
+            else:
+                _run(mode="fixture")
+        except (BaselineRunError, Week2RunError):
+            return _failure(
+                "Fixture Week 2 evaluation failed" if is_week2 else "Fixture baseline failed"
+            )
         return 0
     if not args.live:
         return _failure("Live model calls require --live")
@@ -111,9 +152,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 asyncio.run(client.close())
         return _failure("MODEL client is unavailable")
     try:
-        _run(mode="live", generator=generator, pricing=pricing, client=client)
-    except BaselineRunError:
-        return _failure("Live baseline failed")
+        if is_week2:
+            _run_week2(mode="live", generator=generator, pricing=pricing, client=client)
+        else:
+            _run(mode="live", generator=generator, pricing=pricing, client=client)
+    except (BaselineRunError, Week2RunError):
+        return _failure("Live Week 2 evaluation failed" if is_week2 else "Live baseline failed")
     return 0
 
 

@@ -37,4 +37,6 @@ jobs:
       - run: uv run governed-data generate --scale tiny
       - run: uv run governed-data verify --scale tiny
       - run: uv run pytest tests/unit/metrics tests/integration/metrics -v
+      - run: uv run pytest tests/integration/tools -v
       - run: uv run governed-eval baseline --dataset tiny --mode fixture
+      - run: uv run governed-eval week2 --dataset tiny --mode fixture
