@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Coroutine
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, cast
@@ -38,9 +40,11 @@ from governed_analytics.runtime.runs import (
     InMemoryRunStore,
     RunAlreadyExists,
     RunCapacityExceeded,
+    RunConsistencyError,
     RunnerShutdown,
     RunNotFound,
     RunStateConflict,
+    RunSubmissionFailed,
 )
 
 SENTINEL = "raw-row-secret-sentinel"
@@ -183,6 +187,28 @@ async def test_store_enforces_strict_lifecycle_and_exact_deletion_states() -> No
     assert await store.delete_queued("queued") is True
     with pytest.raises(RunNotFound):
         await store.get("queued")
+
+
+@pytest.mark.asyncio
+async def test_store_complete_is_idempotent_only_for_the_same_projection() -> None:
+    store = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=FakeClock())
+    await store.create("run-1", "query")
+    await store.mark_running("run-1")
+    result = completed_result("run-1")
+
+    first = await store.complete("run-1", result)
+    assert await store.complete("run-1", result) == first
+    different = result.model_copy(
+        update={
+            "final_answer": FinalAnswer(
+                status=FinalStatus.COMPLETED,
+                stop_reason=StopReason.PREMISE_NOT_MET,
+                answer="前提不成立。",
+            )
+        }
+    )
+    with pytest.raises(RunStateConflict):
+        await store.complete("run-1", different)
 
 
 @pytest.mark.asyncio
@@ -434,7 +460,7 @@ async def test_submit_rolls_back_both_stores_when_event_creation_fails() -> None
         id_factory=lambda: "run-1",
     )
 
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(RunSubmissionFailed, match="run submission failed") as raised:
         await runner.submit("private query")
     assert SENTINEL not in str(raised.value)
     with pytest.raises(RunNotFound):
@@ -452,6 +478,43 @@ class RecordingEventStore(InMemoryEventStore):
     async def create_run(self, run_id: str) -> None:
         self.created.append(run_id)
         await super().create_run(run_id)
+
+
+class BlockingPreflightEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.preflight_started = asyncio.Event()
+
+    async def high_water_mark(self, run_id: str) -> int:
+        self.preflight_started.set()
+        await asyncio.Event().wait()
+        return await super().high_water_mark(run_id)
+
+
+@pytest.mark.asyncio
+async def test_submit_cancellation_during_event_preflight_removes_owned_run() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = BlockingPreflightEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.preflight_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await InMemoryEventStore.high_water_mark(events, "run-1")
 
 
 @pytest.mark.asyncio
@@ -757,4 +820,522 @@ async def test_timeout_during_model_call_preserves_reserved_cost_counts_and_safe
     assert SENTINEL not in serialized
     assert "prompt" not in serialized
     assert "raw" not in serialized
+    await runner.shutdown()
+
+
+class SideEffectFailureEventStore(InMemoryEventStore):
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime],
+        method: str,
+        timing: str,
+        persistent: bool = False,
+    ) -> None:
+        super().__init__(clock=clock)
+        self.method = method
+        self.timing = timing
+        self.persistent = persistent
+        self.failures = 0
+
+    def _fails(self, method: str, timing: str) -> bool:
+        if self.method != method or self.timing != timing:
+            return False
+        if self.failures and not self.persistent:
+            return False
+        self.failures += 1
+        return True
+
+    async def create_run(self, run_id: str) -> None:
+        if self._fails("create_run", "before"):
+            raise RuntimeError(SENTINEL)
+        await super().create_run(run_id)
+        if self._fails("create_run", "after"):
+            raise RuntimeError(SENTINEL)
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+        method = event_type
+        if self._fails(method, "before"):
+            raise RuntimeError(SENTINEL)
+        event = await super().emit(run_id, node, event_type, data)
+        if self._fails(method, "after"):
+            raise RuntimeError(SENTINEL)
+        return event
+
+    async def has_terminal(self, run_id: str) -> bool:
+        if self._fails("has_terminal", "before"):
+            raise RuntimeError(SENTINEL)
+        result = await super().has_terminal(run_id)
+        if self._fails("has_terminal", "after"):
+            raise RuntimeError(SENTINEL)
+        return result
+
+    async def emit_terminal(self, run_id: str, data: Any) -> Any:
+        if self._fails("emit_terminal", "before"):
+            raise RuntimeError(SENTINEL)
+        event = await super().emit_terminal(run_id, data)
+        if self._fails("emit_terminal", "after"):
+            raise RuntimeError(SENTINEL)
+        return event
+
+    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
+        if self._fails("delete_run", "before"):
+            raise RuntimeError(SENTINEL)
+        result = await super().delete_run(run_id, allow_unstarted=allow_unstarted)
+        if self._fails("delete_run", "after"):
+            raise RuntimeError(SENTINEL)
+        return result
+
+
+class SideEffectFailureRunStore(InMemoryRunStore):
+    def __init__(self, *, clock: FakeClock, timing: str, persistent: bool = False) -> None:
+        super().__init__(max_runs=4, retention_seconds=3600, clock=clock)
+        self.timing = timing
+        self.persistent = persistent
+        self.failed = False
+
+    async def complete(self, run_id: str, result: AgentRunResult) -> Any:
+        should_fail = self.persistent or not self.failed
+        if self.timing == "before" and should_fail:
+            self.failed = True
+            raise RuntimeError(SENTINEL)
+        record = await super().complete(run_id, result)
+        if self.timing == "after" and should_fail:
+            self.failed = True
+            raise RuntimeError(SENTINEL)
+        return record
+
+
+class StartFailureRunStore(InMemoryRunStore):
+    def __init__(self, *, clock: FakeClock, timing: str) -> None:
+        super().__init__(max_runs=2, retention_seconds=3600, clock=clock)
+        self.timing = timing
+        self.failed = False
+
+    async def mark_running(self, run_id: str) -> Any:
+        if self.timing == "before" and not self.failed:
+            self.failed = True
+            raise RuntimeError(SENTINEL)
+        record = await super().mark_running(run_id)
+        if self.timing == "after" and not self.failed:
+            self.failed = True
+            raise RuntimeError(SENTINEL)
+        return record
+
+
+def immediate_executor(
+    result_factory: Callable[[str], object],
+) -> Callable[..., Coroutine[Any, Any, object]]:
+    async def execute(*, run_id: str, query: str, context: AgentContext) -> object:
+        del query, context
+        return result_factory(run_id)
+
+    return execute
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before", "after"])
+async def test_run_started_failure_still_writes_one_internal_terminal(timing: str) -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = SideEffectFailureEventStore(clock=clock.now, method="run.started", timing=timing)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    await runner.submit("query")
+    record = await runner.wait("run-1")
+
+    assert record.final_status is FinalStatus.INTERNAL_ERROR
+    assert record.stop_reason is StopReason.INTERNAL_ERROR
+    terminal = [
+        event
+        async for event in events.stream("run-1", after_sequence=None)
+        if event.type == "run.terminal"
+    ]
+    assert len(terminal) == 1
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before", "after"])
+async def test_mark_running_one_shot_failure_is_reconciled(timing: str) -> None:
+    clock = FakeClock()
+    runs = StartFailureRunStore(clock=clock, timing=timing)
+    events = InMemoryEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    await runner.submit("query")
+    assert (await runner.wait("run-1")).final_status is FinalStatus.COMPLETED
+    assert await events.has_terminal("run-1") is True
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_result", [object(), completed_result("wrong-run")])
+async def test_invalid_executor_result_becomes_internal_terminal(bad_result: object) -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(lambda _run_id: bad_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    await runner.submit("query")
+    record = await runner.wait("run-1")
+
+    assert record.final_status is FinalStatus.INTERNAL_ERROR
+    assert await events.has_terminal("run-1") is True
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before", "after"])
+async def test_complete_one_shot_side_effect_failure_is_reconciled(timing: str) -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(clock=clock, timing=timing)
+    events = InMemoryEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    await runner.submit("query")
+    record = await runner.wait("run-1")
+
+    assert record.final_status is FinalStatus.COMPLETED
+    assert await events.has_terminal("run-1") is True
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_persistent_complete_failure_fail_stops_instead_of_returning_running() -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(clock=clock, timing="before", persistent=True)
+    events = InMemoryEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.wait("run-1")
+    assert (await runs.get("run-1")).lifecycle_status == "running"
+    assert await events.has_terminal("run-1") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "timing"),
+    [
+        ("has_terminal", "before"),
+        ("has_terminal", "after"),
+        ("emit_terminal", "before"),
+        ("emit_terminal", "after"),
+    ],
+)
+async def test_terminal_event_one_shot_failures_are_reconciled(method: str, timing: str) -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = SideEffectFailureEventStore(clock=clock.now, method=method, timing=timing)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    await runner.submit("query")
+    record = await runner.wait("run-1")
+
+    assert record.final_status is FinalStatus.COMPLETED
+    terminal = [
+        event
+        async for event in events.stream("run-1", after_sequence=None)
+        if event.type == "run.terminal"
+    ]
+    assert len(terminal) == 1
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_persistent_terminal_failure_fail_stops_runner_and_wait() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=3, retention_seconds=3600, clock=clock)
+    events = SideEffectFailureEventStore(
+        clock=clock.now,
+        method="emit_terminal",
+        timing="before",
+        persistent=True,
+    )
+    ids = iter(("run-1", "run-2"))
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: next(ids),
+    )
+    await runner.submit("query")
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.wait("run-1")
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("second")
+
+
+@pytest.mark.asyncio
+async def test_submit_does_not_delete_preexisting_event_run_on_create_collision() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    await events.create_run("collision")
+    await events.emit("collision", "runtime", "run.created", {"status": "queued"})
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "collision",
+    )
+
+    with pytest.raises(RunSubmissionFailed, match="run submission failed"):
+        await runner.submit("query")
+    with pytest.raises(RunNotFound):
+        await runs.get("collision")
+    assert await events.high_water_mark("collision") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before", "after"])
+async def test_submit_create_run_failures_respect_event_ownership(timing: str) -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = SideEffectFailureEventStore(clock=clock.now, method="create_run", timing=timing)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    with pytest.raises(RunSubmissionFailed, match="run submission failed"):
+        await runner.submit("query")
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+
+
+@pytest.mark.asyncio
+async def test_submit_create_task_failure_closes_coroutine_and_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+
+    def fail_create_task(coroutine: Coroutine[Any, Any, None], **kwargs: object) -> None:
+        del coroutine, kwargs
+        raise RuntimeError(SENTINEL)
+
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+    monkeypatch.setattr(asyncio, "create_task", fail_create_task)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(RunSubmissionFailed, match="run submission failed"):
+            await runner.submit("query")
+        gc.collect()
+    assert not any("never awaited" in str(item.message) for item in caught)
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+
+
+@pytest.mark.asyncio
+async def test_rollback_delete_before_side_effect_failure_preserves_pair_and_fail_stops() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = SideEffectFailureEventStore(
+        clock=clock.now,
+        method="delete_run",
+        timing="before",
+        persistent=True,
+    )
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+    original_emit = events.emit
+
+    async def fail_created(run_id: str, node: str, event_type: str, data: Any) -> Any:
+        if event_type == "run.created":
+            raise RuntimeError(SENTINEL)
+        return await original_emit(run_id, node, event_type, data)
+
+    events.emit = fail_created  # type: ignore[method-assign]
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+    assert (await runs.get("run-1")).lifecycle_status == "queued"
+    assert await events.high_water_mark("run-1") == 0
+
+
+@pytest.mark.asyncio
+async def test_rollback_delete_after_side_effect_failure_confirms_and_deletes_run() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = SideEffectFailureEventStore(clock=clock.now, method="delete_run", timing="after")
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+    original_emit = events.emit
+
+    async def fail_created(run_id: str, node: str, event_type: str, data: Any) -> Any:
+        if event_type == "run.created":
+            raise RuntimeError(SENTINEL)
+        return await original_emit(run_id, node, event_type, data)
+
+    events.emit = fail_created  # type: ignore[method-assign]
+
+    with pytest.raises(RunSubmissionFailed, match="run submission failed"):
+        await runner.submit("query")
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+
+
+@pytest.mark.asyncio
+async def test_prune_delete_after_side_effect_failure_removes_both_stores() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
+    events = SideEffectFailureEventStore(clock=clock.now, method="delete_run", timing="after")
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "new",
+    )
+
+    await runner.submit("query")
+    with pytest.raises(RunNotFound):
+        await runs.get("old")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("old")
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prune_delete_before_side_effect_failure_retains_both_stores() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
+    events = SideEffectFailureEventStore(
+        clock=clock.now,
+        method="delete_run",
+        timing="before",
+        persistent=True,
+    )
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "new",
+    )
+
+    await runner.submit("query")
+    assert (await runs.get("old")).lifecycle_status == "terminal"
+    assert await events.high_water_mark("old") == 3
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_expired_terminal_with_active_stream_still_consumes_physical_capacity() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=1, retention_seconds=1, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    stream = events.stream("old", after_sequence=None)
+    await anext(stream)
+    ids = iter(("blocked", "accepted"))
+    runner = AnalysisRunner(
+        settings=settings(max_runs=1, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: next(ids),
+    )
+
+    with pytest.raises(RunCapacityExceeded):
+        await runner.submit("blocked")
+    assert (await runs.get("old")).lifecycle_status == "terminal"
+    assert await events.high_water_mark("old") == 3
+    await stream.aclose()
+    created = await runner.submit("accepted")
+    assert created.run_id == "accepted"
+    with pytest.raises(RunNotFound):
+        await runs.get("old")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("old")
     await runner.shutdown()

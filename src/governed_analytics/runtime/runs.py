@@ -24,7 +24,11 @@ from governed_analytics.agent.contracts import (
 from governed_analytics.agent.graph import run_agent
 from governed_analytics.agent.ports import AgentContext
 from governed_analytics.config import AgentRuntimeSettings
-from governed_analytics.runtime.events import EventStore
+from governed_analytics.runtime.events import (
+    EventStore,
+    RunEvent,
+)
+from governed_analytics.runtime.events import RunNotFound as EventRunNotFound
 
 type TimeoutFactory = Callable[[float], AbstractAsyncContextManager[None]]
 type ContextFactory = Callable[[str], AgentContext]
@@ -67,6 +71,11 @@ class RunSubmissionFailed(RunStoreError):
         super().__init__("run submission failed")
 
 
+class RunConsistencyError(RunStoreError):
+    def __init__(self) -> None:
+        super().__init__("run stores are inconsistent")
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -75,6 +84,11 @@ def _require_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("run timestamps must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _task_is_cancelling() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 class RunRecord(BaseModel):
@@ -157,6 +171,26 @@ def _copy_model[T: BaseModel](model: T) -> T:
     return type(model).model_validate_json(model.model_dump_json())
 
 
+def _terminal_projection(result: AgentRunResult) -> dict[str, object]:
+    answer = _copy_model(result.final_answer)
+    governance = _copy_model(result.governance)
+    return {
+        "final_status": answer.status,
+        "answer": str(answer.answer),
+        "evidence": tuple(_copy_model(item) for item in result.evidence if item.verified),
+        "limitations": tuple(str(item) for item in answer.limitations),
+        "evidence_gaps": tuple(str(item) for item in result.evidence_gaps),
+        "repair_count": governance.repair_count,
+        "governance": governance,
+        "stop_reason": answer.stop_reason,
+        "safe_trace": _copy_model(result.safe_trace),
+    }
+
+
+def _terminal_record_matches(record: RunRecord, projection: Mapping[str, object]) -> bool:
+    return all(getattr(record, name) == value for name, value in projection.items())
+
+
 class InMemoryRunStore:
     """A locked, capacity-bounded run state machine with coordinated TTL candidates."""
 
@@ -204,10 +238,7 @@ class InMemoryRunStore:
         async with self._lock:
             if run_id in self._records:
                 raise RunAlreadyExists()
-            retained_count = sum(
-                not self._is_expired(record, now) for record in self._records.values()
-            )
-            if retained_count >= self._max_runs:
+            if len(self._records) >= self._max_runs:
                 raise RunCapacityExceeded()
             self._records[run_id] = candidate
             return candidate
@@ -238,29 +269,20 @@ class InMemoryRunStore:
         now = self._now()
         if result.run_id != run_id:
             raise RunStateConflict()
-        answer = _copy_model(result.final_answer)
-        evidence = tuple(_copy_model(item) for item in result.evidence if item.verified)
-        governance = _copy_model(result.governance)
-        safe_trace = _copy_model(result.safe_trace)
-        evidence_gaps = tuple(str(item) for item in result.evidence_gaps)
-        limitations = tuple(str(item) for item in answer.limitations)
+        projection = _terminal_projection(result)
         async with self._lock:
             record = self._require(run_id)
+            if record.lifecycle_status is RunLifecycleStatus.TERMINAL:
+                if _terminal_record_matches(record, projection):
+                    return record
+                raise RunStateConflict()
             if record.lifecycle_status is not RunLifecycleStatus.RUNNING:
                 raise RunStateConflict()
             updated = record.model_copy(
                 update={
                     "lifecycle_status": RunLifecycleStatus.TERMINAL,
                     "terminal_at": now,
-                    "final_status": answer.status,
-                    "answer": str(answer.answer),
-                    "evidence": evidence,
-                    "limitations": limitations,
-                    "evidence_gaps": evidence_gaps,
-                    "repair_count": governance.repair_count,
-                    "governance": governance,
-                    "stop_reason": answer.stop_reason,
-                    "safe_trace": safe_trace,
+                    **projection,
                 }
             )
             self._records[run_id] = updated
@@ -359,17 +381,46 @@ class AnalysisRunner:
         self._prune_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._terminalizing: set[str] = set()
+        self._run_consistency_failures: set[str] = set()
+        self._consistency_failed = False
         self._accepting = True
 
     async def submit(self, query: str) -> RunRecord:
         async with self._prune_lock:
+            if self._consistency_failed:
+                raise RunConsistencyError()
             if not self._accepting:
                 raise RunnerShutdown()
-            await self._prune_locked()
+            try:
+                await self._prune_locked()
+            except RunConsistencyError:
+                self._enter_fail_stop()
+                raise
             run_id = self._id_factory()
-            record = await self._runs.create(run_id, query)
+            run_existed_before = await self._run_exists_before_submission(run_id)
+            try:
+                record = await self._runs.create(run_id, query)
+            except (RunAlreadyExists, RunCapacityExceeded):
+                raise
+            except BaseException as error:
+                if not run_existed_before and await self._run_exists_after_failure(run_id):
+                    await self._delete_owned_queued_run(run_id)
+                if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
+                    raise
+                raise RunSubmissionFailed() from None
+            try:
+                event_existed_before = await self._event_exists_before_submission(run_id)
+            except BaseException as error:
+                await self._delete_owned_queued_run(run_id)
+                if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
+                    raise
+                if isinstance(error, RunConsistencyError):
+                    raise
+                raise RunSubmissionFailed() from None
+            events_created = False
             try:
                 await self._events.create_run(run_id)
+                events_created = True
                 await self._events.emit(
                     run_id,
                     "runtime",
@@ -377,11 +428,21 @@ class AnalysisRunner:
                     {"status": "queued"},
                 )
             except BaseException as error:
-                await self._rollback_submission(run_id)
-                if isinstance(error, asyncio.CancelledError):
+                if not event_existed_before and not events_created:
+                    events_created = await self._event_exists_after_failure(run_id)
+                await self._rollback_submission(run_id, events_created=events_created)
+                if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
                     raise
                 raise RunSubmissionFailed() from None
-            task = asyncio.create_task(self._execute(run_id, query), name=f"analysis:{run_id}")
+            coroutine = self._execute(run_id, query)
+            try:
+                task = asyncio.create_task(coroutine, name=f"analysis:{run_id}")
+            except BaseException as error:
+                coroutine.close()
+                await self._rollback_submission(run_id, events_created=True)
+                if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
+                    raise
+                raise RunSubmissionFailed() from None
             self._tasks[run_id] = task
 
             def task_done(done: asyncio.Task[None]) -> None:
@@ -402,8 +463,12 @@ class AnalysisRunner:
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
+            except RunConsistencyError:
+                self._run_consistency_failures.add(run_id)
             except Exception:
-                pass
+                self._enter_fail_stop(run_id)
+        if run_id in self._run_consistency_failures:
+            raise RunConsistencyError()
         return await self._runs.get(run_id)
 
     async def shutdown(self) -> None:
@@ -421,46 +486,217 @@ class AnalysisRunner:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _execute(self, run_id: str, query: str) -> None:
-        async with self._semaphore:
-            await self._runs.mark_running(run_id)
-            await self._events.emit(
-                run_id,
-                "runtime",
-                "run.started",
-                {"status": "running"},
-            )
-            context: AgentContext | None = None
-            try:
-                context = self._context_factory(run_id)
-                async with self._timeout_factory(self._timeout_seconds):
-                    result = await self._agent_executor(
-                        run_id=run_id,
-                        query=query,
-                        context=context,
+        try:
+            async with self._semaphore:
+                await self._ensure_running(run_id)
+                context: AgentContext | None = None
+                result: AgentRunResult | None = None
+                try:
+                    await self._events.emit(
+                        run_id,
+                        "runtime",
+                        "run.started",
+                        {"status": "running"},
                     )
-            except TimeoutError:
-                result = self._failure_result(
-                    run_id,
-                    context,
-                    status=FinalStatus.EXECUTION_FAILED,
-                    reason=StopReason.TASK_TIMEOUT,
-                )
-            except Exception:
-                result = self._failure_result(
-                    run_id,
-                    context,
-                    status=FinalStatus.INTERNAL_ERROR,
-                    reason=StopReason.INTERNAL_ERROR,
-                )
-            await self._runs.complete(run_id, result)
-            self._terminalizing.add(run_id)
+                except asyncio.CancelledError:
+                    if _task_is_cancelling():
+                        raise
+                    result = self._failure_result(
+                        run_id,
+                        context,
+                        status=FinalStatus.INTERNAL_ERROR,
+                        reason=StopReason.INTERNAL_ERROR,
+                    )
+                except Exception:
+                    result = self._failure_result(
+                        run_id,
+                        context,
+                        status=FinalStatus.INTERNAL_ERROR,
+                        reason=StopReason.INTERNAL_ERROR,
+                    )
+                if result is None:
+                    try:
+                        context = self._context_factory(run_id)
+                        async with self._timeout_factory(self._timeout_seconds):
+                            candidate = await self._agent_executor(
+                                run_id=run_id,
+                                query=query,
+                                context=context,
+                            )
+                    except TimeoutError:
+                        result = self._failure_result(
+                            run_id,
+                            context,
+                            status=FinalStatus.EXECUTION_FAILED,
+                            reason=StopReason.TASK_TIMEOUT,
+                        )
+                    except asyncio.CancelledError:
+                        if _task_is_cancelling():
+                            raise
+                        result = self._failure_result(
+                            run_id,
+                            context,
+                            status=FinalStatus.INTERNAL_ERROR,
+                            reason=StopReason.INTERNAL_ERROR,
+                        )
+                    except Exception:
+                        result = self._failure_result(
+                            run_id,
+                            context,
+                            status=FinalStatus.INTERNAL_ERROR,
+                            reason=StopReason.INTERNAL_ERROR,
+                        )
+                    else:
+                        result = self._validated_result(run_id, candidate, context)
+                self._terminalizing.add(run_id)
+                try:
+                    await self._ensure_run_terminal(run_id, result)
+                    await self._ensure_event_terminal(run_id, result)
+                finally:
+                    self._terminalizing.discard(run_id)
+            async with self._prune_lock:
+                await self._prune_locked()
+        except asyncio.CancelledError:
+            raise
+        except RunConsistencyError:
+            self._enter_fail_stop(run_id)
+            raise
+        except Exception:
+            self._enter_fail_stop(run_id)
+            raise RunConsistencyError() from None
+
+    def _validated_result(
+        self,
+        run_id: str,
+        candidate: object,
+        context: AgentContext | None,
+    ) -> AgentRunResult:
+        if type(candidate) is AgentRunResult:
             try:
-                if not await self._events.has_terminal(run_id):
-                    await self._events.emit_terminal(run_id, terminal_event_data(result))
-            finally:
-                self._terminalizing.discard(run_id)
-        async with self._prune_lock:
-            await self._prune_locked()
+                owned = AgentRunResult.model_validate_json(candidate.model_dump_json())
+            except Exception:
+                pass
+            else:
+                if owned.run_id == run_id:
+                    return owned
+        return self._failure_result(
+            run_id,
+            context,
+            status=FinalStatus.INTERNAL_ERROR,
+            reason=StopReason.INTERNAL_ERROR,
+        )
+
+    async def _ensure_running(self, run_id: str) -> None:
+        for _ in range(3):
+            try:
+                record = await self._runs.mark_running(run_id)
+            except asyncio.CancelledError:
+                if _task_is_cancelling():
+                    raise
+                record = await self._read_run_for_reconciliation(run_id)
+            except Exception:
+                record = await self._read_run_for_reconciliation(run_id)
+            if record.lifecycle_status is RunLifecycleStatus.RUNNING:
+                return
+            if record.lifecycle_status is not RunLifecycleStatus.QUEUED:
+                break
+        raise RunConsistencyError()
+
+    async def _ensure_run_terminal(self, run_id: str, result: AgentRunResult) -> None:
+        projection = _terminal_projection(result)
+        for _ in range(3):
+            try:
+                record = await self._runs.complete(run_id, result)
+            except asyncio.CancelledError:
+                if _task_is_cancelling():
+                    raise
+                record = await self._read_run_for_reconciliation(run_id)
+            except Exception:
+                record = await self._read_run_for_reconciliation(run_id)
+            if record.lifecycle_status is RunLifecycleStatus.TERMINAL and _terminal_record_matches(
+                record, projection
+            ):
+                return
+            if record.lifecycle_status is not RunLifecycleStatus.RUNNING:
+                break
+        raise RunConsistencyError()
+
+    async def _read_run_for_reconciliation(self, run_id: str) -> RunRecord:
+        try:
+            return await self._runs.get(run_id)
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
+            raise RunConsistencyError() from None
+        except Exception:
+            raise RunConsistencyError() from None
+
+    async def _ensure_event_terminal(self, run_id: str, result: AgentRunResult) -> None:
+        expected = dict(terminal_event_data(result))
+        for _ in range(3):
+            try:
+                terminal_exists = await self._events.has_terminal(run_id)
+            except asyncio.CancelledError:
+                if _task_is_cancelling():
+                    raise
+                terminal_exists = False
+            except Exception:
+                terminal_exists = False
+            if terminal_exists:
+                matches = await self._terminal_event_matches(run_id, expected)
+                if matches is True:
+                    return
+                if matches is False:
+                    raise RunConsistencyError()
+            try:
+                event = await self._events.emit_terminal(run_id, expected)
+            except asyncio.CancelledError:
+                if _task_is_cancelling():
+                    raise
+                continue
+            except Exception:
+                continue
+            if self._is_expected_terminal_event(event, expected):
+                return
+        try:
+            if await self._events.has_terminal(run_id) and await self._terminal_event_matches(
+                run_id, expected
+            ):
+                return
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
+        except Exception:
+            pass
+        raise RunConsistencyError()
+
+    async def _terminal_event_matches(
+        self,
+        run_id: str,
+        expected: Mapping[str, str],
+    ) -> bool | None:
+        try:
+            async for event in self._events.stream(run_id, after_sequence=None):
+                if event.type == "run.terminal":
+                    return self._is_expected_terminal_event(event, expected)
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
+            return None
+        except Exception:
+            return None
+        return False
+
+    @staticmethod
+    def _is_expected_terminal_event(
+        event: object,
+        expected: Mapping[str, str],
+    ) -> bool:
+        return (
+            type(event) is RunEvent
+            and event.type == "run.terminal"
+            and dict(event.data) == dict(expected)
+        )
 
     @staticmethod
     def _failure_result(
@@ -485,21 +721,125 @@ class AnalysisRunner:
             safe_trace=trace,
         )
 
-    async def _rollback_submission(self, run_id: str) -> None:
-        with suppress(Exception):
-            await self._events.delete_run(run_id, allow_unstarted=True)
-        with suppress(Exception):
-            await self._runs.delete_queued(run_id)
+    async def _event_exists_before_submission(self, run_id: str) -> bool:
+        try:
+            await self._events.high_water_mark(run_id)
+        except EventRunNotFound:
+            return False
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        except Exception:
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        return True
+
+    async def _run_exists_before_submission(self, run_id: str) -> bool:
+        try:
+            await self._runs.get(run_id)
+        except RunNotFound:
+            return False
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        except Exception:
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        return True
+
+    async def _run_exists_after_failure(self, run_id: str) -> bool:
+        try:
+            await self._runs.get(run_id)
+        except RunNotFound:
+            return False
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        except Exception:
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        return True
+
+    async def _event_exists_after_failure(self, run_id: str) -> bool:
+        try:
+            await self._events.high_water_mark(run_id)
+        except EventRunNotFound:
+            return False
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        except Exception:
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        return True
+
+    async def _rollback_submission(self, run_id: str, *, events_created: bool) -> None:
+        if events_created:
+            event_deleted = False
+            try:
+                event_deleted = await self._events.delete_run(run_id, allow_unstarted=True)
+            except EventRunNotFound:
+                event_deleted = True
+            except Exception:
+                event_deleted = not await self._event_exists_after_failure(run_id)
+            if not event_deleted:
+                event_deleted = not await self._event_exists_after_failure(run_id)
+            if not event_deleted:
+                self._enter_fail_stop()
+                raise RunConsistencyError()
+        await self._delete_owned_queued_run(run_id)
+
+    async def _delete_owned_queued_run(self, run_id: str) -> None:
+        try:
+            deleted = await self._runs.delete_queued(run_id)
+        except Exception:
+            self._enter_fail_stop()
+            raise RunConsistencyError() from None
+        if not deleted:
+            self._enter_fail_stop()
+            raise RunConsistencyError()
 
     async def _prune_locked(self) -> None:
-        expired = await self._runs.expired_terminal_ids()
+        try:
+            expired = await self._runs.expired_terminal_ids()
+        except asyncio.CancelledError:
+            if _task_is_cancelling():
+                raise
+            raise RunConsistencyError() from None
+        except Exception:
+            raise RunConsistencyError() from None
         for run_id in expired:
             try:
                 deleted = await self._events.delete_run(run_id)
+            except EventRunNotFound:
+                deleted = True
+            except asyncio.CancelledError:
+                if _task_is_cancelling():
+                    raise
+                deleted = not await self._event_exists_after_failure(run_id)
             except Exception:
-                continue
+                deleted = not await self._event_exists_after_failure(run_id)
             if deleted:
-                await self._runs.delete_terminal(run_id)
+                try:
+                    run_deleted = await self._runs.delete_terminal(run_id)
+                except Exception:
+                    raise RunConsistencyError() from None
+                if not run_deleted:
+                    raise RunConsistencyError()
+
+    def _enter_fail_stop(self, run_id: str | None = None) -> None:
+        self._accepting = False
+        self._consistency_failed = True
+        if run_id is not None:
+            self._run_consistency_failures.add(run_id)
 
     def _task_done(self, run_id: str, task: asyncio.Task[None]) -> None:
         if self._tasks.get(run_id) is task:
@@ -514,6 +854,7 @@ __all__ = [
     "InMemoryRunStore",
     "RunAlreadyExists",
     "RunCapacityExceeded",
+    "RunConsistencyError",
     "RunNotFound",
     "RunRecord",
     "RunStateConflict",
