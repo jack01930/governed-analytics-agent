@@ -241,6 +241,12 @@ def test_last_event_id_rejects_cross_run_invalid_and_ahead_cursors() -> None:
         parse_last_event_id("run-1", "run-2:2", high_water_mark=4)
     with pytest.raises(EventCursorAhead):
         parse_last_event_id("run-1", "run-1:5", high_water_mark=4)
+    with pytest.raises(InvalidEventCursor):
+        parse_last_event_id(
+            "run-1",
+            f"run-1:{2**63}",
+            high_water_mark=2**63,
+        )
 
 
 @pytest.mark.parametrize(
@@ -271,6 +277,23 @@ def test_event_cursor_is_strict_and_canonical() -> None:
     assert cursor.event_id == "run-1:0"
     with pytest.raises(ValidationError):
         EventCursor(run_id="run-1", sequence=True)
+
+
+@pytest.mark.asyncio
+async def test_open_stream_acquires_retention_lease_before_first_iteration() -> None:
+    store = InMemoryEventStore()
+    owner = object()
+    await store.create_run("run-1", owner_token=owner)
+    await store.emit_terminal(
+        "run-1",
+        {"final_status": "completed", "stop_reason": "answer_complete"},
+        owner_token=owner,
+    )
+
+    unopened = await store.open_stream("run-1", after_sequence=None)
+    assert await store.delete_run("run-1", owner_token=owner) is False
+    await unopened.aclose()
+    assert await store.delete_run("run-1", owner_token=owner) is True
 
 
 @pytest.mark.asyncio

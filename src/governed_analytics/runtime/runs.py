@@ -33,7 +33,7 @@ from governed_analytics.runtime.events import (
 from governed_analytics.runtime.events import RunNotFound as EventRunNotFound
 
 type TimeoutFactory = Callable[[float], AbstractAsyncContextManager[None]]
-type ContextFactory = Callable[[str], AgentContext]
+type ContextFactory = Callable[[str, object], AgentContext]
 type AgentExecutor = Callable[..., Awaitable[AgentRunResult]]
 type RunIdFactory = Callable[[], str]
 type WallClock = Callable[[], datetime]
@@ -610,6 +610,8 @@ class AnalysisRunner:
             return record
 
     async def get(self, run_id: str) -> RunRecord:
+        if self._consistency_failed or run_id in self._run_consistency_failures:
+            raise RunConsistencyError()
         return await self._runs.get(run_id)
 
     async def wait(self, run_id: str) -> RunRecord:
@@ -675,7 +677,7 @@ class AnalysisRunner:
                     )
                 if result is None:
                     try:
-                        context = self._context_factory(run_id)
+                        context = self._context_factory(run_id, owner_token)
                         async with self._timeout_factory(self._timeout_seconds):
                             candidate = await self._agent_executor(
                                 run_id=run_id,
@@ -1033,6 +1035,14 @@ class AnalysisRunner:
                     state,
                 )
             self._raise_coordination_failure(state, run_id)
+        if event_state.owned and event_state.deleted:
+            event_status = await self._event_generation_after_failure(
+                run_id,
+                event_state.owner_token,
+                state,
+            )
+            if event_status != "missing":
+                self._raise_coordination_failure(state, run_id)
         state.raise_if_pending()
 
     async def _delete_event_for_rollback(
@@ -1247,6 +1257,8 @@ class AnalysisRunner:
         coordination.raise_if_pending()
         for run_id in expired:
             owner_token = self._ownership_tokens.get(run_id)
+            if owner_token is None:
+                self._raise_coordination_failure(coordination, run_id)
             deleted = False
             for _ in range(3):
                 try:
@@ -1273,6 +1285,13 @@ class AnalysisRunner:
             ):
                 self._raise_coordination_failure(coordination, run_id)
             if deleted:
+                event_status = await self._event_generation_after_failure(
+                    run_id,
+                    owner_token,
+                    coordination,
+                )
+                if event_status != "missing":
+                    self._raise_coordination_failure(coordination, run_id)
                 self._ownership_tokens.pop(run_id, None)
             coordination.raise_if_pending()
 

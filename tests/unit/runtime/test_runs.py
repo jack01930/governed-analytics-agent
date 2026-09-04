@@ -22,6 +22,7 @@ from governed_analytics.agent.contracts import (
     JsonValue,
     Observation,
     ObservationValidation,
+    RunLifecycleStatus,
     SafeTrace,
     StopReason,
     StructuredModelRequest,
@@ -33,7 +34,7 @@ from governed_analytics.agent.tracing import InMemoryTraceRecorder
 from governed_analytics.config import AgentRuntimeSettings
 from governed_analytics.pricing import ModelPricing
 from governed_analytics.runtime.budgets import BudgetLedger, BudgetLimits
-from governed_analytics.runtime.events import InMemoryEventStore, RunEvent
+from governed_analytics.runtime.events import BoundEventSink, InMemoryEventStore, RunEvent
 from governed_analytics.runtime.events import RunNotFound as EventRunNotFound
 from governed_analytics.runtime.runs import (
     AnalysisRunner,
@@ -351,7 +352,7 @@ async def test_concurrency_two_queue_time_excluded_and_controlled_timeout() -> N
     context_created: list[tuple[str, float]] = []
     ids = iter(("run-1", "run-2", "run-3"))
 
-    def make_context(run_id: str) -> AgentContext:
+    def make_context(run_id: str, _owner_token: object) -> AgentContext:
         context_created.append((run_id, clock.monotonic()))
         return context_for(clock)
 
@@ -400,7 +401,7 @@ async def test_cancelled_event_consumer_does_not_cancel_analysis() -> None:
         settings=settings(),
         runs=run_store,
         events=event_store,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "run-1",
     )
@@ -433,7 +434,7 @@ async def test_cancelled_waiter_does_not_cancel_analysis_task() -> None:
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "run-1",
     )
@@ -475,7 +476,7 @@ async def test_submit_rolls_back_both_stores_when_event_creation_fails() -> None
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "run-1",
     )
@@ -520,7 +521,7 @@ async def test_submit_cancellation_during_event_preflight_removes_owned_run() ->
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -548,7 +549,7 @@ async def test_capacity_failure_creates_no_event_or_task() -> None:
         settings=settings(max_runs=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "new-run",
     )
@@ -563,18 +564,41 @@ async def add_terminal_pair(
     runs: InMemoryRunStore,
     events: InMemoryEventStore,
     run_id: str,
-) -> None:
-    await runs.create(run_id, "old")
-    await events.create_run(run_id)
-    await events.emit(run_id, "runtime", "run.created", {"status": "queued"})
-    await runs.mark_running(run_id)
-    await events.emit(run_id, "runtime", "run.started", {"status": "running"})
+) -> object:
+    owner_token = object()
+    await runs.create(run_id, "old", owner_token=owner_token)
+    await events.create_run(run_id, owner_token=owner_token)
+    await events.emit(
+        run_id,
+        "runtime",
+        "run.created",
+        {"status": "queued"},
+        owner_token=owner_token,
+    )
+    await runs.mark_running(run_id, owner_token=owner_token)
+    await events.emit(
+        run_id,
+        "runtime",
+        "run.started",
+        {"status": "running"},
+        owner_token=owner_token,
+    )
     result = completed_result(run_id)
-    await runs.complete(run_id, result)
+    await runs.complete(run_id, result, owner_token=owner_token)
     await events.emit_terminal(
         run_id,
         {"final_status": "completed", "stop_reason": "answer_complete"},
+        owner_token=owner_token,
     )
+    return owner_token
+
+
+def register_owned_generation(
+    runner: AnalysisRunner,
+    run_id: str,
+    owner_token: object,
+) -> None:
+    runner._ownership_tokens[run_id] = owner_token
 
 
 @pytest.mark.asyncio
@@ -582,18 +606,20 @@ async def test_submit_prunes_full_capacity_of_expired_terminal_runs_before_creat
     clock = FakeClock()
     runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
     events = InMemoryEventStore(clock=clock.now)
-    await add_terminal_pair(runs, events, "old-1")
-    await add_terminal_pair(runs, events, "old-2")
+    old_1_owner = await add_terminal_pair(runs, events, "old-1")
+    old_2_owner = await add_terminal_pair(runs, events, "old-2")
     clock.advance(1)
     executor = BlockingExecutor()
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "new-run",
     )
+    register_owned_generation(runner, "old-1", old_1_owner)
+    register_owned_generation(runner, "old-2", old_2_owner)
 
     created = await runner.submit("new")
     assert created.run_id == "new-run"
@@ -610,7 +636,7 @@ async def test_prune_retains_both_stores_while_stream_is_active_then_deletes_bot
     clock = FakeClock()
     runs = InMemoryRunStore(max_runs=10, retention_seconds=1, clock=clock)
     events = InMemoryEventStore(clock=clock.now)
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     stream = events.stream("old", after_sequence=None)
     assert (await anext(stream)).type == "run.created"
@@ -620,10 +646,11 @@ async def test_prune_retains_both_stores_while_stream_is_active_then_deletes_bot
         settings=settings(run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: next(ids),
     )
+    register_owned_generation(runner, "old", old_owner)
 
     await runner.submit("first")
     assert (await runs.get("old")).lifecycle_status == "terminal"
@@ -648,7 +675,7 @@ async def test_shutdown_cancels_work_without_writing_terminal_and_is_idempotent(
         settings=settings(max_concurrent_runs=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: next(ids),
     )
@@ -699,7 +726,7 @@ async def test_shutdown_waits_for_started_terminal_write_before_resources_may_cl
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=finish,
         id_factory=lambda: "run-1",
     )
@@ -730,7 +757,7 @@ async def test_unknown_exception_becomes_one_deterministic_internal_terminal() -
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=explode,
         id_factory=lambda: "run-1",
     )
@@ -789,7 +816,7 @@ async def test_timeout_during_model_call_preserves_reserved_cost_counts_and_safe
     events = InMemoryEventStore(clock=clock.now)
     timeout_factory = ControlledTimeoutFactory()
 
-    def make_context(_run_id: str) -> AgentContext:
+    def make_context(_run_id: str, _owner_token: object) -> AgentContext:
         budget = BudgetLedger(
             limits=BudgetLimits.from_settings(settings()),
             pricing=pricing(),
@@ -1034,7 +1061,7 @@ async def test_run_started_failure_still_writes_one_internal_terminal(timing: st
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1063,7 +1090,7 @@ async def test_mark_running_one_shot_failure_is_reconciled(timing: str) -> None:
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1084,7 +1111,7 @@ async def test_invalid_executor_result_becomes_internal_terminal(bad_result: obj
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(lambda _run_id: bad_result)),
         id_factory=lambda: "run-1",
     )
@@ -1107,7 +1134,7 @@ async def test_complete_one_shot_side_effect_failure_is_reconciled(timing: str) 
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1129,7 +1156,7 @@ async def test_persistent_complete_failure_fail_stops_instead_of_returning_runni
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1159,7 +1186,7 @@ async def test_terminal_event_one_shot_failures_are_reconciled(method: str, timi
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1192,7 +1219,7 @@ async def test_persistent_terminal_failure_fail_stops_runner_and_wait() -> None:
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: next(ids),
     )
@@ -1200,6 +1227,9 @@ async def test_persistent_terminal_failure_fail_stops_runner_and_wait() -> None:
 
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.wait("run-1")
+    assert (await runs.get("run-1")).lifecycle_status is RunLifecycleStatus.TERMINAL
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.get("run-1")
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.submit("second")
 
@@ -1215,7 +1245,7 @@ async def test_submit_does_not_delete_preexisting_event_run_on_create_collision(
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "collision",
     )
@@ -1237,7 +1267,7 @@ async def test_submit_create_run_failures_respect_event_ownership(timing: str) -
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1266,7 +1296,7 @@ async def test_submit_create_task_failure_closes_coroutine_and_rolls_back(
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1298,7 +1328,7 @@ async def test_rollback_delete_before_side_effect_failure_preserves_pair_and_fai
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1333,7 +1363,7 @@ async def test_rollback_delete_after_side_effect_failure_confirms_and_deletes_ru
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1366,16 +1396,17 @@ async def test_prune_delete_after_side_effect_failure_removes_both_stores() -> N
     clock = FakeClock()
     runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
     events = SideEffectFailureEventStore(clock=clock.now, method="delete_run", timing="after")
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "new",
     )
+    register_owned_generation(runner, "old", old_owner)
 
     await runner.submit("query")
     with pytest.raises(RunNotFound):
@@ -1395,17 +1426,18 @@ async def test_prune_delete_before_side_effect_failure_retains_both_stores() -> 
         timing="before",
         persistent=True,
     )
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     executor = BlockingExecutor()
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "new",
     )
+    register_owned_generation(runner, "old", old_owner)
 
     await runner.submit("query")
     assert (await runs.get("old")).lifecycle_status == "terminal"
@@ -1418,7 +1450,7 @@ async def test_expired_terminal_with_active_stream_still_consumes_physical_capac
     clock = FakeClock()
     runs = InMemoryRunStore(max_runs=1, retention_seconds=1, clock=clock)
     events = InMemoryEventStore(clock=clock.now)
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     stream = events.stream("old", after_sequence=None)
     await anext(stream)
@@ -1427,10 +1459,11 @@ async def test_expired_terminal_with_active_stream_still_consumes_physical_capac
         settings=settings(max_runs=1, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: next(ids),
     )
+    register_owned_generation(runner, "old", old_owner)
 
     with pytest.raises(RunCapacityExceeded):
         await runner.submit("blocked")
@@ -1464,7 +1497,7 @@ async def test_rollback_reconciles_one_shot_run_delete_failure(timing: str) -> N
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1496,7 +1529,7 @@ async def test_persistent_rollback_run_delete_restores_pair_and_fail_stops() -> 
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: next(ids),
     )
@@ -1521,16 +1554,17 @@ async def test_prune_reconciles_one_shot_terminal_run_delete_failure(timing: str
         retention_seconds=1,
     )
     events = InMemoryEventStore(clock=clock.now)
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "new",
     )
+    register_owned_generation(runner, "old", old_owner)
 
     assert (await runner.submit("query")).run_id == "new"
     with pytest.raises(RunNotFound):
@@ -1552,17 +1586,18 @@ async def test_persistent_prune_run_delete_fail_stops_after_event_delete() -> No
         retention_seconds=1,
     )
     events = InMemoryEventStore(clock=clock.now)
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     ids = iter(("new", "rejected"))
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: next(ids),
     )
+    register_owned_generation(runner, "old", old_owner)
 
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.submit("query")
@@ -1651,7 +1686,7 @@ async def test_rollback_delays_cancellation_until_both_owned_records_are_deleted
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1673,16 +1708,17 @@ async def test_prune_delays_cancellation_until_terminal_pair_is_deleted() -> Non
     clock = FakeClock()
     runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
     events = DeleteThenBlockEventStore(clock=clock.now, fail_created=False)
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "new",
     )
+    register_owned_generation(runner, "old", old_owner)
 
     submission = asyncio.create_task(runner.submit("query"))
     await events.deleted.wait()
@@ -1709,7 +1745,7 @@ async def test_rollback_reconciles_run_delete_before_rethrowing_cancellation() -
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1735,16 +1771,17 @@ async def test_prune_reconciles_run_delete_before_rethrowing_cancellation() -> N
         retention_seconds=1,
     )
     events = InMemoryEventStore(clock=clock.now)
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "new",
     )
+    register_owned_generation(runner, "old", old_owner)
 
     submission = asyncio.create_task(runner.submit("query"))
     await runs.deleted.wait()
@@ -1811,7 +1848,7 @@ async def test_inflight_submit_rechecks_fail_stop_before_starting_task() -> None
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=execute,
         id_factory=lambda: next(ids),
     )
@@ -1885,7 +1922,7 @@ async def test_terminal_matcher_ignores_events_beyond_high_water_snapshot() -> N
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -1932,7 +1969,7 @@ async def test_run_create_reconciliation_delays_cancellation_through_blocked_rea
         settings=settings(max_runs=3),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: next(ids),
     )
@@ -1979,7 +2016,7 @@ async def test_event_create_reconciliation_delays_cancellation_through_blocked_r
         settings=settings(max_runs=3),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: next(ids),
     )
@@ -2033,7 +2070,7 @@ async def test_persistent_run_create_readback_failure_stably_fail_stops() -> Non
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -2067,7 +2104,7 @@ async def test_persistent_event_create_readback_failure_stably_fail_stops() -> N
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -2138,7 +2175,7 @@ async def test_rollback_delete_readback_delays_cancellation_until_pair_is_clean(
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -2162,16 +2199,17 @@ async def test_prune_delete_readback_delays_cancellation_until_pair_is_clean() -
     clock = FakeClock()
     runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
     events = DeleteThenFailBlockingReadEventStore(clock=clock.now, fail_created=False)
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "new",
     )
+    register_owned_generation(runner, "old", old_owner)
 
     submission = asyncio.create_task(runner.submit("query"))
     await events.read_started.wait()
@@ -2239,7 +2277,7 @@ async def test_restore_compensation_delays_cancellation_until_run_created(window
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -2310,7 +2348,7 @@ async def test_incomplete_terminal_snapshot_fail_stops_without_live_stream() -> 
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -2367,7 +2405,7 @@ async def test_matching_terminal_must_be_snapshot_boundary_event() -> None:
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -2407,7 +2445,7 @@ async def test_failed_rollback_never_restores_an_unowned_event_run(
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "collision",
     )
@@ -2497,7 +2535,7 @@ async def test_cleanup_exception_cannot_mask_cancellation_during_rollback_delete
         settings=settings(max_runs=3),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: next(ids),
     )
@@ -2581,7 +2619,7 @@ async def test_readback_cleanup_exception_preserves_cancellation(boundary: str) 
         settings=settings(max_runs=3),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: next(ids),
     )
@@ -2665,7 +2703,7 @@ async def test_restore_cleanup_exception_preserves_cancellation(boundary: str) -
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -2716,7 +2754,7 @@ async def test_run_create_failure_never_deletes_a_foreign_generation() -> None:
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "collision",
     )
@@ -2769,7 +2807,7 @@ async def test_event_create_failure_never_deletes_a_foreign_generation(
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "collision",
     )
@@ -2871,7 +2909,7 @@ async def test_restore_never_emits_into_a_foreign_replacement_generation() -> No
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=executor,
         id_factory=lambda: "collision",
     )
@@ -2949,7 +2987,7 @@ async def test_dependency_swallowing_cancellation_still_cancels_submit_after_cle
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -3033,7 +3071,7 @@ async def test_restore_replay_samples_swallowed_cancellation_but_respects_uncanc
         settings=settings(),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "run-1",
     )
@@ -3070,16 +3108,17 @@ async def test_prune_expired_ids_cleanup_exception_cannot_mask_cancellation() ->
     clock = FakeClock()
     runs = MaskedExpiredIdsRunStore(clock=clock)
     events = InMemoryEventStore(clock=clock.now)
-    await add_terminal_pair(runs, events, "old")
+    old_owner = await add_terminal_pair(runs, events, "old")
     clock.advance(1)
     runner = AnalysisRunner(
         settings=settings(max_runs=2, run_retention_seconds=1),
         runs=runs,
         events=events,
-        context_factory=lambda _run_id: context_for(clock),
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
         agent_executor=cast(Any, immediate_executor(completed_result)),
         id_factory=lambda: "new",
     )
+    register_owned_generation(runner, "old", old_owner)
 
     submission = asyncio.create_task(runner.submit("query"))
     await runs.masker.boundary_started.wait()
@@ -3092,3 +3131,348 @@ async def test_prune_expired_ids_cleanup_exception_cannot_mask_cancellation() ->
     assert await events.high_water_mark("old") == 3
     assert runs.masker.cleanup_task is not None
     assert runs.masker.cleanup_task.done()
+
+
+class ForeignReplacementBeforeDomainEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.foreign_owner = object()
+        self.foreign_snapshot: tuple[RunEvent, ...] | None = None
+
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> RunEvent:
+        if event_type == "behavior.decided":
+            await InMemoryEventStore.emit_terminal(
+                self,
+                run_id,
+                {"final_status": "internal_error", "stop_reason": "internal_error"},
+                owner_token=owner_token,
+            )
+            assert await InMemoryEventStore.delete_run(
+                self,
+                run_id,
+                owner_token=owner_token,
+            )
+            await InMemoryEventStore.create_run(
+                self,
+                run_id,
+                owner_token=self.foreign_owner,
+            )
+            await InMemoryEventStore.emit(
+                self,
+                run_id,
+                "runtime",
+                "run.created",
+                {"status": "queued"},
+                owner_token=self.foreign_owner,
+            )
+            self.foreign_snapshot = await InMemoryEventStore.replay_snapshot(
+                self,
+                run_id,
+                high_water_mark=1,
+                owner_token=self.foreign_owner,
+            )
+        return await super().emit(
+            run_id,
+            node,
+            event_type,
+            data,
+            owner_token=owner_token,
+        )
+
+
+@pytest.mark.asyncio
+async def test_context_factory_binds_exact_submission_token_to_domain_events() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = ForeignReplacementBeforeDomainEventStore(clock=clock.now)
+    factory_calls: list[tuple[str, object]] = []
+
+    def make_context(run_id: str, owner_token: object) -> AgentContext:
+        factory_calls.append((run_id, owner_token))
+        context = context_for(clock)
+        return AgentContext(
+            model_invoker=context.model_invoker,
+            tools=context.tools,
+            budget=context.budget,
+            events=BoundEventSink(events, run_id, owner_token=owner_token),
+            trace_recorder=context.trace_recorder,
+            clock=context.clock,
+        )
+
+    async def emit_domain_event(
+        *, run_id: str, query: str, context: AgentContext
+    ) -> AgentRunResult:
+        del query
+        await context.events.emit(
+            "decide_behavior",
+            "behavior.decided",
+            {"action": "execute", "reason_code": "ready", "missing_fields": ()},
+        )
+        return completed_result(run_id)
+
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=make_context,
+        agent_executor=emit_domain_event,
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.wait("run-1")
+    assert len(factory_calls) == 1
+    assert factory_calls[0][0] == "run-1"
+    assert factory_calls[0][1] is not events.foreign_owner
+    assert events.foreign_snapshot is not None
+    current = await InMemoryEventStore.replay_snapshot(
+        events,
+        "run-1",
+        high_water_mark=1,
+        owner_token=events.foreign_owner,
+    )
+    assert tuple(event.model_dump_json() for event in current) == tuple(
+        event.model_dump_json() for event in events.foreign_snapshot
+    )
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+@pytest.mark.asyncio
+async def test_prune_without_known_owner_token_preserves_foreign_terminal_pair() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    foreign_owner = object()
+    await runs.create("old", "foreign query", owner_token=foreign_owner)
+    await events.create_run("old", owner_token=foreign_owner)
+    await events.emit(
+        "old",
+        "runtime",
+        "run.created",
+        {"status": "queued"},
+        owner_token=foreign_owner,
+    )
+    await runs.mark_running("old", owner_token=foreign_owner)
+    await events.emit(
+        "old",
+        "runtime",
+        "run.started",
+        {"status": "running"},
+        owner_token=foreign_owner,
+    )
+    await runs.complete("old", completed_result("old"), owner_token=foreign_owner)
+    await events.emit_terminal(
+        "old",
+        {"final_status": "completed", "stop_reason": "answer_complete"},
+        owner_token=foreign_owner,
+    )
+    clock.advance(1)
+    original_run = (await runs.get("old", owner_token=foreign_owner)).model_dump_json()
+    original_events = tuple(
+        event.model_dump_json()
+        for event in await events.replay_snapshot(
+            "old",
+            high_water_mark=3,
+            owner_token=foreign_owner,
+        )
+    )
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "new",
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+    assert (await runs.get("old", owner_token=foreign_owner)).model_dump_json() == original_run
+    current_events = await events.replay_snapshot(
+        "old",
+        high_water_mark=3,
+        owner_token=foreign_owner,
+    )
+    assert tuple(event.model_dump_json() for event in current_events) == original_events
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("later")
+
+
+class ReplaceEventDuringRunDeleteStore(InMemoryRunStore):
+    def __init__(
+        self,
+        *,
+        clock: FakeClock,
+        events: InMemoryEventStore,
+        method: str,
+        foreign_owner: object,
+    ) -> None:
+        super().__init__(max_runs=3, retention_seconds=1, clock=clock)
+        self.events = events
+        self.method = method
+        self.foreign_owner = foreign_owner
+
+    async def _replace_event_generation(self, run_id: str) -> None:
+        await InMemoryEventStore.create_run(
+            self.events,
+            run_id,
+            owner_token=self.foreign_owner,
+        )
+        await InMemoryEventStore.emit(
+            self.events,
+            run_id,
+            "runtime",
+            "run.created",
+            {"status": "queued"},
+            owner_token=self.foreign_owner,
+        )
+
+    async def delete_queued(
+        self, run_id: str, *, owner_token: object | None = None
+    ) -> bool:
+        deleted = await super().delete_queued(run_id, owner_token=owner_token)
+        if deleted and self.method == "delete_queued":
+            await self._replace_event_generation(run_id)
+        return deleted
+
+    async def delete_terminal(
+        self, run_id: str, *, owner_token: object | None = None
+    ) -> bool:
+        deleted = await super().delete_terminal(run_id, owner_token=owner_token)
+        if deleted and self.method == "delete_terminal":
+            await self._replace_event_generation(run_id)
+        return deleted
+
+
+class FailFirstCreatedEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.fail_first_created = True
+
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> RunEvent:
+        if event_type == "run.created" and self.fail_first_created:
+            self.fail_first_created = False
+            raise RuntimeError(SENTINEL)
+        return await super().emit(
+            run_id,
+            node,
+            event_type,
+            data,
+            owner_token=owner_token,
+        )
+
+
+@pytest.mark.asyncio
+async def test_rollback_final_event_readback_preserves_replacement_generation() -> None:
+    clock = FakeClock()
+    events = FailFirstCreatedEventStore(clock=clock.now)
+    foreign_owner = object()
+    runs = ReplaceEventDuringRunDeleteStore(
+        clock=clock,
+        events=events,
+        method="delete_queued",
+        foreign_owner=foreign_owner,
+    )
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+    snapshot = await events.replay_snapshot(
+        "run-1",
+        high_water_mark=1,
+        owner_token=foreign_owner,
+    )
+    frozen = tuple(event.model_dump_json() for event in snapshot)
+    assert tuple(
+        event.model_dump_json()
+        for event in await events.replay_snapshot(
+            "run-1",
+            high_water_mark=1,
+            owner_token=foreign_owner,
+        )
+    ) == frozen
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("later")
+
+
+@pytest.mark.asyncio
+async def test_prune_final_event_readback_preserves_replacement_generation() -> None:
+    clock = FakeClock()
+    events = InMemoryEventStore(clock=clock.now)
+    foreign_owner = object()
+    runs = ReplaceEventDuringRunDeleteStore(
+        clock=clock,
+        events=events,
+        method="delete_terminal",
+        foreign_owner=foreign_owner,
+    )
+    owner = object()
+    await runs.create("old", "query", owner_token=owner)
+    await events.create_run("old", owner_token=owner)
+    await events.emit(
+        "old", "runtime", "run.created", {"status": "queued"}, owner_token=owner
+    )
+    await runs.mark_running("old", owner_token=owner)
+    await events.emit(
+        "old", "runtime", "run.started", {"status": "running"}, owner_token=owner
+    )
+    await runs.complete("old", completed_result("old"), owner_token=owner)
+    await events.emit_terminal(
+        "old",
+        {"final_status": "completed", "stop_reason": "answer_complete"},
+        owner_token=owner,
+    )
+    clock.advance(1)
+    runner = AnalysisRunner(
+        settings=settings(max_runs=3, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "new",
+    )
+    runner._ownership_tokens["old"] = owner
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+    snapshot = await events.replay_snapshot(
+        "old",
+        high_water_mark=1,
+        owner_token=foreign_owner,
+    )
+    frozen = tuple(event.model_dump_json() for event in snapshot)
+    assert tuple(
+        event.model_dump_json()
+        for event in await events.replay_snapshot(
+            "old",
+            high_water_mark=1,
+            owner_token=foreign_owner,
+        )
+    ) == frozen
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("later")

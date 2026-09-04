@@ -689,6 +689,10 @@ class EventStore(Protocol):
 
     async def has_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool: ...
 
+    async def open_stream(
+        self, run_id: str, *, after_sequence: int | None
+    ) -> AsyncIterator[RunEvent]: ...
+
     def stream(self, run_id: str, *, after_sequence: int | None) -> AsyncIterator[RunEvent]: ...
 
     async def delete_run(
@@ -709,6 +713,38 @@ class _RunBuffer:
     active_streams: int = 0
     deleted: bool = False
     owner_token: object | None = field(default=None, repr=False)
+
+
+class _OpenedEventStream:
+    def __init__(
+        self,
+        buffer: _RunBuffer,
+        iterator: AsyncGenerator[RunEvent, None],
+    ) -> None:
+        self._buffer = buffer
+        self._iterator = iterator
+        self._closed = False
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> RunEvent:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await anext(self._iterator)
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._iterator.aclose()
+        async with self._buffer.condition:
+            self._buffer.active_streams -= 1
+            self._buffer.condition.notify_all()
 
 
 def _utc_now() -> datetime:
@@ -865,12 +901,12 @@ class InMemoryEventStore:
         finally:
             condition.release()
 
-    async def stream(
+    async def open_stream(
         self,
         run_id: str,
         *,
         after_sequence: int | None,
-    ) -> AsyncGenerator[RunEvent, None]:
+    ) -> _OpenedEventStream:
         if after_sequence is not None and (type(after_sequence) is not int or after_sequence < 0):
             raise InvalidEventCursor()
         buffer, condition = await self._locked_buffer(run_id)
@@ -879,29 +915,50 @@ class InMemoryEventStore:
             raise EventCursorAhead()
         buffer.active_streams += 1
         condition.release()
-        cursor = after_sequence or 0
+        return _OpenedEventStream(
+            buffer,
+            self._stream_buffer(buffer, after_sequence=after_sequence),
+        )
+
+    async def stream(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int | None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        opened = await self.open_stream(run_id, after_sequence=after_sequence)
         try:
-            while True:
-                async with buffer.condition:
-                    if buffer.deleted:
-                        raise RunNotFound()
-                    batch = tuple(event for event in buffer.events if event.sequence > cursor)
-                    if not batch:
-                        if buffer.terminal:
-                            return
-                        await buffer.condition.wait()
-                        continue
-                for event in batch:
-                    if event.sequence <= cursor:
-                        continue
-                    cursor = event.sequence
-                    yield event
-                    if event.type == "run.terminal":
-                        return
+            async for event in opened:
+                yield event
         finally:
+            close = getattr(opened, "aclose", None)
+            if callable(close):
+                await close()
+
+    async def _stream_buffer(
+        self,
+        buffer: _RunBuffer,
+        *,
+        after_sequence: int | None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        cursor = after_sequence or 0
+        while True:
             async with buffer.condition:
-                buffer.active_streams -= 1
-                buffer.condition.notify_all()
+                if buffer.deleted:
+                    raise RunNotFound()
+                batch = tuple(event for event in buffer.events if event.sequence > cursor)
+                if not batch:
+                    if buffer.terminal:
+                        return
+                    await buffer.condition.wait()
+                    continue
+            for event in batch:
+                if event.sequence <= cursor:
+                    continue
+                cursor = event.sequence
+                yield event
+                if event.type == "run.terminal":
+                    return
 
     async def delete_run(
         self,
@@ -970,7 +1027,11 @@ def parse_last_event_id(
         safe_run_id = _safe_run_id(run_id)
     except InvalidRunEvent:
         raise InvalidEventCursor() from None
-    if type(high_water_mark) is not int or high_water_mark < 0:
+    if (
+        type(high_water_mark) is not int
+        or high_water_mark < 0
+        or high_water_mark > _MAX_SEQUENCE
+    ):
         raise InvalidEventCursor()
     if value is None:
         return None
@@ -983,6 +1044,8 @@ def parse_last_event_id(
         sequence = int(match.group(2))
     except ValueError:
         raise InvalidEventCursor() from None
+    if sequence > _MAX_SEQUENCE:
+        raise InvalidEventCursor()
     if sequence > high_water_mark:
         raise EventCursorAhead()
     return sequence
