@@ -4,7 +4,7 @@ import asyncio
 import gc
 import json
 import warnings
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, cast
@@ -33,7 +33,7 @@ from governed_analytics.agent.tracing import InMemoryTraceRecorder
 from governed_analytics.config import AgentRuntimeSettings
 from governed_analytics.pricing import ModelPricing
 from governed_analytics.runtime.budgets import BudgetLedger, BudgetLimits
-from governed_analytics.runtime.events import InMemoryEventStore
+from governed_analytics.runtime.events import InMemoryEventStore, RunEvent
 from governed_analytics.runtime.events import RunNotFound as EventRunNotFound
 from governed_analytics.runtime.runs import (
     AnalysisRunner,
@@ -888,22 +888,57 @@ class SideEffectFailureEventStore(InMemoryEventStore):
 
 
 class SideEffectFailureRunStore(InMemoryRunStore):
-    def __init__(self, *, clock: FakeClock, timing: str, persistent: bool = False) -> None:
-        super().__init__(max_runs=4, retention_seconds=3600, clock=clock)
+    def __init__(
+        self,
+        *,
+        clock: FakeClock,
+        timing: str,
+        method: str = "complete",
+        persistent: bool = False,
+        max_runs: int = 4,
+        retention_seconds: int = 3600,
+    ) -> None:
+        super().__init__(
+            max_runs=max_runs,
+            retention_seconds=retention_seconds,
+            clock=clock,
+        )
         self.timing = timing
+        self.method = method
         self.persistent = persistent
-        self.failed = False
+        self.failures = 0
+
+    def _fails(self, method: str, timing: str) -> bool:
+        if self.method != method or self.timing != timing:
+            return False
+        if self.failures and not self.persistent:
+            return False
+        self.failures += 1
+        return True
 
     async def complete(self, run_id: str, result: AgentRunResult) -> Any:
-        should_fail = self.persistent or not self.failed
-        if self.timing == "before" and should_fail:
-            self.failed = True
+        if self._fails("complete", "before"):
             raise RuntimeError(SENTINEL)
         record = await super().complete(run_id, result)
-        if self.timing == "after" and should_fail:
-            self.failed = True
+        if self._fails("complete", "after"):
             raise RuntimeError(SENTINEL)
         return record
+
+    async def delete_queued(self, run_id: str) -> bool:
+        if self._fails("delete_queued", "before"):
+            raise RuntimeError(SENTINEL)
+        deleted = await super().delete_queued(run_id)
+        if self._fails("delete_queued", "after"):
+            raise RuntimeError(SENTINEL)
+        return deleted
+
+    async def delete_terminal(self, run_id: str) -> bool:
+        if self._fails("delete_terminal", "before"):
+            raise RuntimeError(SENTINEL)
+        deleted = await super().delete_terminal(run_id)
+        if self._fails("delete_terminal", "after"):
+            raise RuntimeError(SENTINEL)
+        return deleted
 
 
 class StartFailureRunStore(InMemoryRunStore):
@@ -1339,3 +1374,412 @@ async def test_expired_terminal_with_active_stream_still_consumes_physical_capac
     with pytest.raises(EventRunNotFound):
         await events.high_water_mark("old")
     await runner.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before", "after"])
+async def test_rollback_reconciles_one_shot_run_delete_failure(timing: str) -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(
+        clock=clock,
+        method="delete_queued",
+        timing=timing,
+    )
+    events = SideEffectFailureEventStore(
+        clock=clock.now,
+        method="run.created",
+        timing="before",
+    )
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    with pytest.raises(RunSubmissionFailed, match="run submission failed"):
+        await runner.submit("query")
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+
+
+@pytest.mark.asyncio
+async def test_persistent_rollback_run_delete_restores_pair_and_fail_stops() -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(
+        clock=clock,
+        method="delete_queued",
+        timing="before",
+        persistent=True,
+    )
+    events = SideEffectFailureEventStore(
+        clock=clock.now,
+        method="run.created",
+        timing="before",
+    )
+    ids = iter(("run-1", "run-2"))
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: next(ids),
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+    assert (await runs.get("run-1")).lifecycle_status == "queued"
+    assert await events.high_water_mark("run-1") == 1
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before", "after"])
+async def test_prune_reconciles_one_shot_terminal_run_delete_failure(timing: str) -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(
+        clock=clock,
+        method="delete_terminal",
+        timing=timing,
+        max_runs=2,
+        retention_seconds=1,
+    )
+    events = InMemoryEventStore(clock=clock.now)
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "new",
+    )
+
+    assert (await runner.submit("query")).run_id == "new"
+    with pytest.raises(RunNotFound):
+        await runs.get("old")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("old")
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_persistent_prune_run_delete_fail_stops_after_event_delete() -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(
+        clock=clock,
+        method="delete_terminal",
+        timing="before",
+        persistent=True,
+        max_runs=2,
+        retention_seconds=1,
+    )
+    events = InMemoryEventStore(clock=clock.now)
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    ids = iter(("new", "rejected"))
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: next(ids),
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+    assert (await runs.get("old")).lifecycle_status == "terminal"
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("old")
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+class DeleteThenBlockEventStore(InMemoryEventStore):
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime],
+        fail_created: bool,
+    ) -> None:
+        super().__init__(clock=clock)
+        self.fail_created = fail_created
+        self.deleted = asyncio.Event()
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+        if self.fail_created and event_type == "run.created":
+            self.fail_created = False
+            raise RuntimeError(SENTINEL)
+        return await super().emit(run_id, node, event_type, data)
+
+    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
+        deleted = await super().delete_run(run_id, allow_unstarted=allow_unstarted)
+        self.deleted.set()
+        await asyncio.Event().wait()
+        return deleted
+
+
+class DeleteThenBlockRunStore(InMemoryRunStore):
+    def __init__(
+        self,
+        *,
+        clock: FakeClock,
+        method: str,
+        retention_seconds: int = 3600,
+    ) -> None:
+        super().__init__(max_runs=2, retention_seconds=retention_seconds, clock=clock)
+        self.method = method
+        self.deleted = asyncio.Event()
+
+    async def delete_queued(self, run_id: str) -> bool:
+        deleted = await super().delete_queued(run_id)
+        if self.method == "delete_queued":
+            self.deleted.set()
+            await asyncio.Event().wait()
+        return deleted
+
+    async def delete_terminal(self, run_id: str) -> bool:
+        deleted = await super().delete_terminal(run_id)
+        if self.method == "delete_terminal":
+            self.deleted.set()
+            await asyncio.Event().wait()
+        return deleted
+
+
+@pytest.mark.asyncio
+async def test_rollback_delays_cancellation_until_both_owned_records_are_deleted() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = DeleteThenBlockEventStore(clock=clock.now, fail_created=True)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.deleted.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+
+
+@pytest.mark.asyncio
+async def test_prune_delays_cancellation_until_terminal_pair_is_deleted() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
+    events = DeleteThenBlockEventStore(clock=clock.now, fail_created=False)
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "new",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.deleted.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("old")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("old")
+
+
+@pytest.mark.asyncio
+async def test_rollback_reconciles_run_delete_before_rethrowing_cancellation() -> None:
+    clock = FakeClock()
+    runs = DeleteThenBlockRunStore(clock=clock, method="delete_queued")
+    events = SideEffectFailureEventStore(
+        clock=clock.now,
+        method="run.created",
+        timing="before",
+    )
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await runs.deleted.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+
+
+@pytest.mark.asyncio
+async def test_prune_reconciles_run_delete_before_rethrowing_cancellation() -> None:
+    clock = FakeClock()
+    runs = DeleteThenBlockRunStore(
+        clock=clock,
+        method="delete_terminal",
+        retention_seconds=1,
+    )
+    events = InMemoryEventStore(clock=clock.now)
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "new",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await runs.deleted.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("old")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("old")
+
+
+class RacingFailStopEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.racing_created = asyncio.Event()
+        self.release_racing = asyncio.Event()
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+        event = await super().emit(run_id, node, event_type, data)
+        if run_id == "racing" and event_type == "run.created":
+            self.racing_created.set()
+            await self.release_racing.wait()
+        return event
+
+    async def emit_terminal(self, run_id: str, data: Any) -> Any:
+        if run_id == "failing":
+            raise RuntimeError(SENTINEL)
+        return await super().emit_terminal(run_id, data)
+
+
+@pytest.mark.asyncio
+async def test_inflight_submit_rechecks_fail_stop_before_starting_task() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=3, retention_seconds=3600, clock=clock)
+    events = RacingFailStopEventStore(clock=clock.now)
+    release_failing = asyncio.Event()
+    executor_calls: list[str] = []
+
+    async def execute(*, run_id: str, query: str, context: AgentContext) -> AgentRunResult:
+        del query, context
+        executor_calls.append(run_id)
+        if run_id == "failing":
+            await release_failing.wait()
+        return completed_result(run_id)
+
+    ids = iter(("failing", "racing"))
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=execute,
+        id_factory=lambda: next(ids),
+    )
+    await runner.submit("first")
+    await wait_until(lambda: executor_calls == ["failing"])
+    racing = asyncio.create_task(runner.submit("second"))
+    await events.racing_created.wait()
+    release_failing.set()
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.wait("failing")
+    events.release_racing.set()
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await racing
+    assert executor_calls == ["failing"]
+    with pytest.raises(RunNotFound):
+        await runs.get("racing")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("racing")
+
+
+class FutureTerminalEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.clock = clock
+        self.replay: list[RunEvent] = []
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> RunEvent:
+        event = await super().emit(run_id, node, event_type, data)
+        self.replay.append(event)
+        return event
+
+    async def has_terminal(self, run_id: str) -> bool:
+        del run_id
+        return True
+
+    async def stream(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int | None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        del after_sequence
+        for event in tuple(self.replay):
+            yield event
+        yield RunEvent(
+            event_id=f"{run_id}:3",
+            sequence=3,
+            run_id=run_id,
+            timestamp=self.clock(),
+            node="runtime",
+            type="run.terminal",
+            data={"final_status": "completed", "stop_reason": "answer_complete"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_matcher_ignores_events_beyond_high_water_snapshot() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = FutureTerminalEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.wait("run-1")

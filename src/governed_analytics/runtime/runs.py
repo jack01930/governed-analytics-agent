@@ -434,6 +434,9 @@ class AnalysisRunner:
                 if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
                     raise
                 raise RunSubmissionFailed() from None
+            if self._consistency_failed:
+                await self._rollback_submission(run_id, events_created=True)
+                raise RunConsistencyError()
             coroutine = self._execute(run_id, query)
             try:
                 task = asyncio.create_task(coroutine, name=f"analysis:{run_id}")
@@ -647,7 +650,7 @@ class AnalysisRunner:
                 if matches is True:
                     return
                 if matches is False:
-                    raise RunConsistencyError()
+                    continue
             try:
                 event = await self._events.emit_terminal(run_id, expected)
             except asyncio.CancelledError:
@@ -676,9 +679,16 @@ class AnalysisRunner:
         expected: Mapping[str, str],
     ) -> bool | None:
         try:
+            high_water_mark = await self._events.high_water_mark(run_id)
+            if high_water_mark == 0:
+                return False
             async for event in self._events.stream(run_id, after_sequence=None):
+                if event.sequence > high_water_mark:
+                    return False
                 if event.type == "run.terminal":
                     return self._is_expected_terminal_event(event, expected)
+                if event.sequence == high_water_mark:
+                    return False
         except asyncio.CancelledError:
             if _task_is_cancelling():
                 raise
@@ -782,30 +792,149 @@ class AnalysisRunner:
         return True
 
     async def _rollback_submission(self, run_id: str, *, events_created: bool) -> None:
+        pending_cancellation: asyncio.CancelledError | None = None
         if events_created:
-            event_deleted = False
-            try:
-                event_deleted = await self._events.delete_run(run_id, allow_unstarted=True)
-            except EventRunNotFound:
-                event_deleted = True
-            except Exception:
-                event_deleted = not await self._event_exists_after_failure(run_id)
-            if not event_deleted:
-                event_deleted = not await self._event_exists_after_failure(run_id)
+            event_deleted, pending_cancellation = await self._delete_event_for_rollback(run_id)
             if not event_deleted:
                 self._enter_fail_stop()
+                if pending_cancellation is not None:
+                    raise pending_cancellation
                 raise RunConsistencyError()
-        await self._delete_owned_queued_run(run_id)
+        try:
+            await self._delete_owned_queued_run(run_id)
+        except asyncio.CancelledError as error:
+            pending_cancellation = pending_cancellation or error
+            record = await self._run_record_after_delete(run_id)
+            if record is not None:
+                self._enter_fail_stop()
+                try:
+                    await self._restore_owned_event_run(run_id)
+                except RunConsistencyError:
+                    raise pending_cancellation from None
+        except RunConsistencyError:
+            self._enter_fail_stop()
+            try:
+                await self._restore_owned_event_run(run_id)
+            except RunConsistencyError:
+                if pending_cancellation is not None:
+                    raise pending_cancellation from None
+                raise
+            if pending_cancellation is not None:
+                raise pending_cancellation from None
+            raise
+        if pending_cancellation is not None:
+            raise pending_cancellation
+
+    async def _delete_event_for_rollback(
+        self,
+        run_id: str,
+    ) -> tuple[bool, asyncio.CancelledError | None]:
+        pending_cancellation: asyncio.CancelledError | None = None
+        for _ in range(3):
+            failed = False
+            try:
+                deleted = await self._events.delete_run(run_id, allow_unstarted=True)
+            except EventRunNotFound:
+                return True, pending_cancellation
+            except asyncio.CancelledError as error:
+                pending_cancellation = pending_cancellation or error
+                deleted = False
+                failed = True
+            except Exception:
+                deleted = False
+                failed = True
+            if not await self._event_exists_after_failure(run_id):
+                return True, pending_cancellation
+            if not failed and not deleted:
+                return False, pending_cancellation
+        return False, pending_cancellation
 
     async def _delete_owned_queued_run(self, run_id: str) -> None:
+        pending_cancellation: asyncio.CancelledError | None = None
+        for _ in range(3):
+            try:
+                deleted = await self._runs.delete_queued(run_id)
+            except asyncio.CancelledError as error:
+                pending_cancellation = pending_cancellation or error
+                deleted = False
+            except Exception:
+                deleted = False
+            record = await self._run_record_after_delete(run_id)
+            if record is None:
+                if pending_cancellation is not None:
+                    raise pending_cancellation
+                return
+            if record.lifecycle_status is not RunLifecycleStatus.QUEUED:
+                break
+            if deleted:
+                break
+        self._enter_fail_stop()
+        if pending_cancellation is not None:
+            raise pending_cancellation
+        raise RunConsistencyError()
+
+    async def _delete_terminal_run(self, run_id: str) -> None:
+        pending_cancellation: asyncio.CancelledError | None = None
+        for _ in range(3):
+            try:
+                deleted = await self._runs.delete_terminal(run_id)
+            except asyncio.CancelledError as error:
+                pending_cancellation = pending_cancellation or error
+                deleted = False
+            except Exception:
+                deleted = False
+            record = await self._run_record_after_delete(run_id)
+            if record is None:
+                if pending_cancellation is not None:
+                    raise pending_cancellation
+                return
+            if record.lifecycle_status is not RunLifecycleStatus.TERMINAL:
+                break
+            if deleted:
+                break
+        self._enter_fail_stop(run_id)
+        if pending_cancellation is not None:
+            raise pending_cancellation
+        raise RunConsistencyError()
+
+    async def _run_record_after_delete(self, run_id: str) -> RunRecord | None:
         try:
-            deleted = await self._runs.delete_queued(run_id)
+            return await self._runs.get(run_id)
+        except RunNotFound:
+            return None
+        except asyncio.CancelledError:
+            self._enter_fail_stop(run_id)
+            raise
         except Exception:
-            self._enter_fail_stop()
+            self._enter_fail_stop(run_id)
             raise RunConsistencyError() from None
-        if not deleted:
-            self._enter_fail_stop()
-            raise RunConsistencyError()
+
+    async def _restore_owned_event_run(self, run_id: str) -> None:
+        for _ in range(3):
+            try:
+                high_water_mark = await self._events.high_water_mark(run_id)
+            except EventRunNotFound:
+                try:
+                    await self._events.create_run(run_id)
+                except Exception:
+                    continue
+                high_water_mark = 0
+            except Exception:
+                continue
+            if high_water_mark >= 1:
+                return
+            try:
+                await self._events.emit(
+                    run_id,
+                    "runtime",
+                    "run.created",
+                    {"status": "queued"},
+                )
+            except Exception:
+                continue
+            return
+        self._enter_fail_stop(run_id)
+        raise RunConsistencyError()
 
     async def _prune_locked(self) -> None:
         try:
@@ -817,23 +946,31 @@ class AnalysisRunner:
         except Exception:
             raise RunConsistencyError() from None
         for run_id in expired:
-            try:
-                deleted = await self._events.delete_run(run_id)
-            except EventRunNotFound:
-                deleted = True
-            except asyncio.CancelledError:
-                if _task_is_cancelling():
-                    raise
-                deleted = not await self._event_exists_after_failure(run_id)
-            except Exception:
-                deleted = not await self._event_exists_after_failure(run_id)
+            pending_cancellation: asyncio.CancelledError | None = None
+            deleted = False
+            for _ in range(3):
+                failed = False
+                try:
+                    deleted = await self._events.delete_run(run_id)
+                except EventRunNotFound:
+                    deleted = True
+                except asyncio.CancelledError as error:
+                    pending_cancellation = pending_cancellation or error
+                    failed = True
+                except Exception:
+                    failed = True
+                if deleted or not await self._event_exists_after_failure(run_id):
+                    deleted = True
+                    break
+                if not failed:
+                    break
             if deleted:
                 try:
-                    run_deleted = await self._runs.delete_terminal(run_id)
-                except Exception:
-                    raise RunConsistencyError() from None
-                if not run_deleted:
-                    raise RunConsistencyError()
+                    await self._delete_terminal_run(run_id)
+                except asyncio.CancelledError as error:
+                    pending_cancellation = pending_cancellation or error
+            if pending_cancellation is not None:
+                raise pending_cancellation
 
     def _enter_fail_stop(self, run_id: str | None = None) -> None:
         self._accepting = False
