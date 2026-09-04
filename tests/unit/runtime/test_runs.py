@@ -2217,3 +2217,278 @@ async def test_matching_terminal_must_be_snapshot_boundary_event() -> None:
 
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.wait("run-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preexisting_nonempty", [False, True])
+async def test_failed_rollback_never_restores_an_unowned_event_run(
+    preexisting_nonempty: bool,
+) -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(
+        clock=clock,
+        method="delete_queued",
+        timing="before",
+        persistent=True,
+    )
+    events = InMemoryEventStore(clock=clock.now)
+    await events.create_run("collision")
+    if preexisting_nonempty:
+        await events.emit(
+            "collision",
+            "runtime",
+            "run.created",
+            {"status": "queued"},
+        )
+    before_high_water = await events.high_water_mark("collision")
+    before_events = await events.replay_snapshot(
+        "collision",
+        high_water_mark=before_high_water,
+    )
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "collision",
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+
+    assert (await runs.get("collision")).lifecycle_status == "queued"
+    assert await events.high_water_mark("collision") == before_high_water
+    assert (
+        await events.replay_snapshot(
+            "collision",
+            high_water_mark=before_high_water,
+        )
+        == before_events
+    )
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+class MaskCancellationWithCleanupError:
+    def __init__(self) -> None:
+        self.boundary_started = asyncio.Event()
+        self.cleanup_task: asyncio.Task[None] | None = None
+        self.masked = False
+
+    async def mask_once(self) -> None:
+        if self.masked:
+            return
+        self.masked = True
+        self.boundary_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cleanup_task = asyncio.create_task(self._fail_cleanup())
+            await self.cleanup_task
+
+    @staticmethod
+    async def _fail_cleanup() -> None:
+        await asyncio.sleep(0)
+        raise RuntimeError(SENTINEL)
+
+
+class MaskedRollbackDeleteEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.masker = MaskCancellationWithCleanupError()
+        self.fail_initial_emit = True
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+        if self.fail_initial_emit and event_type == "run.created":
+            self.fail_initial_emit = False
+            raise RuntimeError(SENTINEL)
+        return await super().emit(run_id, node, event_type, data)
+
+    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
+        deleted = await super().delete_run(run_id, allow_unstarted=allow_unstarted)
+        await self.masker.mask_once()
+        return deleted
+
+
+@pytest.mark.asyncio
+async def test_cleanup_exception_cannot_mask_cancellation_during_rollback_delete() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=3, retention_seconds=3600, clock=clock)
+    events = MaskedRollbackDeleteEventStore(clock=clock.now)
+    ids = iter(("run-1", "run-2"))
+    runner = AnalysisRunner(
+        settings=settings(max_runs=3),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: next(ids),
+    )
+
+    submission = asyncio.create_task(runner.submit("first"))
+    await events.masker.boundary_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    assert submission.cancelled()
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+    assert events.masker.cleanup_task is not None
+    assert events.masker.cleanup_task.done()
+    assert (await runner.submit("second")).run_id == "run-2"
+    assert (await runner.wait("run-2")).final_status is FinalStatus.COMPLETED
+
+
+class MaskedRunReadStore(InMemoryRunStore):
+    def __init__(self, *, clock: FakeClock) -> None:
+        super().__init__(max_runs=3, retention_seconds=3600, clock=clock)
+        self.masker = MaskCancellationWithCleanupError()
+        self.failed_create = False
+
+    async def create(self, run_id: str, query: str) -> Any:
+        record = await super().create(run_id, query)
+        if run_id == "run-1":
+            self.failed_create = True
+            raise RuntimeError(SENTINEL)
+        return record
+
+    async def get(self, run_id: str) -> Any:
+        if run_id == "run-1" and self.failed_create:
+            await self.masker.mask_once()
+        return await super().get(run_id)
+
+
+class MaskedEventHighWaterStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.masker = MaskCancellationWithCleanupError()
+        self.failed_create = False
+
+    async def create_run(self, run_id: str) -> None:
+        await super().create_run(run_id)
+        if run_id == "run-1":
+            self.failed_create = True
+            raise RuntimeError(SENTINEL)
+
+    async def high_water_mark(self, run_id: str) -> int:
+        if run_id == "run-1" and self.failed_create:
+            await self.masker.mask_once()
+        return await super().high_water_mark(run_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["run_get", "event_high_water"])
+async def test_readback_cleanup_exception_preserves_cancellation(boundary: str) -> None:
+    clock = FakeClock()
+    if boundary == "run_get":
+        masked_runs = MaskedRunReadStore(clock=clock)
+        runs: InMemoryRunStore = masked_runs
+        events: InMemoryEventStore = InMemoryEventStore(clock=clock.now)
+        masker = masked_runs.masker
+    else:
+        runs = InMemoryRunStore(max_runs=3, retention_seconds=3600, clock=clock)
+        masked_events = MaskedEventHighWaterStore(clock=clock.now)
+        events = masked_events
+        masker = masked_events.masker
+    ids = iter(("run-1", "run-2"))
+    runner = AnalysisRunner(
+        settings=settings(max_runs=3),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: next(ids),
+    )
+
+    submission = asyncio.create_task(runner.submit("first"))
+    await masker.boundary_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    assert submission.cancelled()
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+    assert masker.cleanup_task is not None
+    assert masker.cleanup_task.done()
+    assert (await runner.submit("second")).run_id == "run-2"
+    assert (await runner.wait("run-2")).final_status is FinalStatus.COMPLETED
+
+
+class MaskedRestoreEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime], boundary: str) -> None:
+        super().__init__(clock=clock)
+        self.boundary = boundary
+        self.masker = MaskCancellationWithCleanupError()
+        self.initial_emit_failed = False
+
+    async def create_run(self, run_id: str) -> None:
+        if self.initial_emit_failed and self.boundary == "restore_create":
+            await self.masker.mask_once()
+        await super().create_run(run_id)
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+        if event_type == "run.created" and not self.initial_emit_failed:
+            self.initial_emit_failed = True
+            raise RuntimeError(SENTINEL)
+        if event_type == "run.created" and self.boundary == "restore_emit":
+            await self.masker.mask_once()
+        return await super().emit(run_id, node, event_type, data)
+
+    async def replay_snapshot(
+        self,
+        run_id: str,
+        *,
+        high_water_mark: int,
+    ) -> tuple[RunEvent, ...]:
+        if self.initial_emit_failed and self.boundary == "restore_replay":
+            await self.masker.mask_once()
+        return await super().replay_snapshot(run_id, high_water_mark=high_water_mark)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    ["restore_create", "restore_emit", "restore_replay"],
+)
+async def test_restore_cleanup_exception_preserves_cancellation(boundary: str) -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(
+        clock=clock,
+        method="delete_queued",
+        timing="before",
+        persistent=True,
+    )
+    events = MaskedRestoreEventStore(clock=clock.now, boundary=boundary)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.masker.boundary_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    assert submission.cancelled()
+    assert (await runs.get("run-1")).lifecycle_status == "queued"
+    assert await events.high_water_mark("run-1") == 1
+    restored = await events.replay_snapshot("run-1", high_water_mark=1)
+    assert len(restored) == 1
+    assert restored[0].type == "run.created"
+    assert dict(restored[0].data) == {"status": "queued"}
+    assert events.masker.cleanup_task is not None
+    assert events.masker.cleanup_task.done()
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")

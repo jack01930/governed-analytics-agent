@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
@@ -94,18 +95,42 @@ def _task_is_cancelling() -> bool:
 class _DelayedCancellation:
     def __init__(self) -> None:
         self.pending: asyncio.CancelledError | None = None
+        self.diagnostic: BaseException | None = None
 
     def observe(self, error: BaseException) -> None:
-        if (
-            isinstance(error, asyncio.CancelledError)
-            and _task_is_cancelling()
-            and self.pending is None
-        ):
-            self.pending = error
+        if not _task_is_cancelling():
+            return
+        if self.pending is None:
+            if isinstance(error, asyncio.CancelledError):
+                self.pending = error
+            else:
+                self.pending = asyncio.CancelledError()
+                self.diagnostic = error
+        elif self.diagnostic is None and not isinstance(error, asyncio.CancelledError):
+            self.diagnostic = error
+
+    async def await_dependency[T](self, awaitable: Awaitable[T]) -> T:
+        try:
+            return await awaitable
+        except BaseException as error:
+            self.observe(error)
+            if self.pending is not None and not isinstance(
+                error, (asyncio.CancelledError, Exception)
+            ):
+                raise asyncio.CancelledError() from error
+            raise
 
     def raise_if_pending(self) -> None:
         if self.pending is not None:
+            if self.diagnostic is not None:
+                raise self.pending from self.diagnostic
             raise self.pending
+
+
+@dataclass
+class _SubmissionEventState:
+    owned: bool
+    deleted: bool = False
 
 
 class RunRecord(BaseModel):
@@ -442,10 +467,10 @@ class AnalysisRunner:
                 if isinstance(error, RunConsistencyError):
                     raise
                 raise RunSubmissionFailed() from None
-            events_created = False
+            event_state = _SubmissionEventState(owned=False)
             try:
                 await self._events.create_run(run_id)
-                events_created = True
+                event_state.owned = True
                 await self._events.emit(
                     run_id,
                     "runtime",
@@ -455,16 +480,19 @@ class AnalysisRunner:
             except BaseException as error:
                 coordination = _DelayedCancellation()
                 coordination.observe(error)
-                if not event_existed_before and not events_created:
-                    events_created = await self._event_exists_after_failure(run_id, coordination)
+                if not event_existed_before and not event_state.owned:
+                    event_state.owned = await self._event_exists_after_failure(run_id, coordination)
                 await self._rollback_submission(
                     run_id,
-                    events_created=events_created,
+                    event_state=event_state,
                     coordination=coordination,
                 )
                 raise RunSubmissionFailed() from None
             if self._consistency_failed:
-                await self._rollback_submission(run_id, events_created=True)
+                await self._rollback_submission(
+                    run_id,
+                    event_state=_SubmissionEventState(owned=True),
+                )
                 raise RunConsistencyError()
             coroutine = self._execute(run_id, query)
             try:
@@ -475,7 +503,7 @@ class AnalysisRunner:
                 coordination.observe(error)
                 await self._rollback_submission(
                     run_id,
-                    events_created=True,
+                    event_state=_SubmissionEventState(owned=True),
                     coordination=coordination,
                 )
                 raise RunSubmissionFailed() from None
@@ -813,7 +841,7 @@ class AnalysisRunner:
     ) -> int | None:
         for _ in range(3):
             try:
-                return await self._events.high_water_mark(run_id)
+                return await coordination.await_dependency(self._events.high_water_mark(run_id))
             except EventRunNotFound:
                 return None
             except asyncio.CancelledError as error:
@@ -834,14 +862,17 @@ class AnalysisRunner:
         self,
         run_id: str,
         *,
-        events_created: bool,
+        event_state: _SubmissionEventState,
         coordination: _DelayedCancellation | None = None,
     ) -> None:
         state = coordination or _DelayedCancellation()
-        if events_created and not await self._delete_event_for_rollback(run_id, state):
-            self._raise_coordination_failure(state, run_id)
+        if event_state.owned:
+            if not await self._delete_event_for_rollback(run_id, state):
+                self._raise_coordination_failure(state, run_id)
+            event_state.deleted = True
         if not await self._delete_owned_queued_run(run_id, state):
-            await self._restore_owned_event_run(run_id, state)
+            if event_state.owned and event_state.deleted:
+                await self._restore_owned_event_run(run_id, state)
             self._raise_coordination_failure(state, run_id)
         state.raise_if_pending()
 
@@ -852,7 +883,9 @@ class AnalysisRunner:
     ) -> bool:
         for _ in range(3):
             try:
-                await self._events.delete_run(run_id, allow_unstarted=True)
+                await coordination.await_dependency(
+                    self._events.delete_run(run_id, allow_unstarted=True)
+                )
             except EventRunNotFound:
                 return True
             except asyncio.CancelledError as error:
@@ -870,7 +903,7 @@ class AnalysisRunner:
     ) -> bool:
         for _ in range(3):
             try:
-                await self._runs.delete_queued(run_id)
+                await coordination.await_dependency(self._runs.delete_queued(run_id))
             except asyncio.CancelledError as error:
                 coordination.observe(error)
             except Exception:
@@ -889,7 +922,7 @@ class AnalysisRunner:
     ) -> bool:
         for _ in range(3):
             try:
-                await self._runs.delete_terminal(run_id)
+                await coordination.await_dependency(self._runs.delete_terminal(run_id))
             except asyncio.CancelledError as error:
                 coordination.observe(error)
             except Exception:
@@ -908,7 +941,7 @@ class AnalysisRunner:
     ) -> RunRecord | None:
         for _ in range(3):
             try:
-                return await self._runs.get(run_id)
+                return await coordination.await_dependency(self._runs.get(run_id))
             except RunNotFound:
                 return None
             except asyncio.CancelledError as error:
@@ -928,7 +961,7 @@ class AnalysisRunner:
             if high_water_mark is not None:
                 break
             try:
-                await self._events.create_run(run_id)
+                await coordination.await_dependency(self._events.create_run(run_id))
             except asyncio.CancelledError as error:
                 coordination.observe(error)
             except Exception:
@@ -944,11 +977,13 @@ class AnalysisRunner:
             if high_water_mark != 0:
                 self._raise_coordination_failure(coordination, run_id)
             try:
-                await self._events.emit(
-                    run_id,
-                    "runtime",
-                    "run.created",
-                    {"status": "queued"},
+                await coordination.await_dependency(
+                    self._events.emit(
+                        run_id,
+                        "runtime",
+                        "run.created",
+                        {"status": "queued"},
+                    )
                 )
             except asyncio.CancelledError as error:
                 coordination.observe(error)
@@ -966,7 +1001,9 @@ class AnalysisRunner:
     ) -> bool:
         for _ in range(3):
             try:
-                snapshot = await self._events.replay_snapshot(run_id, high_water_mark=1)
+                snapshot = await coordination.await_dependency(
+                    self._events.replay_snapshot(run_id, high_water_mark=1)
+                )
             except asyncio.CancelledError as error:
                 coordination.observe(error)
             except Exception:
@@ -1005,7 +1042,7 @@ class AnalysisRunner:
             deleted = False
             for _ in range(3):
                 try:
-                    await self._events.delete_run(run_id)
+                    await coordination.await_dependency(self._events.delete_run(run_id))
                 except EventRunNotFound:
                     deleted = True
                 except asyncio.CancelledError as error:
