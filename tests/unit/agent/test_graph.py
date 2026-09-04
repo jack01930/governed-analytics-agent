@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import cast
+from types import MappingProxyType
+from typing import ClassVar, cast
 
 import pytest
 from langgraph.errors import NodeCancelledError
@@ -73,11 +75,67 @@ CLARIFY_QUERY = "GMV怎么样？"  # noqa: RUF001
 QUERY_ID = "a" * 64
 SynthesisFactory = Callable[[StructuredModelRequest], Mapping[str, object]]
 RAW_INVALID_TOOL_RESULT_SENTINEL = "raw_invalid_tool_result_sentinel"
+CLASS_GETTER_SENTINEL = "raw_class_getter_sentinel"
+MALFORMED_FIELD_SENTINEL = "raw_malformed_field_sentinel"
 
 
 class InvalidToolReturn:
     def __repr__(self) -> str:
         return RAW_INVALID_TOOL_RESULT_SENTINEL
+
+
+class ExplodingClassProxy:
+    observation_reads = 0
+    trace_reads = 0
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type[object]:  # type: ignore[override]
+        raise RuntimeError(CLASS_GETTER_SENTINEL)
+
+    @property
+    def observation(self) -> object:
+        type(self).observation_reads += 1
+        raise RuntimeError(CLASS_GETTER_SENTINEL)
+
+    @property
+    def trace(self) -> object:
+        type(self).trace_reads += 1
+        raise RuntimeError(CLASS_GETTER_SENTINEL)
+
+
+class CountingToolInvocation(ToolInvocation):
+    observation_reads: ClassVar[int] = 0
+    trace_reads: ClassVar[int] = 0
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "observation":
+            type(self).observation_reads += 1
+        elif name == "trace":
+            type(self).trace_reads += 1
+        return super().__getattribute__(name)
+
+
+class CountingObservation(Observation):
+    field_reads: ClassVar[int] = 0
+
+    def __getattribute__(self, name: str) -> object:
+        if name in type(self).model_fields:
+            type(self).field_reads += 1
+        return super().__getattribute__(name)
+
+
+class CountingToolCallTrace(ToolCallTrace):
+    field_reads: ClassVar[int] = 0
+
+    def __getattribute__(self, name: str) -> object:
+        if name in type(self).model_fields:
+            type(self).field_reads += 1
+        return super().__getattribute__(name)
+
+
+class MalformedField:
+    def __repr__(self) -> str:
+        return MALFORMED_FIELD_SENTINEL
 
 
 class FrozenClock:
@@ -2860,3 +2918,299 @@ async def test_node_self_cancellation_wins_over_tool_cleanup_runtime_error() -> 
 
     with pytest.raises(asyncio.CancelledError):
         await run_agent(run_id="node-self-cancelled", query=QUERY, context=context)
+
+
+def malformed_tool_invocation(field: str) -> ToolInvocation:
+    observation_values: dict[str, object] = {
+        "observation_id": "malformed-observation",
+        "tool_name": ActionType.EXECUTE_SQL,
+        "purpose": "metric_value_contract",
+        "ok": True,
+        "safe_error": None,
+        "hypothesis_id": "metric_value",
+        "contract_id": "metric_value_contract",
+        "query_id": QUERY_ID,
+        "columns": ("gmv",),
+        "row_count": 1,
+        "possibly_truncated": False,
+        "payload": MappingProxyType({"rows": (("125.00",),)}),
+    }
+    trace_values: dict[str, object] = {
+        "tool_name": ActionType.EXECUTE_SQL,
+        "purpose": "metric_value_contract",
+        "safe_arguments": (
+            ("contract_id", "metric_value_contract"),
+            ("hypothesis_id", "metric_value"),
+        ),
+        "query_id": QUERY_ID,
+        "columns": ("gmv",),
+        "row_count": 1,
+        "possibly_truncated": False,
+        "safe_error": None,
+    }
+    if field == "query_id":
+        observation_values["query_id"] = b"a" * 64
+        trace_values["query_id"] = b"a" * 64
+    elif field == "columns":
+        observation_values["columns"] = ["gmv"]
+        trace_values["columns"] = ["gmv"]
+    elif field == "rows":
+        observation_values["payload"] = MappingProxyType({"rows": [["125.00"]]})
+    elif field == "row_count":
+        observation_values["row_count"] = True
+        trace_values["row_count"] = True
+    elif field == "malformed_column":
+        malformed = MalformedField()
+        observation_values["columns"] = (malformed,)
+        trace_values["columns"] = (malformed,)
+    else:  # pragma: no cover - test helper misuse
+        raise AssertionError(field)
+    return ToolInvocation.model_construct(
+        observation=Observation.model_construct(**observation_values),  # type: ignore[arg-type]
+        trace=ToolCallTrace.model_construct(**trace_values),  # type: ignore[arg-type]
+    )
+
+
+def assert_one_safe_execute_failure(
+    state: AgentState,
+    events: RecordingEvents,
+    *,
+    execute_calls: int,
+) -> None:
+    assert state["final_answer"] is not None
+    assert state["final_answer"].status is FinalStatus.INTERNAL_ERROR
+    assert state["final_answer"].stop_reason is StopReason.INTERNAL_ERROR
+    assert state["governance"].execute_calls == execute_calls
+    assert state["governance"].action_loops == 1
+    assert state["action_loop_pending"] is False
+    execute_observations = tuple(
+        item for item in state["observations"] if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    execute_traces = tuple(
+        item for item in state["tool_call_traces"] if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    assert len(execute_observations) == len(execute_traces) == execute_calls
+    assert execute_observations[-1].safe_error == "internal_tool_error"
+    assert execute_traces[-1].safe_error == "internal_tool_error"
+    assert [item[1] for item in events.items].count("tool.failed") == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_result_class_getter_proxy_is_safely_rejected_without_field_access() -> None:
+    proxy = ExplodingClassProxy()
+    type(proxy).observation_reads = 0
+    type(proxy).trace_reads = 0
+
+    class ProxyResultTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            del node
+            self.calls.append(cast(AgentAction, action).action_type)
+            return proxy
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, ())
+    context = replace_context(context, tools=ProxyResultTools(tools.registry))
+
+    state = cast(
+        AgentState,
+        await build_agent_graph().ainvoke(
+            new_agent_state(run_id="class-proxy-tool-result", query=QUERY),
+            context=context,
+        ),
+    )
+
+    assert_one_safe_execute_failure(state, events, execute_calls=1)
+    assert type(proxy).observation_reads == type(proxy).trace_reads == 0
+    rendered = json.dumps(
+        {
+            "observations": [item.model_dump(mode="json") for item in state["observations"]],
+            "traces": [item.model_dump(mode="json") for item in state["tool_call_traces"]],
+            "events": events.items,
+        }
+    )
+    assert CLASS_GETTER_SENTINEL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_repair_tool_result_class_getter_proxy_is_safely_rejected_and_audited() -> None:
+    proxy = ExplodingClassProxy()
+    type(proxy).observation_reads = 0
+    type(proxy).trace_reads = 0
+
+    class ProxyRepairResultTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            if node == "repair":
+                self.calls.append(cast(AgentAction, action).action_type)
+                return proxy
+            return await super().invoke(action, node=node)
+
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(sql="select cast(125 as numeric) as value"),),
+        repairs=(execute_action(),),
+    )
+    context, tools, _, events, _ = context_for(
+        scripts,
+        (query_result(("value",), (("125",),)),),
+    )
+    context = replace_context(context, tools=ProxyRepairResultTools(tools.registry))
+
+    state = cast(
+        AgentState,
+        await build_agent_graph().ainvoke(
+            new_agent_state(run_id="class-proxy-repair-result", query=QUERY),
+            context=context,
+        ),
+    )
+
+    assert state["final_answer"] is not None
+    assert state["final_answer"].status is FinalStatus.EXECUTION_FAILED
+    assert state["final_answer"].stop_reason is StopReason.REPAIR_FAILED
+    assert state["governance"].execute_calls == 2
+    assert state["governance"].action_loops == 1
+    assert state["governance"].repair_count == 1
+    assert state["action_loop_pending"] is False
+    execute_observations = tuple(
+        item for item in state["observations"] if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    execute_traces = tuple(
+        item for item in state["tool_call_traces"] if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    assert len(execute_observations) == len(execute_traces) == 2
+    assert execute_observations[-1].safe_error == "internal_tool_error"
+    assert execute_traces[-1].safe_error == "internal_tool_error"
+    assert [item[1] for item in events.items].count("tool.failed") == 1
+    assert type(proxy).observation_reads == type(proxy).trace_reads == 0
+    assert CLASS_GETTER_SENTINEL not in json.dumps(
+        {
+            "observations": [item.model_dump(mode="json") for item in execute_observations],
+            "traces": [item.model_dump(mode="json") for item in execute_traces],
+            "events": events.items,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_invocation_subclass_is_rejected_without_nested_field_access() -> None:
+    class SubclassResultTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            invocation = await super().invoke(action, node=node)
+            subclass = CountingToolInvocation(
+                observation=invocation.observation,
+                trace=invocation.trace,
+            )
+            CountingToolInvocation.observation_reads = 0
+            CountingToolInvocation.trace_reads = 0
+            return subclass
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, (query_result(),))
+    context = replace_context(context, tools=SubclassResultTools(tools.registry))
+
+    state = cast(
+        AgentState,
+        await build_agent_graph().ainvoke(
+            new_agent_state(run_id="subclass-tool-result", query=QUERY),
+            context=context,
+        ),
+    )
+
+    assert_one_safe_execute_failure(state, events, execute_calls=1)
+    assert CountingToolInvocation.observation_reads == 0
+    assert CountingToolInvocation.trace_reads == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested_kind", ["observation", "trace"])
+async def test_nested_tool_model_subclass_is_rejected_without_field_access(
+    nested_kind: str,
+) -> None:
+    class NestedSubclassResultTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            invocation = await super().invoke(action, node=node)
+            if nested_kind == "observation":
+                nested_observation = CountingObservation.model_validate(
+                    invocation.observation.model_dump(mode="python")
+                )
+                candidate = ToolInvocation.model_construct(
+                    observation=nested_observation,
+                    trace=invocation.trace,
+                )
+                CountingObservation.field_reads = 0
+            else:
+                nested_trace = CountingToolCallTrace.model_validate(
+                    invocation.trace.model_dump(mode="python")
+                )
+                candidate = ToolInvocation.model_construct(
+                    observation=invocation.observation,
+                    trace=nested_trace,
+                )
+                CountingToolCallTrace.field_reads = 0
+            return candidate
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, (query_result(),))
+    context = replace_context(context, tools=NestedSubclassResultTools(tools.registry))
+
+    state = cast(
+        AgentState,
+        await build_agent_graph().ainvoke(
+            new_agent_state(run_id=f"nested-subclass-{nested_kind}", query=QUERY),
+            context=context,
+        ),
+    )
+
+    assert_one_safe_execute_failure(state, events, execute_calls=1)
+    if nested_kind == "observation":
+        assert CountingObservation.field_reads == 0
+    else:
+        assert CountingToolCallTrace.field_reads == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["query_id", "columns", "rows", "row_count", "malformed_column"],
+)
+async def test_malformed_tool_fields_are_rejected_without_coercion_warning_or_leak(
+    field: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    candidate = malformed_tool_invocation(field)
+
+    class MalformedResultTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            del node
+            self.calls.append(cast(AgentAction, action).action_type)
+            return candidate
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, ())
+    context = replace_context(context, tools=MalformedResultTools(tools.registry))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        state = cast(
+            AgentState,
+            await build_agent_graph().ainvoke(
+                new_agent_state(run_id=f"malformed-tool-{field}", query=QUERY),
+                context=context,
+            ),
+        )
+
+    assert_one_safe_execute_failure(state, events, execute_calls=1)
+    assert state["evidence"] == ()
+    assert caught == []
+    assert MALFORMED_FIELD_SENTINEL not in caplog.text
+    answer = state["final_answer"]
+    assert answer is not None
+    rendered = json.dumps(
+        {
+            "answer": answer.model_dump(mode="json"),
+            "observations": [item.model_dump(mode="json") for item in state["observations"]],
+            "traces": [item.model_dump(mode="json") for item in state["tool_call_traces"]],
+            "events": events.items,
+        }
+    )
+    assert MALFORMED_FIELD_SENTINEL not in rendered

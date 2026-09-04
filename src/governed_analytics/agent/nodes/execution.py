@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 from datetime import datetime
+from types import MappingProxyType
 from uuid import uuid4
 
 from langgraph.runtime import Runtime
@@ -77,6 +79,32 @@ _PROFILE_ARGUMENTS = frozenset(
         "limit",
     }
 )
+_TOOL_INVOCATION_FIELDS = ("observation", "trace")
+_OBSERVATION_FIELDS = (
+    "observation_id",
+    "tool_name",
+    "purpose",
+    "ok",
+    "safe_error",
+    "hypothesis_id",
+    "contract_id",
+    "query_id",
+    "columns",
+    "row_count",
+    "possibly_truncated",
+    "payload",
+)
+_TOOL_TRACE_FIELDS = (
+    "tool_name",
+    "purpose",
+    "safe_arguments",
+    "query_id",
+    "columns",
+    "row_count",
+    "possibly_truncated",
+    "safe_error",
+)
+_MAPPING_PROXY_TYPE: type[Mapping[object, object]] = type(MappingProxyType({}))
 
 
 def tool_started_data(action: AgentAction) -> Mapping[str, JsonValue]:
@@ -598,18 +626,24 @@ def _govern_tool_invocation(
 ) -> ToolInvocation:
     """Normalize an untrusted tool-port return before any later attribute access."""
 
-    if not isinstance(candidate, ToolInvocation):
-        return _safe_failure_invocation(action)
     try:
-        if not isinstance(candidate.observation, Observation) or not isinstance(
-            candidate.trace, ToolCallTrace
-        ):
+        candidate_fields = _exact_model_fields(
+            candidate,
+            ToolInvocation,
+            _TOOL_INVOCATION_FIELDS,
+        )
+        if candidate_fields is None:
+            return _safe_failure_invocation(action)
+        observation = _strict_observation(candidate_fields["observation"])
+        trace = _strict_tool_trace(candidate_fields["trace"])
+        if observation is None or trace is None:
             return _safe_failure_invocation(action)
         validated = ToolInvocation.model_validate(
             {
-                "observation": candidate.observation.model_dump(mode="python"),
-                "trace": candidate.trace.model_dump(mode="python"),
-            }
+                "observation": observation,
+                "trace": trace,
+            },
+            strict=True,
         )
         if not _invocation_matches_action(action, validated):
             return _safe_failure_invocation(action)
@@ -617,6 +651,66 @@ def _govern_tool_invocation(
         propagate_cancellation()
         return _safe_failure_invocation(action)
     return validated
+
+
+def _exact_model_fields(
+    candidate: object,
+    expected_type: type[object],
+    field_names: tuple[str, ...],
+) -> dict[str, object] | None:
+    """Copy exact model storage without invoking untrusted attribute access."""
+
+    if type(candidate) is not expected_type:
+        return None
+    storage = object.__getattribute__(candidate, "__dict__")
+    if type(storage) is not dict or len(storage) != len(field_names):
+        return None
+    expected_names = frozenset(field_names)
+    if any(type(name) is not str or name not in expected_names for name in storage):
+        return None
+    return {name: storage[name] for name in field_names}
+
+
+def _canonical_frozen_json(value: object) -> bool:
+    """Recognize the immutable representation produced by agent contracts."""
+
+    if value is None or type(value) in {str, int, bool}:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is tuple:
+        return all(_canonical_frozen_json(item) for item in value)
+    if type(value) is _MAPPING_PROXY_TYPE:
+        return all(
+            type(name) is str and _canonical_frozen_json(item) for name, item in value.items()
+        )
+    return False
+
+
+def _strict_observation(candidate: object) -> Observation | None:
+    fields = _exact_model_fields(candidate, Observation, _OBSERVATION_FIELDS)
+    if fields is None:
+        return None
+    payload = fields["payload"]
+    if not _canonical_frozen_json(payload):
+        return None
+    strict_fields = dict(fields)
+    if payload is not None:
+        # Frozen JSON mappings are stored as mappingproxy, while Pydantic's strict
+        # recursive JSON union accepts only dict. Validate every other field with
+        # a canonical tuple placeholder, then restore the already checked payload.
+        strict_fields["payload"] = ()
+    validated = Observation.model_validate(strict_fields, strict=True)
+    if payload is not None:
+        validated = validated.model_copy(update={"payload": payload})
+    return validated
+
+
+def _strict_tool_trace(candidate: object) -> ToolCallTrace | None:
+    fields = _exact_model_fields(candidate, ToolCallTrace, _TOOL_TRACE_FIELDS)
+    if fields is None:
+        return None
+    return ToolCallTrace.model_validate(fields, strict=True)
 
 
 async def invoke_tool(
