@@ -1,19 +1,38 @@
-"""Deterministic plan compilation; no query text or model output is consulted here."""
+"""Governed context retrieval, planning, and deterministic contract compilation."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
+from langgraph.runtime import Runtime
+from pydantic import BaseModel
+
 from governed_analytics.agent.contracts import (
+    ActionType,
     AnalysisType,
     AnswerContract,
     ColumnContract,
+    ContextBundle,
+    JsonValue,
     ObservationContract,
     ResultShape,
     SortKey,
+    StopReason,
+    StructuredModelRequest,
     TypedMetricPlan,
 )
-from governed_analytics.tools.contracts import MetricInfo
+from governed_analytics.agent.nodes.behavior import (
+    cast_stop_reason,
+    emit_budget_warning,
+    failure_delta,
+    finish_node,
+    safe_error_stop_reason,
+)
+from governed_analytics.agent.ports import AgentContext, StructuredInvocationError
+from governed_analytics.agent.state import AgentState
+from governed_analytics.runtime.budgets import BudgetExceeded
+from governed_analytics.tools.contracts import MetricInfo, TableInfo
 
 _ATTRIBUTION_DIMENSIONS = frozenset({"region", "product", "segment"})
 _ATTRIBUTION_HYPOTHESES = (
@@ -31,9 +50,7 @@ def _require_metric_binding(plan: TypedMetricPlan, metric: MetricInfo) -> None:
 
 
 def _simple_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerContract:
-    metric_hypotheses = tuple(
-        item for item in plan.hypotheses if item.kind == "metric_value"
-    )
+    metric_hypotheses = tuple(item for item in plan.hypotheses if item.kind == "metric_value")
     if len(metric_hypotheses) != 1 or len(plan.hypotheses) != 1:
         raise ValueError("simple plans require exactly one metric_value hypothesis")
     if not set(plan.dimensions).issubset(metric.dimensions):
@@ -84,10 +101,9 @@ def _simple_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerContrac
             name=plan.metric_id,
             data_type="decimal",
             role="metric",
-            nullable=plan.zero_denominator_policy == "return_null"
-            and plan.denominator is not None,
+            nullable=plan.zero_denominator_policy == "return_null" and plan.denominator is not None,
             unit=metric.unit,
-        )
+        ),
     )
     observation_contract = ObservationContract(
         contract_id=f"{hypothesis_id}_contract",
@@ -178,9 +194,7 @@ def _attribution_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerCo
         max_rows=1,
     )
     monetary_metric = (
-        ColumnContract(
-            name="gmv_loss", data_type="decimal", role="metric", unit=metric.unit
-        ),
+        ColumnContract(name="gmv_loss", data_type="decimal", role="metric", unit=metric.unit),
     )
     region = _top_k_contract(
         contract_id="region_contribution",
@@ -208,9 +222,7 @@ def _attribution_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerCo
             ColumnContract(
                 name="current_gmv", data_type="decimal", role="metric", unit=metric.unit
             ),
-            ColumnContract(
-                name="delta", data_type="decimal", role="metric", unit=metric.unit
-            ),
+            ColumnContract(name="delta", data_type="decimal", role="metric", unit=metric.unit),
         ),
         order_column="delta",
         order_direction="asc",
@@ -239,4 +251,335 @@ def compile_answer_contract(
     raise ValueError("comparison plans are not supported by the Week 3 answer compiler")
 
 
-__all__ = ["compile_answer_contract"]
+def context_event_data(bundle: ContextBundle) -> Mapping[str, JsonValue]:
+    return {
+        "metric_count": len(bundle.metrics),
+        "table_count": len(bundle.tables),
+        "success": bundle.ok,
+    }
+
+
+def interrupted_context_event_data(
+    metrics: tuple[MetricInfo, ...],
+    tables: tuple[TableInfo, ...],
+) -> Mapping[str, JsonValue]:
+    return {
+        "metric_count": len(metrics),
+        "table_count": len(tables),
+        "success": False,
+    }
+
+
+def plan_event_data(plan: TypedMetricPlan) -> Mapping[str, JsonValue]:
+    return {
+        "plan_id": plan.plan_id,
+        "revision": plan.revision,
+        "analysis_type": plan.analysis_type.value,
+        "metric_id": plan.metric_id,
+        "hypothesis_ids": tuple(item.hypothesis_id for item in plan.hypotheses),
+    }
+
+
+def _payload_models[T: BaseModel](
+    payload: JsonValue | None,
+    model: type[T],
+) -> tuple[T, ...]:
+    if not isinstance(payload, tuple):
+        raise ValueError("context payload must be a tuple")
+    values: list[T] = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            raise ValueError("context payload item must be an object")
+        values.append(model.model_validate(dict(item)))
+    return tuple(values)
+
+
+async def retrieve_context(
+    state: AgentState,
+    runtime: Runtime[AgentContext],
+) -> dict[str, object]:
+    del state
+    context = runtime.context
+    started_at = context.clock.monotonic()
+    observations = []
+    traces = []
+    metrics: tuple[MetricInfo, ...] = ()
+    tables: tuple[TableInfo, ...] = ()
+    context_event_attempted = False
+    try:
+        context.budget.consume_tool(ActionType.METRIC_LOOKUP)
+        metric_invocation = await context.tools.lookup_metrics(node="retrieve_context")
+        observations.append(metric_invocation.observation)
+        traces.append(metric_invocation.trace)
+        context.trace_recorder.append_tool(metric_invocation.trace)
+        if not metric_invocation.observation.ok:
+            bundle = ContextBundle(
+                ok=False,
+                metrics=(),
+                tables=(),
+                observations=tuple(observations),
+            )
+            context_event_attempted = True
+            await context.events.emit(
+                "retrieve_context",
+                "context.retrieved",
+                context_event_data(bundle),
+            )
+            return finish_node(
+                context=context,
+                node="retrieve_context",
+                started_at=started_at,
+                outcome="failed",
+                delta={
+                    "observations": tuple(observations),
+                    "tool_call_traces": tuple(traces),
+                    "governance": context.budget.snapshot,
+                    "stop_reason": safe_error_stop_reason(metric_invocation.observation.safe_error),
+                },
+            )
+        metrics = _payload_models(metric_invocation.observation.payload, MetricInfo)
+
+        context.budget.consume_tool(ActionType.SCHEMA_LOOKUP)
+        schema_invocation = await context.tools.lookup_schema(node="retrieve_context")
+        observations.append(schema_invocation.observation)
+        traces.append(schema_invocation.trace)
+        context.trace_recorder.append_tool(schema_invocation.trace)
+        if schema_invocation.observation.ok:
+            tables = _payload_models(schema_invocation.observation.payload, TableInfo)
+        bundle = ContextBundle(
+            ok=schema_invocation.observation.ok,
+            metrics=metrics if schema_invocation.observation.ok else (),
+            tables=tables,
+            observations=tuple(observations),
+        )
+        context_event_attempted = True
+        await context.events.emit(
+            "retrieve_context",
+            "context.retrieved",
+            context_event_data(bundle),
+        )
+        delta: dict[str, object] = {
+            "observations": tuple(observations),
+            "tool_call_traces": tuple(traces),
+            "governance": context.budget.snapshot,
+        }
+        if bundle.ok:
+            delta["metric_context"] = metrics
+            delta["schema_context"] = tables
+            delta["stop_reason"] = None
+        else:
+            delta["stop_reason"] = safe_error_stop_reason(schema_invocation.observation.safe_error)
+        return finish_node(
+            context=context,
+            node="retrieve_context",
+            started_at=started_at,
+            outcome="completed" if bundle.ok else "failed",
+            delta=delta,
+        )
+    except Exception as error:
+        delta = failure_delta(error, context)
+        if observations:
+            delta["observations"] = tuple(observations)
+        if traces:
+            delta["tool_call_traces"] = tuple(traces)
+        failed_lookup_bundle = (
+            ContextBundle(
+                ok=False,
+                metrics=(),
+                tables=(),
+                observations=tuple(observations),
+            )
+            if observations and not observations[-1].ok
+            else None
+        )
+        if failed_lookup_bundle is not None and not context_event_attempted:
+            await context.events.emit(
+                "retrieve_context",
+                "context.retrieved",
+                context_event_data(failed_lookup_bundle),
+            )
+        elif not context_event_attempted:
+            await context.events.emit(
+                "retrieve_context",
+                "context.retrieved",
+                interrupted_context_event_data(metrics, tables),
+            )
+        if isinstance(error, (BudgetExceeded, StructuredInvocationError)):
+            await emit_budget_warning(
+                context,
+                node="retrieve_context",
+                reason=cast_stop_reason(delta["stop_reason"]),
+            )
+        return finish_node(
+            context=context,
+            node="retrieve_context",
+            started_at=started_at,
+            outcome="failed",
+            delta=delta,
+        )
+
+
+def _metric_prompt(metric: MetricInfo) -> Mapping[str, JsonValue]:
+    return {
+        "metric_id": metric.metric_id,
+        "version": metric.version,
+        "dimensions": metric.dimensions,
+        "unit": metric.unit,
+        "time_field": metric.time_field,
+    }
+
+
+def _table_prompt(table: TableInfo) -> Mapping[str, JsonValue]:
+    return {
+        "name": table.name,
+        "columns": tuple(column.name for column in table.columns),
+    }
+
+
+async def build_plan(
+    state: AgentState,
+    runtime: Runtime[AgentContext],
+) -> dict[str, object]:
+    context = runtime.context
+    started_at = context.clock.monotonic()
+    invocation = None
+    try:
+        request = StructuredModelRequest.for_output(
+            purpose="plan",
+            system_prompt="Build one bounded governed metric plan using only supplied context.",
+            user_payload={
+                "query": state["normalized_query"],
+                "metrics": tuple(_metric_prompt(item) for item in state["metric_context"]),
+                "tables": tuple(_table_prompt(item) for item in state["schema_context"]),
+            },
+            output_type=TypedMetricPlan,
+            max_output_tokens=1200,
+        )
+        invocation = await context.model_invoker.invoke(request, TypedMetricPlan)
+        plan = invocation.result.output
+        await context.events.emit("build_plan", "plan.created", plan_event_data(plan))
+        delta: dict[str, object] = {
+            "plan_revisions": (plan,),
+            "governance": invocation.governance,
+            "model_call_traces": invocation.traces,
+            "stop_reason": None,
+        }
+        if invocation.repair_record is not None:
+            delta["repair_history"] = (invocation.repair_record,)
+        if invocation.governance.soft_cap_reached:
+            await emit_budget_warning(
+                context,
+                node="build_plan",
+                reason=StopReason.COST_SOFT_CAP,
+            )
+            delta["stop_reason"] = StopReason.COST_SOFT_CAP
+        return finish_node(
+            context=context,
+            node="build_plan",
+            started_at=started_at,
+            outcome="completed",
+            delta=delta,
+        )
+    except Exception as error:
+        delta = failure_delta(error, context)
+        if invocation is not None and not isinstance(error, StructuredInvocationError):
+            delta["model_call_traces"] = invocation.traces
+            delta["governance"] = invocation.governance
+            if invocation.repair_record is not None:
+                delta["repair_history"] = (invocation.repair_record,)
+        if isinstance(error, (BudgetExceeded, StructuredInvocationError)):
+            await emit_budget_warning(
+                context,
+                node="build_plan",
+                reason=cast_stop_reason(delta["stop_reason"]),
+            )
+        return finish_node(
+            context=context,
+            node="build_plan",
+            started_at=started_at,
+            outcome="failed",
+            delta=delta,
+        )
+
+
+async def compile_contract(
+    state: AgentState,
+    runtime: Runtime[AgentContext],
+) -> dict[str, object]:
+    context = runtime.context
+    started_at = context.clock.monotonic()
+    try:
+        plan = state["plan_revisions"][-1]
+        matches = tuple(
+            metric
+            for metric in state["metric_context"]
+            if metric.metric_id == plan.metric_id and metric.version == plan.metric_version
+        )
+        if len(matches) != 1:
+            raise ValueError("plan metric binding is not unique")
+        contract = compile_answer_contract(plan, matches[0])
+        return finish_node(
+            context=context,
+            node="compile_contract",
+            started_at=started_at,
+            outcome="completed",
+            delta={"answer_contract": contract, "stop_reason": None},
+        )
+    except (IndexError, KeyError, ValueError):
+        return finish_node(
+            context=context,
+            node="compile_contract",
+            started_at=started_at,
+            outcome="failed",
+            delta={
+                "stop_reason": StopReason.PLAN_INVALID,
+                "governance": context.budget.snapshot,
+            },
+        )
+    except Exception as error:
+        return finish_node(
+            context=context,
+            node="compile_contract",
+            started_at=started_at,
+            outcome="failed",
+            delta=failure_delta(error, context),
+        )
+
+
+async def replan(
+    state: AgentState,
+    runtime: Runtime[AgentContext],
+) -> dict[str, object]:
+    context = runtime.context
+    started_at = context.clock.monotonic()
+    plan = state["plan_revisions"][-1]
+    pending = next((item for item in plan.hypotheses if item.status == "pending"), None)
+    delta: dict[str, object] = {"next_action": None}
+    if pending is None:
+        delta["stop_reason"] = StopReason.ANSWER_CONTRACT_UNMET
+    elif context.budget.snapshot.soft_cap_reached:
+        await emit_budget_warning(
+            context,
+            node="replan",
+            reason=StopReason.COST_SOFT_CAP,
+        )
+        delta["stop_reason"] = StopReason.COST_SOFT_CAP
+        delta["governance"] = context.budget.snapshot
+    else:
+        delta["stop_reason"] = None
+    return finish_node(
+        context=context,
+        node="replan",
+        started_at=started_at,
+        outcome="completed",
+        delta=delta,
+    )
+
+
+__all__ = [
+    "build_plan",
+    "compile_answer_contract",
+    "compile_contract",
+    "replan",
+    "retrieve_context",
+]

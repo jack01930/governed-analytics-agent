@@ -45,6 +45,7 @@ from governed_analytics.agent.contracts import (
     ToolInvocation,
     TypedMetricPlan,
 )
+from governed_analytics.agent.graph import build_agent_graph, run_agent
 from governed_analytics.agent.ports import (
     AgentContext,
     AgentModel,
@@ -114,5 +115,7 @@ __all__ = [
     "ToolInvocation",
     "TraceRecorder",
     "TypedMetricPlan",
+    "build_agent_graph",
     "new_agent_state",
+    "run_agent",
 ]
