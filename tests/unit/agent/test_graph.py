@@ -77,6 +77,7 @@ SynthesisFactory = Callable[[StructuredModelRequest], Mapping[str, object]]
 RAW_INVALID_TOOL_RESULT_SENTINEL = "raw_invalid_tool_result_sentinel"
 CLASS_GETTER_SENTINEL = "raw_class_getter_sentinel"
 MALFORMED_FIELD_SENTINEL = "raw_malformed_field_sentinel"
+MAPPING_READ_SENTINEL = "raw_mapping_read_sentinel"
 
 
 class InvalidToolReturn:
@@ -136,6 +137,18 @@ class CountingToolCallTrace(ToolCallTrace):
 class MalformedField:
     def __repr__(self) -> str:
         return MALFORMED_FIELD_SENTINEL
+
+
+class ExplodingMapping(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        del key
+        raise RuntimeError(MAPPING_READ_SENTINEL)
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        raise RuntimeError(MAPPING_READ_SENTINEL)
+
+    def __len__(self) -> int:
+        raise RuntimeError(MAPPING_READ_SENTINEL)
 
 
 class FrozenClock:
@@ -3214,3 +3227,88 @@ async def test_malformed_tool_fields_are_rejected_without_coercion_warning_or_le
         }
     )
     assert MALFORMED_FIELD_SENTINEL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tool_payload_is_an_owned_snapshot_after_validation_and_run() -> None:
+    backing: dict[str, object] = {}
+
+    class AliasedPayloadTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            invocation = await super().invoke(action, node=node)
+            payload = invocation.observation.payload
+            assert isinstance(payload, Mapping)
+            backing.update(payload)
+            fields = dict(object.__getattribute__(invocation.observation, "__dict__"))
+            fields["payload"] = MappingProxyType(backing)
+            return ToolInvocation.model_construct(
+                observation=Observation.model_construct(**fields),
+                trace=invocation.trace,
+            )
+
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(),),
+        synthesis_output=synthesis(),
+    )
+    context, tools, _, events, _ = context_for(scripts, (query_result(),))
+    context = replace_context(context, tools=AliasedPayloadTools(tools.registry))
+
+    result = await run_agent(run_id="owned-payload", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.COMPLETED
+    assert result.evidence[0].numeric_value == Decimal("125.00")
+    backing["rows"] = (("999.00",),)
+    backing["secret_token"] = MAPPING_READ_SENTINEL
+
+    execute_observation = next(
+        item for item in result.observations if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    assert isinstance(execute_observation.payload, Mapping)
+    assert execute_observation.payload["rows"] == (("125.00",),)
+    assert result.evidence[0].numeric_value == Decimal("125.00")
+    rendered = json.dumps(
+        {
+            "result": result.model_dump(mode="json"),
+            "trace": result.safe_trace.model_dump(mode="json"),
+            "events": events.items,
+        }
+    )
+    assert "999.00" not in rendered
+    assert MAPPING_READ_SENTINEL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tool_payload_mapping_read_failure_is_fixed_and_does_not_leak(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exploding_payload = MappingProxyType(ExplodingMapping())
+
+    class ExplodingPayloadTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            invocation = await super().invoke(action, node=node)
+            fields = dict(object.__getattribute__(invocation.observation, "__dict__"))
+            fields["payload"] = exploding_payload
+            return ToolInvocation.model_construct(
+                observation=Observation.model_construct(**fields),
+                trace=invocation.trace,
+            )
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, (query_result(),))
+    context = replace_context(context, tools=ExplodingPayloadTools(tools.registry))
+
+    result = await run_agent(run_id="exploding-payload", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.observations[-1].safe_error == "internal_tool_error"
+    rendered = json.dumps(
+        {
+            "result": result.model_dump(mode="json"),
+            "trace": result.safe_trace.model_dump(mode="json"),
+            "events": events.items,
+            "logs": caplog.text,
+        }
+    )
+    assert MAPPING_READ_SENTINEL not in rendered

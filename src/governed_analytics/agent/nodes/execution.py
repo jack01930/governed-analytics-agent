@@ -7,6 +7,7 @@ import re
 from collections.abc import Mapping
 from datetime import datetime
 from types import MappingProxyType
+from typing import cast
 from uuid import uuid4
 
 from langgraph.runtime import Runtime
@@ -671,20 +672,25 @@ def _exact_model_fields(
     return {name: storage[name] for name in field_names}
 
 
-def _canonical_frozen_json(value: object) -> bool:
-    """Recognize the immutable representation produced by agent contracts."""
+def _owned_canonical_frozen_json(value: object) -> JsonValue:
+    """Copy canonical frozen JSON into storage owned by the governed boundary."""
 
     if value is None or type(value) in {str, int, bool}:
-        return True
+        return cast(JsonValue, value)
     if type(value) is float:
-        return math.isfinite(value)
+        if not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
+        return value
     if type(value) is tuple:
-        return all(_canonical_frozen_json(item) for item in value)
+        return tuple(_owned_canonical_frozen_json(item) for item in value)
     if type(value) is _MAPPING_PROXY_TYPE:
-        return all(
-            type(name) is str and _canonical_frozen_json(item) for name, item in value.items()
-        )
-    return False
+        owned: dict[str, JsonValue] = {}
+        for name, item in value.items():
+            if type(name) is not str:
+                raise ValueError("JSON object keys must be strings")
+            owned[name] = _owned_canonical_frozen_json(item)
+        return MappingProxyType(owned)
+    raise ValueError("value is not canonical frozen JSON")
 
 
 def _strict_observation(candidate: object) -> Observation | None:
@@ -692,8 +698,7 @@ def _strict_observation(candidate: object) -> Observation | None:
     if fields is None:
         return None
     payload = fields["payload"]
-    if not _canonical_frozen_json(payload):
-        return None
+    owned_payload = None if payload is None else _owned_canonical_frozen_json(payload)
     strict_fields = dict(fields)
     if payload is not None:
         # Frozen JSON mappings are stored as mappingproxy, while Pydantic's strict
@@ -702,7 +707,7 @@ def _strict_observation(candidate: object) -> Observation | None:
         strict_fields["payload"] = ()
     validated = Observation.model_validate(strict_fields, strict=True)
     if payload is not None:
-        validated = validated.model_copy(update={"payload": payload})
+        validated = validated.model_copy(update={"payload": owned_payload})
     return validated
 
 
