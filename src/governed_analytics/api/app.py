@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
+from governed_analytics.api.contracts import RequestValidationErrorResponse
 from governed_analytics.api.dependencies import AppContainer, build_container
 from governed_analytics.api.routes import analysis_router, health_router
 
@@ -24,6 +27,19 @@ def create_app(*, container_factory: ContainerFactory = build_container) -> Fast
                 del application.state.container
 
     application = FastAPI(title="Governed Analytics Agent", lifespan=lifespan)
+
+    @application.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        request: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        del request, error
+        body = RequestValidationErrorResponse()
+        return JSONResponse(
+            status_code=422,
+            content=body.model_dump(mode="json"),
+        )
+
     application.include_router(analysis_router)
     application.include_router(health_router)
     return application

@@ -612,7 +612,10 @@ class AnalysisRunner:
     async def get(self, run_id: str) -> RunRecord:
         if self._consistency_failed or run_id in self._run_consistency_failures:
             raise RunConsistencyError()
-        return await self._runs.get(run_id)
+        record = await self._runs.get(run_id)
+        if self._consistency_failed or run_id in self._run_consistency_failures:
+            raise RunConsistencyError()
+        return record
 
     async def wait(self, run_id: str) -> RunRecord:
         task = self._tasks.get(run_id)
@@ -629,7 +632,7 @@ class AnalysisRunner:
                 self._enter_fail_stop(run_id)
         if run_id in self._run_consistency_failures:
             raise RunConsistencyError()
-        return await self._runs.get(run_id)
+        return await self.get(run_id)
 
     async def shutdown(self) -> None:
         async with self._prune_lock:

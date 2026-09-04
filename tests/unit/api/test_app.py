@@ -132,11 +132,14 @@ def test_live_startup_fails_safely_before_client_without_key_or_matching_pricing
         model_api_key=api_key,
     )
 
-    with pytest.raises(AgentStartupError, match="agent startup failed") as raised, TestClient(
-        app_for(
-            runtime_settings(runtime_mode="live", live_enabled=True),
-            model,
-        )
+    with (
+        pytest.raises(AgentStartupError, match="agent startup failed") as raised,
+        TestClient(
+            app_for(
+                runtime_settings(runtime_mode="live", live_enabled=True),
+                model,
+            )
+        ),
     ):
         pass
 
@@ -239,8 +242,7 @@ def test_builtin_demo_library_has_exact_queries_and_complete_purpose_sequences()
     assert tuple(scripts) == (
         "2026年6月gmv是多少？",  # noqa: RUF001
         # The full-width comma is part of the exact approved demo query.
-        "比较 2026-06-01 至 06-08 与 06-08 至 06-15 的 "
-        "gmv，并按区域、sku、客户分群解释下降。",  # noqa: RUF001
+        "比较 2026-06-01 至 06-08 与 06-08 至 06-15 的 gmv，并按区域、sku、客户分群解释下降。",  # noqa: RUF001
     )
     first_key, second_key = tuple(scripts)
     assert tuple(scripts[first_key]) == ("behavior", "plan", "action", "synthesis")

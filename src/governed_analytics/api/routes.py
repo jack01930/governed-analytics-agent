@@ -6,8 +6,9 @@ from collections.abc import AsyncIterator
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sse_starlette.sse import EventSourceResponse
+from starlette.types import Message
 
 from governed_analytics.agent.contracts import RunLifecycleStatus
 from governed_analytics.api.contracts import (
@@ -25,6 +26,7 @@ from governed_analytics.api.dependencies import AppContainer
 from governed_analytics.runtime.events import (
     EventCursorAhead,
     InvalidEventCursor,
+    RunEvent,
     parse_last_event_id,
 )
 from governed_analytics.runtime.events import RunNotFound as EventRunNotFound
@@ -40,6 +42,37 @@ analysis_router = APIRouter(prefix="/v1/analyses", tags=["analyses"])
 health_router = APIRouter(tags=["health"])
 
 
+class _SseEventIterator:
+    def __init__(self, opened: AsyncIterator[RunEvent]) -> None:
+        self._opened = opened
+        self._closed = False
+
+    def __aiter__(self) -> _SseEventIterator:
+        return self
+
+    async def __anext__(self) -> dict[str, str]:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            event = await anext(self._opened)
+        except BaseException:
+            await self.aclose()
+            raise
+        return {
+            "id": event.event_id,
+            "event": event.type,
+            "data": event.model_dump_json(),
+        }
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._opened, "aclose", None)
+        if callable(close):
+            await close()
+
+
 def get_container(request: Request) -> AppContainer:
     container = getattr(request.app.state, "container", None)
     if not isinstance(container, AppContainer):
@@ -48,6 +81,9 @@ def get_container(request: Request) -> AppContainer:
             detail="service_not_ready",
         )
     return container
+
+
+ContainerDependency = Annotated[AppContainer, Depends(get_container)]
 
 
 def _map_run_read_error(error: Exception) -> HTTPException:
@@ -60,9 +96,7 @@ def _map_run_read_error(error: Exception) -> HTTPException:
 
 def _status_response(record: RunRecord) -> AnalysisStatusResponse:
     evidence = tuple(
-        SafeEvidenceResponse.model_validate(
-            item.model_dump(exclude={"verified"})
-        )
+        SafeEvidenceResponse.model_validate(item.model_dump(exclude={"verified"}))
         for item in record.evidence
     )
     return AnalysisStatusResponse(
@@ -122,10 +156,9 @@ def _trace_response(record: RunRecord) -> TraceResponse:
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_analysis(
-    request: Request,
     payload: AnalysisCreateRequest,
+    container: ContainerDependency,
 ) -> AnalysisCreateResponse:
-    container = get_container(request)
     try:
         record = await container.runner.submit(payload.query)
     except RunCapacityExceeded:
@@ -145,18 +178,24 @@ async def create_analysis(
 
 
 @analysis_router.get("/{run_id}", response_model=AnalysisStatusResponse)
-async def get_analysis(request: Request, run_id: str) -> AnalysisStatusResponse:
+async def get_analysis(
+    run_id: str,
+    container: ContainerDependency,
+) -> AnalysisStatusResponse:
     try:
-        record = await get_container(request).runner.get(run_id)
+        record = await container.runner.get(run_id)
     except (RunNotFound, RunConsistencyError) as error:
         raise _map_run_read_error(error) from None
     return _status_response(record)
 
 
 @analysis_router.get("/{run_id}/trace", response_model=TraceResponse)
-async def get_trace(request: Request, run_id: str) -> TraceResponse:
+async def get_trace(
+    run_id: str,
+    container: ContainerDependency,
+) -> TraceResponse:
     try:
-        record = await get_container(request).runner.get(run_id)
+        record = await container.runner.get(run_id)
     except (RunNotFound, RunConsistencyError) as error:
         raise _map_run_read_error(error) from None
     return _trace_response(record)
@@ -164,11 +203,10 @@ async def get_trace(request: Request, run_id: str) -> TraceResponse:
 
 @analysis_router.get("/{run_id}/events")
 async def sse_events(
-    request: Request,
     run_id: str,
+    container: ContainerDependency,
     last_event_id: Annotated[str | None, Header()] = None,
 ) -> EventSourceResponse:
-    container = get_container(request)
     try:
         high_water = await container.events.high_water_mark(run_id)
         after = parse_last_event_id(
@@ -184,22 +222,15 @@ async def sse_events(
     except EventCursorAhead:
         raise HTTPException(status_code=409, detail="event_cursor_ahead") from None
 
-    async def generate() -> AsyncIterator[dict[str, str]]:
-        try:
-            async for event in opened:
-                yield {
-                    "id": event.event_id,
-                    "event": event.type,
-                    "data": event.model_dump_json(),
-                }
-        finally:
-            close = getattr(opened, "aclose", None)
-            if callable(close):
-                await close()
+    iterator = _SseEventIterator(opened)
+
+    async def close_on_disconnect(_message: Message) -> None:
+        await iterator.aclose()
 
     return EventSourceResponse(
-        generate(),
+        iterator,
         ping=container.settings.sse_heartbeat_seconds,
+        client_close_handler_callable=close_on_disconnect,
     )
 
 
@@ -209,9 +240,14 @@ async def healthz() -> HealthResponse:
 
 
 @health_router.get("/readyz", response_model=HealthResponse)
-async def readyz(request: Request) -> HealthResponse:
-    get_container(request)
+async def readyz(container: ContainerDependency) -> HealthResponse:
+    del container
     return HealthResponse()
 
 
-__all__ = ["analysis_router", "get_container", "health_router"]
+__all__ = [
+    "ContainerDependency",
+    "analysis_router",
+    "get_container",
+    "health_router",
+]

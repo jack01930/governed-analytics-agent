@@ -69,9 +69,7 @@ class AnalysisStatusResponse(_WireModel):
             if any(value is None for value in terminal_values):
                 raise ValueError("terminal status requires complete public output")
         elif (
-            any(value is not None for value in terminal_values)
-            or self.evidence
-            or self.limitations
+            any(value is not None for value in terminal_values) or self.evidence or self.limitations
         ):
             raise ValueError("nonterminal status cannot expose terminal output")
         return self
@@ -127,11 +125,16 @@ class HealthResponse(_WireModel):
     status: Literal["ok"] = "ok"
 
 
+class RequestValidationErrorResponse(_WireModel):
+    detail: Literal["request_validation_failed"] = "request_validation_failed"
+
+
 __all__ = [
     "AnalysisCreateRequest",
     "AnalysisCreateResponse",
     "AnalysisStatusResponse",
     "HealthResponse",
+    "RequestValidationErrorResponse",
     "SafeEvidenceResponse",
     "SafeModelCallTrace",
     "SafeNodeTrace",

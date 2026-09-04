@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from starlette.types import Message, Scope
 
 from governed_analytics.agent.contracts import (
     FinalStatus,
@@ -19,8 +23,9 @@ from governed_analytics.agent.contracts import (
 )
 from governed_analytics.api.app import create_app
 from governed_analytics.api.dependencies import AppContainer
+from governed_analytics.api.routes import get_container, sse_events
 from governed_analytics.config import AgentRuntimeSettings
-from governed_analytics.runtime.events import RunEvent
+from governed_analytics.runtime.events import InMemoryEventStore, RunEvent
 from governed_analytics.runtime.events import RunNotFound as EventRunNotFound
 from governed_analytics.runtime.runs import (
     RunCapacityExceeded,
@@ -119,9 +124,7 @@ class CannedEventStore:
     def __init__(self) -> None:
         self.events = tuple(event(sequence) for sequence in range(1, 5))
 
-    async def high_water_mark(
-        self, run_id: str, *, owner_token: object | None = None
-    ) -> int:
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int:
         del owner_token
         if run_id != "run-1":
             raise EventRunNotFound()
@@ -147,6 +150,32 @@ class PrunedBeforeOpenEventStore(CannedEventStore):
     ) -> AsyncIterator[RunEvent]:
         del run_id, after_sequence
         raise EventRunNotFound()
+
+
+class ExceptionalOpenedStream:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def __aiter__(self) -> ExceptionalOpenedStream:
+        return self
+
+    async def __anext__(self) -> RunEvent:
+        raise RuntimeError("stream failed")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class ExceptionalEventStore(CannedEventStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.opened = ExceptionalOpenedStream()
+
+    async def open_stream(
+        self, run_id: str, *, after_sequence: int | None
+    ) -> AsyncIterator[RunEvent]:
+        del run_id, after_sequence
+        return self.opened
 
 
 def factory_for(
@@ -178,6 +207,17 @@ def parse_sse(text: str) -> list[dict[str, str]]:
     return messages
 
 
+def direct_container(events: object, runner: FakeRunner | None = None) -> AppContainer:
+    return AppContainer(
+        settings=AgentRuntimeSettings(  # type: ignore[call-arg]
+            _env_file=None,
+            sse_heartbeat_seconds=1,
+        ),
+        runner=runner or FakeRunner(),  # type: ignore[arg-type]
+        events=events,  # type: ignore[arg-type]
+    )
+
+
 def test_post_analysis_returns_queued_urls_and_filters_response() -> None:
     runner = FakeRunner()
     with TestClient(create_app(container_factory=factory_for(runner))) as client:
@@ -197,6 +237,39 @@ def test_post_analysis_returns_queued_urls_and_filters_response() -> None:
     }
 
 
+def test_all_container_routes_use_overridable_annotated_dependency() -> None:
+    base_runner = FakeRunner()
+    override_runner = FakeRunner({"run-1": terminal()})
+    application = create_app(container_factory=factory_for(base_runner))
+    override = direct_container(CannedEventStore(), override_runner)
+    application.dependency_overrides[get_container] = lambda: override
+
+    with TestClient(application) as client:
+        response = client.get("/v1/analyses/run-1")
+
+    assert response.status_code == 200
+    container_paths = {
+        "/v1/analyses",
+        "/v1/analyses/{run_id}",
+        "/v1/analyses/{run_id}/trace",
+        "/v1/analyses/{run_id}/events",
+        "/readyz",
+    }
+    included_routes = (
+        route
+        for included in application.routes
+        for route in getattr(getattr(included, "original_router", None), "routes", ())
+    )
+    routes = {
+        route.path: route
+        for route in included_routes
+        if isinstance(route, APIRoute) and route.path in container_paths
+    }
+    assert routes.keys() == container_paths
+    for route in routes.values():
+        assert any(dependency.call is get_container for dependency in route.dependant.dependencies)
+
+
 def test_post_maps_capacity_and_rejects_request_overrides() -> None:
     runner = FakeRunner()
     runner.capacity_error = True
@@ -212,6 +285,35 @@ def test_post_maps_capacity_and_rejects_request_overrides() -> None:
     assert override.status_code == 422
 
 
+def test_request_validation_error_is_fixed_and_redacts_raw_input() -> None:
+    sentinel = "secret-payload-prompt-sentinel"
+    runner = FakeRunner()
+    with TestClient(create_app(container_factory=factory_for(runner))) as client:
+        response = client.post(
+            "/v1/analyses",
+            json={
+                "query": "safe query",
+                "model_api_key": sentinel,
+                "payload": {"prompt": sentinel},
+                "prompt": sentinel,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "request_validation_failed"}
+    serialized = json.dumps(response.json()).casefold()
+    for forbidden in (
+        "query",
+        "model_api_key",
+        "payload",
+        "prompt",
+        sentinel,
+        "ctx",
+        "input",
+    ):
+        assert forbidden not in serialized
+
+
 def test_status_unknown_terminal_and_consistency_mapping_are_safe() -> None:
     runner = FakeRunner({"run-1": terminal()})
     with TestClient(create_app(container_factory=factory_for(runner))) as client:
@@ -219,6 +321,7 @@ def test_status_unknown_terminal_and_consistency_mapping_are_safe() -> None:
         unknown = client.get("/v1/analyses/unknown")
         runner.consistency_error = True
         inconsistent = client.get("/v1/analyses/run-1")
+        inconsistent_trace = client.get("/v1/analyses/run-1/trace")
 
     assert response.status_code == 200
     assert response.json()["final_status"] == "completed"
@@ -227,6 +330,9 @@ def test_status_unknown_terminal_and_consistency_mapping_are_safe() -> None:
     assert unknown.json() == {"detail": "run_not_found"}
     assert inconsistent.status_code == 503
     assert inconsistent.json() == {"detail": "run_consistency_unavailable"}
+    assert inconsistent_trace.status_code == 503
+    assert inconsistent_trace.json() == {"detail": "run_consistency_unavailable"}
+    assert "safe query" not in json.dumps((inconsistent.json(), inconsistent_trace.json()))
 
 
 def test_trace_has_explicit_initial_and_terminal_frozen_snapshots() -> None:
@@ -253,9 +359,7 @@ def test_trace_has_explicit_initial_and_terminal_frozen_snapshots() -> None:
     }
     body = complete.json()
     assert body["snapshot_complete"] is True
-    assert body["nodes"] == [
-        {"node": "finalize", "duration_ms": 1, "outcome": "completed"}
-    ]
+    assert body["nodes"] == [{"node": "finalize", "duration_ms": 1, "outcome": "completed"}]
     serialized = json.dumps(body)
     for forbidden in ("sql", "parameters", "rows", "prompt", "endpoint", "provider_raw"):
         assert forbidden not in serialized.casefold()
@@ -309,10 +413,104 @@ def test_sse_maps_cursor_and_unknown_errors(
 def test_sse_ttl_prune_race_maps_late_not_found_before_response_headers() -> None:
     runner = FakeRunner({"run-1": terminal()})
     events = PrunedBeforeOpenEventStore()
-    with TestClient(
-        create_app(container_factory=factory_for(runner, events))
-    ) as client:
+    with TestClient(create_app(container_factory=factory_for(runner, events))) as client:
         response = client.get("/v1/analyses/run-1/events")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "run_not_found"}
+
+
+@pytest.mark.asyncio
+async def test_sse_response_body_iterator_closes_lease_before_first_iteration() -> None:
+    events = InMemoryEventStore()
+    owner = object()
+    await events.create_run("run-1", owner_token=owner)
+    await events.emit_terminal(
+        "run-1",
+        {"final_status": "completed", "stop_reason": "answer_complete"},
+        owner_token=owner,
+    )
+    response = await sse_events("run-1", direct_container(events))
+
+    assert await events.delete_run("run-1", owner_token=owner) is False
+    await cast(Any, response.body_iterator).aclose()
+    assert await events.delete_run("run-1", owner_token=owner) is True
+
+
+@pytest.mark.asyncio
+async def test_sse_response_body_iterator_closes_after_start_and_natural_end() -> None:
+    for close_early in (True, False):
+        events = InMemoryEventStore()
+        owner = object()
+        await events.create_run("run-1", owner_token=owner)
+        await events.emit_terminal(
+            "run-1",
+            {"final_status": "completed", "stop_reason": "answer_complete"},
+            owner_token=owner,
+        )
+        response = await sse_events("run-1", direct_container(events))
+        iterator = cast(Any, response.body_iterator)
+        await anext(iterator)
+        if close_early:
+            await iterator.aclose()
+        else:
+            async for _item in iterator:
+                pass
+
+        assert await events.delete_run("run-1", owner_token=owner) is True
+
+
+@pytest.mark.asyncio
+async def test_sse_response_asgi_disconnect_closes_lease_while_send_is_blocked() -> None:
+    events = InMemoryEventStore()
+    owner = object()
+    await events.create_run("run-1", owner_token=owner)
+    await events.emit_terminal(
+        "run-1",
+        {"final_status": "completed", "stop_reason": "answer_complete"},
+        owner_token=owner,
+    )
+    response = await sse_events("run-1", direct_container(events))
+    body_send_started = asyncio.Event()
+    never_finish_send = asyncio.Event()
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            body_send_started.set()
+            await never_finish_send.wait()
+
+    async def receive() -> Message:
+        await body_send_started.wait()
+        return {"type": "http.disconnect"}
+
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/v1/analyses/run-1/events",
+        "raw_path": b"/v1/analyses/run-1/events",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    await response(
+        scope,
+        receive,
+        send,
+    )
+
+    assert await events.delete_run("run-1", owner_token=owner) is True
+
+
+@pytest.mark.asyncio
+async def test_sse_response_body_iterator_closes_opened_stream_on_exception() -> None:
+    events = ExceptionalEventStore()
+    response = await sse_events("run-1", direct_container(events))
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        await anext(cast(Any, response.body_iterator))
+
+    assert events.opened.closed

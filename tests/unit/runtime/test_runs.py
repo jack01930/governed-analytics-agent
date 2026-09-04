@@ -45,6 +45,7 @@ from governed_analytics.runtime.runs import (
     RunnerShutdown,
     RunNotFound,
     RunOwnershipMismatch,
+    RunRecord,
     RunStateConflict,
     RunSubmissionFailed,
 )
@@ -1232,6 +1233,63 @@ async def test_persistent_terminal_failure_fail_stops_runner_and_wait() -> None:
         await runner.get("run-1")
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.submit("second")
+
+
+class BarrierGetRunStore(InMemoryRunStore):
+    def __init__(self, *, clock: FakeClock) -> None:
+        super().__init__(max_runs=3, retention_seconds=3600, clock=clock)
+        self.read_started = asyncio.Event()
+        self.release_read = asyncio.Event()
+
+    async def get(self, run_id: str, *, owner_token: object | None = None) -> RunRecord:
+        if run_id == "run-1" and owner_token is None:
+            self.read_started.set()
+            await self.release_read.wait()
+        return await super().get(run_id, owner_token=owner_token)
+
+
+@pytest.mark.asyncio
+async def test_get_rechecks_global_fail_stop_after_awaited_store_read() -> None:
+    clock = FakeClock()
+    runs = BarrierGetRunStore(clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    owner = object()
+    await runs.create("run-1", "query", owner_token=owner)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+    )
+
+    read = asyncio.create_task(runner.get("run-1"))
+    await runs.read_started.wait()
+    runner._enter_fail_stop("run-2")
+    runs.release_read.set()
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await read
+
+
+@pytest.mark.asyncio
+async def test_wait_final_read_uses_guarded_get_after_global_fail_stop() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=3, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    owner = object()
+    await runs.create("run-1", "query", owner_token=owner)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id, _owner_token: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+    )
+    runner._enter_fail_stop("run-2")
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.wait("run-1")
 
 
 @pytest.mark.asyncio
@@ -3337,17 +3395,13 @@ class ReplaceEventDuringRunDeleteStore(InMemoryRunStore):
             owner_token=self.foreign_owner,
         )
 
-    async def delete_queued(
-        self, run_id: str, *, owner_token: object | None = None
-    ) -> bool:
+    async def delete_queued(self, run_id: str, *, owner_token: object | None = None) -> bool:
         deleted = await super().delete_queued(run_id, owner_token=owner_token)
         if deleted and self.method == "delete_queued":
             await self._replace_event_generation(run_id)
         return deleted
 
-    async def delete_terminal(
-        self, run_id: str, *, owner_token: object | None = None
-    ) -> bool:
+    async def delete_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool:
         deleted = await super().delete_terminal(run_id, owner_token=owner_token)
         if deleted and self.method == "delete_terminal":
             await self._replace_event_generation(run_id)
@@ -3408,14 +3462,17 @@ async def test_rollback_final_event_readback_preserves_replacement_generation() 
         owner_token=foreign_owner,
     )
     frozen = tuple(event.model_dump_json() for event in snapshot)
-    assert tuple(
-        event.model_dump_json()
-        for event in await events.replay_snapshot(
-            "run-1",
-            high_water_mark=1,
-            owner_token=foreign_owner,
+    assert (
+        tuple(
+            event.model_dump_json()
+            for event in await events.replay_snapshot(
+                "run-1",
+                high_water_mark=1,
+                owner_token=foreign_owner,
+            )
         )
-    ) == frozen
+        == frozen
+    )
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.submit("later")
 
@@ -3434,13 +3491,9 @@ async def test_prune_final_event_readback_preserves_replacement_generation() -> 
     owner = object()
     await runs.create("old", "query", owner_token=owner)
     await events.create_run("old", owner_token=owner)
-    await events.emit(
-        "old", "runtime", "run.created", {"status": "queued"}, owner_token=owner
-    )
+    await events.emit("old", "runtime", "run.created", {"status": "queued"}, owner_token=owner)
     await runs.mark_running("old", owner_token=owner)
-    await events.emit(
-        "old", "runtime", "run.started", {"status": "running"}, owner_token=owner
-    )
+    await events.emit("old", "runtime", "run.started", {"status": "running"}, owner_token=owner)
     await runs.complete("old", completed_result("old"), owner_token=owner)
     await events.emit_terminal(
         "old",
@@ -3466,13 +3519,16 @@ async def test_prune_final_event_readback_preserves_replacement_generation() -> 
         owner_token=foreign_owner,
     )
     frozen = tuple(event.model_dump_json() for event in snapshot)
-    assert tuple(
-        event.model_dump_json()
-        for event in await events.replay_snapshot(
-            "old",
-            high_water_mark=1,
-            owner_token=foreign_owner,
+    assert (
+        tuple(
+            event.model_dump_json()
+            for event in await events.replay_snapshot(
+                "old",
+                high_water_mark=1,
+                owner_token=foreign_owner,
+            )
         )
-    ) == frozen
+        == frozen
+    )
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.submit("later")
