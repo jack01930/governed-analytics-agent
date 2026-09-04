@@ -16,6 +16,7 @@ from governed_analytics.runtime.events import (
     BoundEventSink,
     EventCursor,
     EventCursorAhead,
+    EventOwnershipMismatch,
     InMemoryEventStore,
     InvalidEventCursor,
     InvalidRunEvent,
@@ -24,6 +25,34 @@ from governed_analytics.runtime.events import (
     TerminalEventExists,
     parse_last_event_id,
 )
+
+
+@pytest.mark.asyncio
+async def test_event_store_conditions_generation_reads_and_mutations_on_exact_token() -> None:
+    store = InMemoryEventStore()
+    owner = object()
+    foreign = object()
+    await store.create_run("run-1", owner_token=owner)
+
+    with pytest.raises(EventOwnershipMismatch, match="generation ownership mismatch"):
+        await store.high_water_mark("run-1", owner_token=foreign)
+    with pytest.raises(EventOwnershipMismatch, match="generation ownership mismatch"):
+        await store.emit(
+            "run-1",
+            "runtime",
+            "run.created",
+            {"status": "queued"},
+            owner_token=foreign,
+        )
+    with pytest.raises(EventOwnershipMismatch, match="generation ownership mismatch"):
+        await store.delete_run(
+            "run-1",
+            allow_unstarted=True,
+            owner_token=foreign,
+        )
+
+    assert await store.high_water_mark("run-1", owner_token=owner) == 0
+
 
 VALID_EVENTS: tuple[tuple[str, str, dict[str, Any]], ...] = (
     ("runtime", "run.created", {"status": "queued"}),

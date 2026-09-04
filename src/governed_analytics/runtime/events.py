@@ -262,6 +262,11 @@ class InvalidRunEvent(ValueError):
         super().__init__("invalid_run_event")
 
 
+class EventOwnershipMismatch(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("event generation ownership mismatch")
+
+
 def _safe_run_id(value: object) -> str:
     if (
         type(value) is not str
@@ -652,7 +657,7 @@ class RunEvent(BaseModel):
 
 
 class EventStore(Protocol):
-    async def create_run(self, run_id: str) -> None: ...
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None: ...
 
     async def emit(
         self,
@@ -660,24 +665,39 @@ class EventStore(Protocol):
         node: str,
         event_type: str,
         data: Mapping[str, JsonValue],
+        *,
+        owner_token: object | None = None,
     ) -> RunEvent: ...
 
-    async def emit_terminal(self, run_id: str, data: Mapping[str, JsonValue]) -> RunEvent: ...
+    async def emit_terminal(
+        self,
+        run_id: str,
+        data: Mapping[str, JsonValue],
+        *,
+        owner_token: object | None = None,
+    ) -> RunEvent: ...
 
-    async def high_water_mark(self, run_id: str) -> int: ...
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int: ...
 
     async def replay_snapshot(
         self,
         run_id: str,
         *,
         high_water_mark: int,
+        owner_token: object | None = None,
     ) -> tuple[RunEvent, ...]: ...
 
-    async def has_terminal(self, run_id: str) -> bool: ...
+    async def has_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool: ...
 
     def stream(self, run_id: str, *, after_sequence: int | None) -> AsyncIterator[RunEvent]: ...
 
-    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool: ...
+    async def delete_run(
+        self,
+        run_id: str,
+        *,
+        allow_unstarted: bool = False,
+        owner_token: object | None = None,
+    ) -> bool: ...
 
 
 @dataclass(slots=True)
@@ -688,6 +708,7 @@ class _RunBuffer:
     started: bool = False
     active_streams: int = 0
     deleted: bool = False
+    owner_token: object | None = field(default=None, repr=False)
 
 
 def _utc_now() -> datetime:
@@ -700,14 +721,19 @@ class InMemoryEventStore:
         self._registry_lock = asyncio.Lock()
         self._runs: dict[str, _RunBuffer] = {}
 
-    async def create_run(self, run_id: str) -> None:
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None:
         safe_run_id = _safe_run_id(run_id)
         async with self._registry_lock:
             if safe_run_id in self._runs:
                 raise InvalidRunEvent()
-            self._runs[safe_run_id] = _RunBuffer()
+            self._runs[safe_run_id] = _RunBuffer(owner_token=owner_token)
 
-    async def _locked_buffer(self, run_id: str) -> tuple[_RunBuffer, asyncio.Condition]:
+    async def _locked_buffer(
+        self,
+        run_id: str,
+        *,
+        owner_token: object | None = None,
+    ) -> tuple[_RunBuffer, asyncio.Condition]:
         safe_run_id = _safe_run_id(run_id)
         await self._registry_lock.acquire()
         buffer = self._runs.get(safe_run_id)
@@ -723,6 +749,9 @@ class InMemoryEventStore:
         if buffer.deleted:
             buffer.condition.release()
             raise RunNotFound()
+        if owner_token is not None and buffer.owner_token is not owner_token:
+            buffer.condition.release()
+            raise EventOwnershipMismatch()
         return buffer, buffer.condition
 
     async def emit(
@@ -731,17 +760,35 @@ class InMemoryEventStore:
         node: str,
         event_type: str,
         data: Mapping[str, JsonValue],
+        *,
+        owner_token: object | None = None,
     ) -> RunEvent:
         if event_type == "run.terminal":
             raise InvalidRunEvent()
-        return await self._append(run_id, node, event_type, data, terminal=False)
+        return await self._append(
+            run_id,
+            node,
+            event_type,
+            data,
+            terminal=False,
+            owner_token=owner_token,
+        )
 
     async def emit_terminal(
         self,
         run_id: str,
         data: Mapping[str, JsonValue],
+        *,
+        owner_token: object | None = None,
     ) -> RunEvent:
-        return await self._append(run_id, "runtime", "run.terminal", data, terminal=True)
+        return await self._append(
+            run_id,
+            "runtime",
+            "run.terminal",
+            data,
+            terminal=True,
+            owner_token=owner_token,
+        )
 
     async def _append(
         self,
@@ -751,10 +798,14 @@ class InMemoryEventStore:
         data: Mapping[str, JsonValue],
         *,
         terminal: bool,
+        owner_token: object | None,
     ) -> RunEvent:
         safe_run_id = _safe_run_id(run_id)
         owned_data = _freeze_event_data(node, event_type, data)
-        buffer, condition = await self._locked_buffer(safe_run_id)
+        buffer, condition = await self._locked_buffer(
+            safe_run_id,
+            owner_token=owner_token,
+        )
         try:
             if buffer.terminal:
                 raise TerminalEventExists()
@@ -783,8 +834,8 @@ class InMemoryEventStore:
         finally:
             condition.release()
 
-    async def high_water_mark(self, run_id: str) -> int:
-        buffer, condition = await self._locked_buffer(run_id)
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int:
+        buffer, condition = await self._locked_buffer(run_id, owner_token=owner_token)
         try:
             return len(buffer.events)
         finally:
@@ -795,10 +846,11 @@ class InMemoryEventStore:
         run_id: str,
         *,
         high_water_mark: int,
+        owner_token: object | None = None,
     ) -> tuple[RunEvent, ...]:
         if type(high_water_mark) is not int or high_water_mark < 0:
             raise InvalidEventCursor()
-        buffer, condition = await self._locked_buffer(run_id)
+        buffer, condition = await self._locked_buffer(run_id, owner_token=owner_token)
         try:
             if high_water_mark > len(buffer.events):
                 raise EventCursorAhead()
@@ -806,8 +858,8 @@ class InMemoryEventStore:
         finally:
             condition.release()
 
-    async def has_terminal(self, run_id: str) -> bool:
-        buffer, condition = await self._locked_buffer(run_id)
+    async def has_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool:
+        buffer, condition = await self._locked_buffer(run_id, owner_token=owner_token)
         try:
             return buffer.terminal
         finally:
@@ -851,7 +903,13 @@ class InMemoryEventStore:
                 buffer.active_streams -= 1
                 buffer.condition.notify_all()
 
-    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
+    async def delete_run(
+        self,
+        run_id: str,
+        *,
+        allow_unstarted: bool = False,
+        owner_token: object | None = None,
+    ) -> bool:
         if type(allow_unstarted) is not bool:
             raise InvalidRunEvent()
         safe_run_id = _safe_run_id(run_id)
@@ -860,6 +918,8 @@ class InMemoryEventStore:
             if buffer is None:
                 raise RunNotFound()
             async with buffer.condition:
+                if owner_token is not None and buffer.owner_token is not owner_token:
+                    raise EventOwnershipMismatch()
                 if buffer.active_streams:
                     return False
                 permitted = buffer.terminal or (
@@ -878,6 +938,7 @@ class InMemoryEventStore:
 class BoundEventSink:
     store: EventStore
     run_id: str
+    owner_token: object | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _safe_run_id(self.run_id)
@@ -890,7 +951,13 @@ class BoundEventSink:
     ) -> None:
         if event_type.startswith("run.") or node == "runtime":
             raise InvalidRunEvent()
-        await self.store.emit(self.run_id, node, event_type, data)
+        await self.store.emit(
+            self.run_id,
+            node,
+            event_type,
+            data,
+            owner_token=self.owner_token,
+        )
 
 
 def parse_last_event_id(
@@ -925,6 +992,7 @@ __all__ = [
     "BoundEventSink",
     "EventCursor",
     "EventCursorAhead",
+    "EventOwnershipMismatch",
     "EventStore",
     "InMemoryEventStore",
     "InvalidEventCursor",

@@ -43,11 +43,29 @@ from governed_analytics.runtime.runs import (
     RunConsistencyError,
     RunnerShutdown,
     RunNotFound,
+    RunOwnershipMismatch,
     RunStateConflict,
     RunSubmissionFailed,
 )
 
 SENTINEL = "raw-row-secret-sentinel"
+
+
+@pytest.mark.asyncio
+async def test_run_store_conditions_generation_operations_on_exact_owner_token() -> None:
+    clock = FakeClock()
+    store = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    owner = object()
+    foreign = object()
+    created = await store.create("run-1", "query", owner_token=owner)
+
+    with pytest.raises(RunOwnershipMismatch, match="generation ownership mismatch"):
+        await store.get("run-1", owner_token=foreign)
+    with pytest.raises(RunOwnershipMismatch, match="generation ownership mismatch"):
+        await store.delete_queued("run-1", owner_token=foreign)
+
+    assert await store.get("run-1", owner_token=owner) == created
+    assert "owner_token" not in created.model_dump_json()
 
 
 class FakeClock:
@@ -439,10 +457,12 @@ class FailingCreatedEventStore(InMemoryEventStore):
         node: str,
         event_type: str,
         data: Any,
+        *,
+        owner_token: object | None = None,
     ) -> Any:
         if event_type == "run.created":
             raise RuntimeError(f"do not expose {SENTINEL}")
-        return await super().emit(run_id, node, event_type, data)
+        return await super().emit(run_id, node, event_type, data, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -475,9 +495,9 @@ class RecordingEventStore(InMemoryEventStore):
         super().__init__(clock=clock)
         self.created: list[str] = []
 
-    async def create_run(self, run_id: str) -> None:
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None:
         self.created.append(run_id)
-        await super().create_run(run_id)
+        await super().create_run(run_id, owner_token=owner_token)
 
 
 class BlockingPreflightEventStore(InMemoryEventStore):
@@ -485,10 +505,10 @@ class BlockingPreflightEventStore(InMemoryEventStore):
         super().__init__(clock=clock)
         self.preflight_started = asyncio.Event()
 
-    async def high_water_mark(self, run_id: str) -> int:
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int:
         self.preflight_started.set()
         await asyncio.Event().wait()
-        return await super().high_water_mark(run_id)
+        return await super().high_water_mark(run_id, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -653,10 +673,16 @@ class BlockingTerminalEventStore(InMemoryEventStore):
         self.terminal_entered = asyncio.Event()
         self.release_terminal = asyncio.Event()
 
-    async def emit_terminal(self, run_id: str, data: Any) -> Any:
+    async def emit_terminal(
+        self,
+        run_id: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         self.terminal_entered.set()
         await self.release_terminal.wait()
-        return await super().emit_terminal(run_id, data)
+        return await super().emit_terminal(run_id, data, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -846,42 +872,66 @@ class SideEffectFailureEventStore(InMemoryEventStore):
         self.failures += 1
         return True
 
-    async def create_run(self, run_id: str) -> None:
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None:
         if self._fails("create_run", "before"):
             raise RuntimeError(SENTINEL)
-        await super().create_run(run_id)
+        await super().create_run(run_id, owner_token=owner_token)
         if self._fails("create_run", "after"):
             raise RuntimeError(SENTINEL)
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         method = event_type
         if self._fails(method, "before"):
             raise RuntimeError(SENTINEL)
-        event = await super().emit(run_id, node, event_type, data)
+        event = await super().emit(run_id, node, event_type, data, owner_token=owner_token)
         if self._fails(method, "after"):
             raise RuntimeError(SENTINEL)
         return event
 
-    async def has_terminal(self, run_id: str) -> bool:
+    async def has_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool:
         if self._fails("has_terminal", "before"):
             raise RuntimeError(SENTINEL)
-        result = await super().has_terminal(run_id)
+        result = await super().has_terminal(run_id, owner_token=owner_token)
         if self._fails("has_terminal", "after"):
             raise RuntimeError(SENTINEL)
         return result
 
-    async def emit_terminal(self, run_id: str, data: Any) -> Any:
+    async def emit_terminal(
+        self,
+        run_id: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if self._fails("emit_terminal", "before"):
             raise RuntimeError(SENTINEL)
-        event = await super().emit_terminal(run_id, data)
+        event = await super().emit_terminal(run_id, data, owner_token=owner_token)
         if self._fails("emit_terminal", "after"):
             raise RuntimeError(SENTINEL)
         return event
 
-    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
+    async def delete_run(
+        self,
+        run_id: str,
+        *,
+        allow_unstarted: bool = False,
+        owner_token: object | None = None,
+    ) -> bool:
         if self._fails("delete_run", "before"):
             raise RuntimeError(SENTINEL)
-        result = await super().delete_run(run_id, allow_unstarted=allow_unstarted)
+        result = await super().delete_run(
+            run_id,
+            allow_unstarted=allow_unstarted,
+            owner_token=owner_token,
+        )
         if self._fails("delete_run", "after"):
             raise RuntimeError(SENTINEL)
         return result
@@ -916,26 +966,32 @@ class SideEffectFailureRunStore(InMemoryRunStore):
         self.failures += 1
         return True
 
-    async def complete(self, run_id: str, result: AgentRunResult) -> Any:
+    async def complete(
+        self,
+        run_id: str,
+        result: AgentRunResult,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if self._fails("complete", "before"):
             raise RuntimeError(SENTINEL)
-        record = await super().complete(run_id, result)
+        record = await super().complete(run_id, result, owner_token=owner_token)
         if self._fails("complete", "after"):
             raise RuntimeError(SENTINEL)
         return record
 
-    async def delete_queued(self, run_id: str) -> bool:
+    async def delete_queued(self, run_id: str, *, owner_token: object | None = None) -> bool:
         if self._fails("delete_queued", "before"):
             raise RuntimeError(SENTINEL)
-        deleted = await super().delete_queued(run_id)
+        deleted = await super().delete_queued(run_id, owner_token=owner_token)
         if self._fails("delete_queued", "after"):
             raise RuntimeError(SENTINEL)
         return deleted
 
-    async def delete_terminal(self, run_id: str) -> bool:
+    async def delete_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool:
         if self._fails("delete_terminal", "before"):
             raise RuntimeError(SENTINEL)
-        deleted = await super().delete_terminal(run_id)
+        deleted = await super().delete_terminal(run_id, owner_token=owner_token)
         if self._fails("delete_terminal", "after"):
             raise RuntimeError(SENTINEL)
         return deleted
@@ -947,11 +1003,11 @@ class StartFailureRunStore(InMemoryRunStore):
         self.timing = timing
         self.failed = False
 
-    async def mark_running(self, run_id: str) -> Any:
+    async def mark_running(self, run_id: str, *, owner_token: object | None = None) -> Any:
         if self.timing == "before" and not self.failed:
             self.failed = True
             raise RuntimeError(SENTINEL)
-        record = await super().mark_running(run_id)
+        record = await super().mark_running(run_id, owner_token=owner_token)
         if self.timing == "after" and not self.failed:
             self.failed = True
             raise RuntimeError(SENTINEL)
@@ -1248,10 +1304,17 @@ async def test_rollback_delete_before_side_effect_failure_preserves_pair_and_fai
     )
     original_emit = events.emit
 
-    async def fail_created(run_id: str, node: str, event_type: str, data: Any) -> Any:
+    async def fail_created(
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if event_type == "run.created":
             raise RuntimeError(SENTINEL)
-        return await original_emit(run_id, node, event_type, data)
+        return await original_emit(run_id, node, event_type, data, owner_token=owner_token)
 
     events.emit = fail_created  # type: ignore[method-assign]
 
@@ -1276,10 +1339,17 @@ async def test_rollback_delete_after_side_effect_failure_confirms_and_deletes_ru
     )
     original_emit = events.emit
 
-    async def fail_created(run_id: str, node: str, event_type: str, data: Any) -> Any:
+    async def fail_created(
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if event_type == "run.created":
             raise RuntimeError(SENTINEL)
-        return await original_emit(run_id, node, event_type, data)
+        return await original_emit(run_id, node, event_type, data, owner_token=owner_token)
 
     events.emit = fail_created  # type: ignore[method-assign]
 
@@ -1514,14 +1584,32 @@ class DeleteThenBlockEventStore(InMemoryEventStore):
         self.fail_created = fail_created
         self.deleted = asyncio.Event()
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if self.fail_created and event_type == "run.created":
             self.fail_created = False
             raise RuntimeError(SENTINEL)
-        return await super().emit(run_id, node, event_type, data)
+        return await super().emit(run_id, node, event_type, data, owner_token=owner_token)
 
-    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
-        deleted = await super().delete_run(run_id, allow_unstarted=allow_unstarted)
+    async def delete_run(
+        self,
+        run_id: str,
+        *,
+        allow_unstarted: bool = False,
+        owner_token: object | None = None,
+    ) -> bool:
+        deleted = await super().delete_run(
+            run_id,
+            allow_unstarted=allow_unstarted,
+            owner_token=owner_token,
+        )
         self.deleted.set()
         await asyncio.Event().wait()
         return deleted
@@ -1539,15 +1627,15 @@ class DeleteThenBlockRunStore(InMemoryRunStore):
         self.method = method
         self.deleted = asyncio.Event()
 
-    async def delete_queued(self, run_id: str) -> bool:
-        deleted = await super().delete_queued(run_id)
+    async def delete_queued(self, run_id: str, *, owner_token: object | None = None) -> bool:
+        deleted = await super().delete_queued(run_id, owner_token=owner_token)
         if self.method == "delete_queued":
             self.deleted.set()
             await asyncio.Event().wait()
         return deleted
 
-    async def delete_terminal(self, run_id: str) -> bool:
-        deleted = await super().delete_terminal(run_id)
+    async def delete_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool:
+        deleted = await super().delete_terminal(run_id, owner_token=owner_token)
         if self.method == "delete_terminal":
             self.deleted.set()
             await asyncio.Event().wait()
@@ -1676,17 +1764,31 @@ class RacingFailStopEventStore(InMemoryEventStore):
         self.racing_created = asyncio.Event()
         self.release_racing = asyncio.Event()
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
-        event = await super().emit(run_id, node, event_type, data)
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
+        event = await super().emit(run_id, node, event_type, data, owner_token=owner_token)
         if run_id == "racing" and event_type == "run.created":
             self.racing_created.set()
             await self.release_racing.wait()
         return event
 
-    async def emit_terminal(self, run_id: str, data: Any) -> Any:
+    async def emit_terminal(
+        self,
+        run_id: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if run_id == "failing":
             raise RuntimeError(SENTINEL)
-        return await super().emit_terminal(run_id, data)
+        return await super().emit_terminal(run_id, data, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -1737,13 +1839,21 @@ class FutureTerminalEventStore(InMemoryEventStore):
         self.clock = clock
         self.replay: list[RunEvent] = []
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> RunEvent:
-        event = await super().emit(run_id, node, event_type, data)
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> RunEvent:
+        event = await super().emit(run_id, node, event_type, data, owner_token=owner_token)
         self.replay.append(event)
         return event
 
-    async def has_terminal(self, run_id: str) -> bool:
-        del run_id
+    async def has_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool:
+        del run_id, owner_token
         return True
 
     async def stream(
@@ -1791,19 +1901,25 @@ class CreateThenFailBlockingReadRunStore(InMemoryRunStore):
         self.block_get = False
         self.read_started = asyncio.Event()
 
-    async def create(self, run_id: str, query: str) -> Any:
-        record = await super().create(run_id, query)
+    async def create(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
+        record = await super().create(run_id, query, owner_token=owner_token)
         if run_id == "run-1":
             self.block_get = True
             raise RuntimeError(SENTINEL)
         return record
 
-    async def get(self, run_id: str) -> Any:
+    async def get(self, run_id: str, *, owner_token: object | None = None) -> Any:
         if run_id == "run-1" and self.block_get:
             self.block_get = False
             self.read_started.set()
             await asyncio.Event().wait()
-        return await super().get(run_id)
+        return await super().get(run_id, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -1839,18 +1955,18 @@ class EventCreateThenFailBlockingReadStore(InMemoryEventStore):
         self.block_read = False
         self.read_started = asyncio.Event()
 
-    async def create_run(self, run_id: str) -> None:
-        await super().create_run(run_id)
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None:
+        await super().create_run(run_id, owner_token=owner_token)
         if run_id == "run-1":
             self.block_read = True
             raise RuntimeError(SENTINEL)
 
-    async def high_water_mark(self, run_id: str) -> int:
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int:
         if run_id == "run-1" and self.block_read:
             self.block_read = False
             self.read_started.set()
             await asyncio.Event().wait()
-        return await super().high_water_mark(run_id)
+        return await super().high_water_mark(run_id, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -1887,15 +2003,21 @@ class PersistentRunCreateReadFailureStore(InMemoryRunStore):
         super().__init__(**kwargs)
         self.created = False
 
-    async def create(self, run_id: str, query: str) -> Any:
-        await super().create(run_id, query)
+    async def create(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
+        await super().create(run_id, query, owner_token=owner_token)
         self.created = True
         raise RuntimeError(SENTINEL)
 
-    async def get(self, run_id: str) -> Any:
+    async def get(self, run_id: str, *, owner_token: object | None = None) -> Any:
         if self.created:
             raise RuntimeError(SENTINEL)
-        return await super().get(run_id)
+        return await super().get(run_id, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -1924,13 +2046,13 @@ async def test_persistent_run_create_readback_failure_stably_fail_stops() -> Non
 
 
 class PersistentEventCreateReadFailureStore(InMemoryEventStore):
-    async def create_run(self, run_id: str) -> None:
-        await super().create_run(run_id)
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None:
+        await super().create_run(run_id, owner_token=owner_token)
         raise RuntimeError(SENTINEL)
 
-    async def high_water_mark(self, run_id: str) -> int:
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int:
         try:
-            await super().high_water_mark(run_id)
+            await super().high_water_mark(run_id, owner_token=owner_token)
         except EventRunNotFound:
             raise
         raise RuntimeError(SENTINEL)
@@ -1970,23 +2092,41 @@ class DeleteThenFailBlockingReadEventStore(InMemoryEventStore):
         self.block_read = False
         self.read_started = asyncio.Event()
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if self.fail_created and event_type == "run.created":
             self.fail_created = False
             raise RuntimeError(SENTINEL)
-        return await super().emit(run_id, node, event_type, data)
+        return await super().emit(run_id, node, event_type, data, owner_token=owner_token)
 
-    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
-        await super().delete_run(run_id, allow_unstarted=allow_unstarted)
+    async def delete_run(
+        self,
+        run_id: str,
+        *,
+        allow_unstarted: bool = False,
+        owner_token: object | None = None,
+    ) -> bool:
+        await super().delete_run(
+            run_id,
+            allow_unstarted=allow_unstarted,
+            owner_token=owner_token,
+        )
         self.block_read = True
         raise RuntimeError(SENTINEL)
 
-    async def high_water_mark(self, run_id: str) -> int:
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int:
         if self.block_read:
             self.block_read = False
             self.read_started.set()
             await asyncio.Event().wait()
-        return await super().high_water_mark(run_id)
+        return await super().high_water_mark(run_id, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -2056,15 +2196,23 @@ class RestoreCancellationEventStore(InMemoryEventStore):
         self.restore_emit_calls = 0
         self.restore_started = asyncio.Event()
 
-    async def create_run(self, run_id: str) -> None:
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None:
         if self.initial_created_failed:
             self.restore_create_calls += 1
             if self.window == "create" and self.restore_create_calls == 1:
                 self.restore_started.set()
                 await asyncio.Event().wait()
-        await super().create_run(run_id)
+        await super().create_run(run_id, owner_token=owner_token)
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if event_type == "run.created" and not self.initial_created_failed:
             self.initial_created_failed = True
             raise RuntimeError(SENTINEL)
@@ -2073,7 +2221,7 @@ class RestoreCancellationEventStore(InMemoryEventStore):
             if self.window == "emit" and self.restore_emit_calls == 1:
                 self.restore_started.set()
                 await asyncio.Event().wait()
-        return await super().emit(run_id, node, event_type, data)
+        return await super().emit(run_id, node, event_type, data, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -2114,13 +2262,21 @@ class IncompleteSnapshotEventStore(InMemoryEventStore):
         self.replay: list[RunEvent] = []
         self.stream_called = False
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> RunEvent:
-        event = await super().emit(run_id, node, event_type, data)
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> RunEvent:
+        event = await super().emit(run_id, node, event_type, data, owner_token=owner_token)
         self.replay.append(event)
         return event
 
-    async def has_terminal(self, run_id: str) -> bool:
-        del run_id
+    async def has_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool:
+        del run_id, owner_token
         return True
 
     async def replay_snapshot(
@@ -2128,8 +2284,9 @@ class IncompleteSnapshotEventStore(InMemoryEventStore):
         run_id: str,
         *,
         high_water_mark: int,
+        owner_token: object | None = None,
     ) -> tuple[RunEvent, ...]:
-        del run_id, high_water_mark
+        del run_id, high_water_mark, owner_token
         return tuple(self.replay[:1])
 
     async def stream(
@@ -2181,8 +2338,9 @@ class NonBoundaryTerminalSnapshotEventStore(IncompleteSnapshotEventStore):
         run_id: str,
         *,
         high_water_mark: int,
+        owner_token: object | None = None,
     ) -> tuple[RunEvent, ...]:
-        del high_water_mark
+        del high_water_mark, owner_token
         terminal = RunEvent(
             event_id=f"{run_id}:2",
             sequence=2,
@@ -2195,8 +2353,8 @@ class NonBoundaryTerminalSnapshotEventStore(IncompleteSnapshotEventStore):
         trailing = self.replay[1].model_copy(update={"event_id": f"{run_id}:3", "sequence": 3})
         return self.replay[0], terminal, trailing
 
-    async def high_water_mark(self, run_id: str) -> int:
-        del run_id
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int:
+        del run_id, owner_token
         return 3
 
 
@@ -2299,14 +2457,32 @@ class MaskedRollbackDeleteEventStore(InMemoryEventStore):
         self.masker = MaskCancellationWithCleanupError()
         self.fail_initial_emit = True
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if self.fail_initial_emit and event_type == "run.created":
             self.fail_initial_emit = False
             raise RuntimeError(SENTINEL)
-        return await super().emit(run_id, node, event_type, data)
+        return await super().emit(run_id, node, event_type, data, owner_token=owner_token)
 
-    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
-        deleted = await super().delete_run(run_id, allow_unstarted=allow_unstarted)
+    async def delete_run(
+        self,
+        run_id: str,
+        *,
+        allow_unstarted: bool = False,
+        owner_token: object | None = None,
+    ) -> bool:
+        deleted = await super().delete_run(
+            run_id,
+            allow_unstarted=allow_unstarted,
+            owner_token=owner_token,
+        )
         await self.masker.mask_once()
         return deleted
 
@@ -2349,17 +2525,23 @@ class MaskedRunReadStore(InMemoryRunStore):
         self.masker = MaskCancellationWithCleanupError()
         self.failed_create = False
 
-    async def create(self, run_id: str, query: str) -> Any:
-        record = await super().create(run_id, query)
+    async def create(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
+        record = await super().create(run_id, query, owner_token=owner_token)
         if run_id == "run-1":
             self.failed_create = True
             raise RuntimeError(SENTINEL)
         return record
 
-    async def get(self, run_id: str) -> Any:
+    async def get(self, run_id: str, *, owner_token: object | None = None) -> Any:
         if run_id == "run-1" and self.failed_create:
             await self.masker.mask_once()
-        return await super().get(run_id)
+        return await super().get(run_id, owner_token=owner_token)
 
 
 class MaskedEventHighWaterStore(InMemoryEventStore):
@@ -2368,16 +2550,16 @@ class MaskedEventHighWaterStore(InMemoryEventStore):
         self.masker = MaskCancellationWithCleanupError()
         self.failed_create = False
 
-    async def create_run(self, run_id: str) -> None:
-        await super().create_run(run_id)
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None:
+        await super().create_run(run_id, owner_token=owner_token)
         if run_id == "run-1":
             self.failed_create = True
             raise RuntimeError(SENTINEL)
 
-    async def high_water_mark(self, run_id: str) -> int:
+    async def high_water_mark(self, run_id: str, *, owner_token: object | None = None) -> int:
         if run_id == "run-1" and self.failed_create:
             await self.masker.mask_once()
-        return await super().high_water_mark(run_id)
+        return await super().high_water_mark(run_id, owner_token=owner_token)
 
 
 @pytest.mark.asyncio
@@ -2428,28 +2610,41 @@ class MaskedRestoreEventStore(InMemoryEventStore):
         self.masker = MaskCancellationWithCleanupError()
         self.initial_emit_failed = False
 
-    async def create_run(self, run_id: str) -> None:
+    async def create_run(self, run_id: str, *, owner_token: object | None = None) -> None:
         if self.initial_emit_failed and self.boundary == "restore_create":
             await self.masker.mask_once()
-        await super().create_run(run_id)
+        await super().create_run(run_id, owner_token=owner_token)
 
-    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
         if event_type == "run.created" and not self.initial_emit_failed:
             self.initial_emit_failed = True
             raise RuntimeError(SENTINEL)
         if event_type == "run.created" and self.boundary == "restore_emit":
             await self.masker.mask_once()
-        return await super().emit(run_id, node, event_type, data)
+        return await super().emit(run_id, node, event_type, data, owner_token=owner_token)
 
     async def replay_snapshot(
         self,
         run_id: str,
         *,
         high_water_mark: int,
+        owner_token: object | None = None,
     ) -> tuple[RunEvent, ...]:
         if self.initial_emit_failed and self.boundary == "restore_replay":
             await self.masker.mask_once()
-        return await super().replay_snapshot(run_id, high_water_mark=high_water_mark)
+        return await super().replay_snapshot(
+            run_id,
+            high_water_mark=high_water_mark,
+            owner_token=owner_token,
+        )
 
 
 @pytest.mark.asyncio
@@ -2492,3 +2687,408 @@ async def test_restore_cleanup_exception_preserves_cancellation(boundary: str) -
     assert events.masker.cleanup_task.done()
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.submit("must be rejected")
+
+
+class ForeignGenerationOnFailedRunCreate(InMemoryRunStore):
+    async def create(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
+        del query, owner_token
+        await InMemoryRunStore.create(self, run_id, "foreign query")
+        raise RuntimeError(SENTINEL)
+
+
+@pytest.mark.asyncio
+async def test_run_create_failure_never_deletes_a_foreign_generation() -> None:
+    clock = FakeClock()
+    runs = ForeignGenerationOnFailedRunCreate(
+        max_runs=2,
+        retention_seconds=3600,
+        clock=clock,
+    )
+    events = InMemoryEventStore(clock=clock.now)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "collision",
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("our query")
+
+    foreign = await InMemoryRunStore.get(runs, "collision")
+    assert foreign.query == "foreign query"
+    assert foreign.lifecycle_status == "queued"
+    assert executor.calls == []
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+class ForeignGenerationOnFailedEventCreate(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime], nonempty: bool) -> None:
+        super().__init__(clock=clock)
+        self.nonempty = nonempty
+
+    async def create_run(
+        self,
+        run_id: str,
+        *,
+        owner_token: object | None = None,
+    ) -> None:
+        del owner_token
+        await InMemoryEventStore.create_run(self, run_id)
+        if self.nonempty:
+            await InMemoryEventStore.emit(
+                self,
+                run_id,
+                "runtime",
+                "run.created",
+                {"status": "queued"},
+            )
+        raise RuntimeError(SENTINEL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonempty", [False, True])
+async def test_event_create_failure_never_deletes_a_foreign_generation(
+    nonempty: bool,
+) -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = ForeignGenerationOnFailedEventCreate(clock=clock.now, nonempty=nonempty)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "collision",
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("our query")
+
+    assert await InMemoryEventStore.high_water_mark(events, "collision") == int(nonempty)
+    if nonempty:
+        snapshot = await InMemoryEventStore.replay_snapshot(
+            events,
+            "collision",
+            high_water_mark=1,
+        )
+        assert len(snapshot) == 1
+        assert snapshot[0].type == "run.created"
+        assert dict(snapshot[0].data) == {"status": "queued"}
+    with pytest.raises(RunNotFound):
+        await runs.get("collision")
+    assert executor.calls == []
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+class ForeignReplacementDuringRestoreEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.initial_emit = True
+
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
+        if self.initial_emit and event_type == "run.created":
+            self.initial_emit = False
+            raise RuntimeError(SENTINEL)
+        return await super().emit(
+            run_id,
+            node,
+            event_type,
+            data,
+            owner_token=owner_token,
+        )
+
+    async def delete_run(
+        self,
+        run_id: str,
+        *,
+        allow_unstarted: bool = False,
+        owner_token: object | None = None,
+    ) -> bool:
+        return await super().delete_run(
+            run_id,
+            allow_unstarted=allow_unstarted,
+            owner_token=owner_token,
+        )
+
+
+class ForeignReplacementBeforeRestoreRunStore(SideEffectFailureRunStore):
+    def __init__(
+        self,
+        *,
+        clock: FakeClock,
+        events: InMemoryEventStore,
+    ) -> None:
+        super().__init__(
+            clock=clock,
+            method="delete_queued",
+            timing="before",
+            persistent=True,
+        )
+        self.events = events
+        self.replaced = False
+
+    async def delete_queued(
+        self,
+        run_id: str,
+        *,
+        owner_token: object | None = None,
+    ) -> bool:
+        if not self.replaced:
+            self.replaced = True
+            await InMemoryEventStore.create_run(self.events, run_id)
+        raise RuntimeError(SENTINEL)
+
+
+@pytest.mark.asyncio
+async def test_restore_never_emits_into_a_foreign_replacement_generation() -> None:
+    clock = FakeClock()
+    events = ForeignReplacementDuringRestoreEventStore(clock=clock.now)
+    runs = ForeignReplacementBeforeRestoreRunStore(clock=clock, events=events)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "collision",
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("our query")
+
+    assert await InMemoryEventStore.high_water_mark(events, "collision") == 0
+    assert (
+        await InMemoryEventStore.replay_snapshot(
+            events,
+            "collision",
+            high_water_mark=0,
+        )
+        == ()
+    )
+    assert (await runs.get("collision")).lifecycle_status == "queued"
+    assert executor.calls == []
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+class SwallowCancellationRollbackEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.initial_emit = True
+        self.delete_started = asyncio.Event()
+
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
+        if self.initial_emit and event_type == "run.created":
+            self.initial_emit = False
+            raise RuntimeError(SENTINEL)
+        return await super().emit(
+            run_id,
+            node,
+            event_type,
+            data,
+            owner_token=owner_token,
+        )
+
+    async def delete_run(
+        self,
+        run_id: str,
+        *,
+        allow_unstarted: bool = False,
+        owner_token: object | None = None,
+    ) -> bool:
+        deleted = await super().delete_run(
+            run_id,
+            allow_unstarted=allow_unstarted,
+            owner_token=owner_token,
+        )
+        self.delete_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return deleted
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_dependency_swallowing_cancellation_still_cancels_submit_after_cleanup() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = SwallowCancellationRollbackEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.delete_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    assert submission.cancelled()
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await InMemoryEventStore.high_water_mark(events, "run-1")
+
+
+class SwallowCancellationRestoreReplayStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime], uncancel: bool) -> None:
+        super().__init__(clock=clock)
+        self.uncancel = uncancel
+        self.initial_emit = True
+        self.replay_started = asyncio.Event()
+
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> Any:
+        if self.initial_emit and event_type == "run.created":
+            self.initial_emit = False
+            raise RuntimeError(SENTINEL)
+        return await super().emit(
+            run_id,
+            node,
+            event_type,
+            data,
+            owner_token=owner_token,
+        )
+
+    async def replay_snapshot(
+        self,
+        run_id: str,
+        *,
+        high_water_mark: int,
+        owner_token: object | None = None,
+    ) -> tuple[RunEvent, ...]:
+        self.replay_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if self.uncancel:
+                task = asyncio.current_task()
+                assert task is not None
+                task.uncancel()
+        return await super().replay_snapshot(
+            run_id,
+            high_water_mark=high_water_mark,
+            owner_token=owner_token,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uncancel", [False, True])
+async def test_restore_replay_samples_swallowed_cancellation_but_respects_uncancel(
+    uncancel: bool,
+) -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(
+        clock=clock,
+        method="delete_queued",
+        timing="before",
+        persistent=True,
+    )
+    events = SwallowCancellationRestoreReplayStore(clock=clock.now, uncancel=uncancel)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.replay_started.wait()
+    submission.cancel()
+
+    if uncancel:
+        with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+            await submission
+        assert not submission.cancelled()
+        assert submission.cancelling() == 0
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await submission
+        assert submission.cancelled()
+    assert (await runs.get("run-1")).lifecycle_status == "queued"
+    assert await events.high_water_mark("run-1") == 1
+
+
+class MaskedExpiredIdsRunStore(InMemoryRunStore):
+    def __init__(self, *, clock: FakeClock) -> None:
+        super().__init__(max_runs=2, retention_seconds=1, clock=clock)
+        self.masker = MaskCancellationWithCleanupError()
+
+    async def expired_terminal_ids(self) -> tuple[str, ...]:
+        await self.masker.mask_once()
+        return await super().expired_terminal_ids()
+
+
+@pytest.mark.asyncio
+async def test_prune_expired_ids_cleanup_exception_cannot_mask_cancellation() -> None:
+    clock = FakeClock()
+    runs = MaskedExpiredIdsRunStore(clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "new",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await runs.masker.boundary_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    assert submission.cancelled()
+    assert (await runs.get("old")).lifecycle_status == "terminal"
+    assert await events.high_water_mark("old") == 3
+    assert runs.masker.cleanup_task is not None
+    assert runs.masker.cleanup_task.done()

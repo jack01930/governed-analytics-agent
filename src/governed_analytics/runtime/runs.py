@@ -26,6 +26,7 @@ from governed_analytics.agent.graph import run_agent
 from governed_analytics.agent.ports import AgentContext
 from governed_analytics.config import AgentRuntimeSettings
 from governed_analytics.runtime.events import (
+    EventOwnershipMismatch,
     EventStore,
     RunEvent,
 )
@@ -77,6 +78,11 @@ class RunConsistencyError(RunStoreError):
         super().__init__("run stores are inconsistent")
 
 
+class RunOwnershipMismatch(RunStoreError):
+    def __init__(self) -> None:
+        super().__init__("run generation ownership mismatch")
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -96,6 +102,18 @@ class _DelayedCancellation:
     def __init__(self) -> None:
         self.pending: asyncio.CancelledError | None = None
         self.diagnostic: BaseException | None = None
+        self._synthetic = False
+        self._sample()
+
+    def _sample(self) -> None:
+        if _task_is_cancelling():
+            if self.pending is None:
+                self.pending = asyncio.CancelledError()
+                self._synthetic = True
+        elif self._synthetic:
+            self.pending = None
+            self.diagnostic = None
+            self._synthetic = False
 
     def observe(self, error: BaseException) -> None:
         if not _task_is_cancelling():
@@ -103,15 +121,18 @@ class _DelayedCancellation:
         if self.pending is None:
             if isinstance(error, asyncio.CancelledError):
                 self.pending = error
+                self._synthetic = False
             else:
                 self.pending = asyncio.CancelledError()
                 self.diagnostic = error
+                self._synthetic = True
         elif self.diagnostic is None and not isinstance(error, asyncio.CancelledError):
             self.diagnostic = error
 
     async def await_dependency[T](self, awaitable: Awaitable[T]) -> T:
+        self._sample()
         try:
-            return await awaitable
+            result = await awaitable
         except BaseException as error:
             self.observe(error)
             if self.pending is not None and not isinstance(
@@ -119,6 +140,8 @@ class _DelayedCancellation:
             ):
                 raise asyncio.CancelledError() from error
             raise
+        self._sample()
+        return result
 
     def raise_if_pending(self) -> None:
         if self.pending is not None:
@@ -129,6 +152,7 @@ class _DelayedCancellation:
 
 @dataclass
 class _SubmissionEventState:
+    owner_token: object
     owned: bool
     deleted: bool = False
 
@@ -192,19 +216,33 @@ class RunRecord(BaseModel):
 
 
 class RunStore(Protocol):
-    async def create(self, run_id: str, query: str) -> RunRecord: ...
+    async def create(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        owner_token: object | None = None,
+    ) -> RunRecord: ...
 
-    async def get(self, run_id: str) -> RunRecord: ...
+    async def get(self, run_id: str, *, owner_token: object | None = None) -> RunRecord: ...
 
-    async def mark_running(self, run_id: str) -> RunRecord: ...
+    async def mark_running(
+        self, run_id: str, *, owner_token: object | None = None
+    ) -> RunRecord: ...
 
-    async def complete(self, run_id: str, result: AgentRunResult) -> RunRecord: ...
+    async def complete(
+        self,
+        run_id: str,
+        result: AgentRunResult,
+        *,
+        owner_token: object | None = None,
+    ) -> RunRecord: ...
 
     async def expired_terminal_ids(self) -> tuple[str, ...]: ...
 
-    async def delete_queued(self, run_id: str) -> bool: ...
+    async def delete_queued(self, run_id: str, *, owner_token: object | None = None) -> bool: ...
 
-    async def delete_terminal(self, run_id: str) -> bool: ...
+    async def delete_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool: ...
 
 
 def _copy_model[T: BaseModel](model: T) -> T:
@@ -258,6 +296,7 @@ class InMemoryRunStore:
         self._retention_seconds = retention_seconds
         self._lock = asyncio.Lock()
         self._records: dict[str, RunRecord] = {}
+        self._owners: dict[str, object | None] = {}
 
     def _now(self) -> datetime:
         return _require_utc(self._clock())
@@ -269,7 +308,13 @@ class InMemoryRunStore:
             and (now - record.terminal_at).total_seconds() >= self._retention_seconds
         )
 
-    async def create(self, run_id: str, query: str) -> RunRecord:
+    async def create(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        owner_token: object | None = None,
+    ) -> RunRecord:
         now = self._now()
         candidate = RunRecord(
             run_id=run_id,
@@ -283,19 +328,20 @@ class InMemoryRunStore:
             if len(self._records) >= self._max_runs:
                 raise RunCapacityExceeded()
             self._records[run_id] = candidate
+            self._owners[run_id] = owner_token
             return candidate
 
-    async def get(self, run_id: str) -> RunRecord:
+    async def get(self, run_id: str, *, owner_token: object | None = None) -> RunRecord:
         async with self._lock:
-            try:
-                return self._records[run_id]
-            except KeyError:
-                raise RunNotFound() from None
+            record = self._require(run_id)
+            self._require_owner(run_id, owner_token)
+            return record
 
-    async def mark_running(self, run_id: str) -> RunRecord:
+    async def mark_running(self, run_id: str, *, owner_token: object | None = None) -> RunRecord:
         now = self._now()
         async with self._lock:
             record = self._require(run_id)
+            self._require_owner(run_id, owner_token)
             if record.lifecycle_status is not RunLifecycleStatus.QUEUED:
                 raise RunStateConflict()
             updated = record.model_copy(
@@ -307,13 +353,20 @@ class InMemoryRunStore:
             self._records[run_id] = updated
             return updated
 
-    async def complete(self, run_id: str, result: AgentRunResult) -> RunRecord:
+    async def complete(
+        self,
+        run_id: str,
+        result: AgentRunResult,
+        *,
+        owner_token: object | None = None,
+    ) -> RunRecord:
         now = self._now()
         if result.run_id != run_id:
             raise RunStateConflict()
         projection = _terminal_projection(result)
         async with self._lock:
             record = self._require(run_id)
+            self._require_owner(run_id, owner_token)
             if record.lifecycle_status is RunLifecycleStatus.TERMINAL:
                 if _terminal_record_matches(record, projection):
                     return record
@@ -337,20 +390,24 @@ class InMemoryRunStore:
                 run_id for run_id, record in self._records.items() if self._is_expired(record, now)
             )
 
-    async def delete_queued(self, run_id: str) -> bool:
+    async def delete_queued(self, run_id: str, *, owner_token: object | None = None) -> bool:
         async with self._lock:
             record = self._require(run_id)
+            self._require_owner(run_id, owner_token)
             if record.lifecycle_status is not RunLifecycleStatus.QUEUED:
                 return False
             del self._records[run_id]
+            del self._owners[run_id]
             return True
 
-    async def delete_terminal(self, run_id: str) -> bool:
+    async def delete_terminal(self, run_id: str, *, owner_token: object | None = None) -> bool:
         async with self._lock:
             record = self._require(run_id)
+            self._require_owner(run_id, owner_token)
             if record.lifecycle_status is not RunLifecycleStatus.TERMINAL:
                 return False
             del self._records[run_id]
+            del self._owners[run_id]
             return True
 
     def _require(self, run_id: str) -> RunRecord:
@@ -358,6 +415,10 @@ class InMemoryRunStore:
             return self._records[run_id]
         except KeyError:
             raise RunNotFound() from None
+
+    def _require_owner(self, run_id: str, owner_token: object | None) -> None:
+        if owner_token is not None and self._owners[run_id] is not owner_token:
+            raise RunOwnershipMismatch()
 
 
 def deterministic_failure_result(
@@ -422,6 +483,7 @@ class AnalysisRunner:
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_runs)
         self._prune_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._ownership_tokens: dict[str, object] = {}
         self._terminalizing: set[str] = set()
         self._run_consistency_failures: set[str] = set()
         self._consistency_failed = False
@@ -439,19 +501,24 @@ class AnalysisRunner:
                 self._enter_fail_stop()
                 raise
             run_id = self._id_factory()
-            run_existed_before = await self._run_exists_before_submission(run_id)
+            owner_token = object()
+            coordination = _DelayedCancellation()
             try:
-                record = await self._runs.create(run_id, query)
-            except (RunAlreadyExists, RunCapacityExceeded):
+                record = await coordination.await_dependency(
+                    self._runs.create(run_id, query, owner_token=owner_token)
+                )
+                coordination.raise_if_pending()
+            except (RunAlreadyExists, RunCapacityExceeded) as error:
+                coordination.observe(error)
+                coordination.raise_if_pending()
                 raise
             except BaseException as error:
-                coordination = _DelayedCancellation()
                 coordination.observe(error)
-                owned_run_exists = not run_existed_before and await self._run_exists_after_failure(
-                    run_id, coordination
+                owned_run_exists = await self._run_exists_after_failure(
+                    run_id, owner_token, coordination
                 )
                 if owned_run_exists and not await self._delete_owned_queued_run(
-                    run_id, coordination
+                    run_id, owner_token, coordination
                 ):
                     self._raise_coordination_failure(coordination)
                 coordination.raise_if_pending()
@@ -461,27 +528,47 @@ class AnalysisRunner:
             except BaseException as error:
                 coordination = _DelayedCancellation()
                 coordination.observe(error)
-                if not await self._delete_owned_queued_run(run_id, coordination):
+                if not await self._delete_owned_queued_run(run_id, owner_token, coordination):
                     self._raise_coordination_failure(coordination)
                 coordination.raise_if_pending()
                 if isinstance(error, RunConsistencyError):
                     raise
                 raise RunSubmissionFailed() from None
-            event_state = _SubmissionEventState(owned=False)
+            event_state = _SubmissionEventState(owner_token=owner_token, owned=False)
+            coordination = _DelayedCancellation()
             try:
-                await self._events.create_run(run_id)
-                event_state.owned = True
-                await self._events.emit(
-                    run_id,
-                    "runtime",
-                    "run.created",
-                    {"status": "queued"},
+                await coordination.await_dependency(
+                    self._events.create_run(run_id, owner_token=owner_token)
                 )
+                event_state.owned = True
+                coordination.raise_if_pending()
+                await coordination.await_dependency(
+                    self._events.emit(
+                        run_id,
+                        "runtime",
+                        "run.created",
+                        {"status": "queued"},
+                        owner_token=owner_token,
+                    )
+                )
+                coordination.raise_if_pending()
             except BaseException as error:
-                coordination = _DelayedCancellation()
                 coordination.observe(error)
-                if not event_existed_before and not event_state.owned:
-                    event_state.owned = await self._event_exists_after_failure(run_id, coordination)
+                if not event_state.owned and not event_existed_before:
+                    event_status = await self._event_generation_after_failure(
+                        run_id,
+                        owner_token,
+                        coordination,
+                    )
+                    if event_status == "foreign":
+                        if not await self._delete_owned_queued_run(
+                            run_id,
+                            owner_token,
+                            coordination,
+                        ):
+                            self._raise_coordination_failure(coordination, run_id)
+                        self._raise_coordination_failure(coordination, run_id)
+                    event_state.owned = event_status == "owned"
                 await self._rollback_submission(
                     run_id,
                     event_state=event_state,
@@ -491,10 +578,13 @@ class AnalysisRunner:
             if self._consistency_failed:
                 await self._rollback_submission(
                     run_id,
-                    event_state=_SubmissionEventState(owned=True),
+                    event_state=_SubmissionEventState(
+                        owner_token=owner_token,
+                        owned=True,
+                    ),
                 )
                 raise RunConsistencyError()
-            coroutine = self._execute(run_id, query)
+            coroutine = self._execute(run_id, query, owner_token)
             try:
                 task = asyncio.create_task(coroutine, name=f"analysis:{run_id}")
             except BaseException as error:
@@ -503,10 +593,14 @@ class AnalysisRunner:
                 coordination.observe(error)
                 await self._rollback_submission(
                     run_id,
-                    event_state=_SubmissionEventState(owned=True),
+                    event_state=_SubmissionEventState(
+                        owner_token=owner_token,
+                        owned=True,
+                    ),
                     coordination=coordination,
                 )
                 raise RunSubmissionFailed() from None
+            self._ownership_tokens[run_id] = owner_token
             self._tasks[run_id] = task
 
             def task_done(done: asyncio.Task[None]) -> None:
@@ -549,10 +643,10 @@ class AnalysisRunner:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _execute(self, run_id: str, query: str) -> None:
+    async def _execute(self, run_id: str, query: str, owner_token: object) -> None:
         try:
             async with self._semaphore:
-                await self._ensure_running(run_id)
+                await self._ensure_running(run_id, owner_token)
                 context: AgentContext | None = None
                 result: AgentRunResult | None = None
                 try:
@@ -561,6 +655,7 @@ class AnalysisRunner:
                         "runtime",
                         "run.started",
                         {"status": "running"},
+                        owner_token=owner_token,
                     )
                 except asyncio.CancelledError:
                     if _task_is_cancelling():
@@ -614,8 +709,8 @@ class AnalysisRunner:
                         result = self._validated_result(run_id, candidate, context)
                 self._terminalizing.add(run_id)
                 try:
-                    await self._ensure_run_terminal(run_id, result)
-                    await self._ensure_event_terminal(run_id, result)
+                    await self._ensure_run_terminal(run_id, result, owner_token)
+                    await self._ensure_event_terminal(run_id, result, owner_token)
                 finally:
                     self._terminalizing.discard(run_id)
             async with self._prune_lock:
@@ -650,33 +745,42 @@ class AnalysisRunner:
             reason=StopReason.INTERNAL_ERROR,
         )
 
-    async def _ensure_running(self, run_id: str) -> None:
+    async def _ensure_running(self, run_id: str, owner_token: object) -> None:
         for _ in range(3):
             try:
-                record = await self._runs.mark_running(run_id)
+                record = await self._runs.mark_running(run_id, owner_token=owner_token)
             except asyncio.CancelledError:
                 if _task_is_cancelling():
                     raise
-                record = await self._read_run_for_reconciliation(run_id)
+                record = await self._read_run_for_reconciliation(run_id, owner_token)
             except Exception:
-                record = await self._read_run_for_reconciliation(run_id)
+                record = await self._read_run_for_reconciliation(run_id, owner_token)
             if record.lifecycle_status is RunLifecycleStatus.RUNNING:
                 return
             if record.lifecycle_status is not RunLifecycleStatus.QUEUED:
                 break
         raise RunConsistencyError()
 
-    async def _ensure_run_terminal(self, run_id: str, result: AgentRunResult) -> None:
+    async def _ensure_run_terminal(
+        self,
+        run_id: str,
+        result: AgentRunResult,
+        owner_token: object,
+    ) -> None:
         projection = _terminal_projection(result)
         for _ in range(3):
             try:
-                record = await self._runs.complete(run_id, result)
+                record = await self._runs.complete(
+                    run_id,
+                    result,
+                    owner_token=owner_token,
+                )
             except asyncio.CancelledError:
                 if _task_is_cancelling():
                     raise
-                record = await self._read_run_for_reconciliation(run_id)
+                record = await self._read_run_for_reconciliation(run_id, owner_token)
             except Exception:
-                record = await self._read_run_for_reconciliation(run_id)
+                record = await self._read_run_for_reconciliation(run_id, owner_token)
             if record.lifecycle_status is RunLifecycleStatus.TERMINAL and _terminal_record_matches(
                 record, projection
             ):
@@ -685,9 +789,13 @@ class AnalysisRunner:
                 break
         raise RunConsistencyError()
 
-    async def _read_run_for_reconciliation(self, run_id: str) -> RunRecord:
+    async def _read_run_for_reconciliation(
+        self,
+        run_id: str,
+        owner_token: object,
+    ) -> RunRecord:
         try:
-            return await self._runs.get(run_id)
+            return await self._runs.get(run_id, owner_token=owner_token)
         except asyncio.CancelledError:
             if _task_is_cancelling():
                 raise
@@ -695,11 +803,19 @@ class AnalysisRunner:
         except Exception:
             raise RunConsistencyError() from None
 
-    async def _ensure_event_terminal(self, run_id: str, result: AgentRunResult) -> None:
+    async def _ensure_event_terminal(
+        self,
+        run_id: str,
+        result: AgentRunResult,
+        owner_token: object,
+    ) -> None:
         expected = dict(terminal_event_data(result))
         for _ in range(3):
             try:
-                terminal_exists = await self._events.has_terminal(run_id)
+                terminal_exists = await self._events.has_terminal(
+                    run_id,
+                    owner_token=owner_token,
+                )
             except asyncio.CancelledError:
                 if _task_is_cancelling():
                     raise
@@ -707,13 +823,17 @@ class AnalysisRunner:
             except Exception:
                 terminal_exists = False
             if terminal_exists:
-                matches = await self._terminal_event_matches(run_id, expected)
+                matches = await self._terminal_event_matches(run_id, expected, owner_token)
                 if matches is True:
                     return
                 if matches is False:
                     continue
             try:
-                event = await self._events.emit_terminal(run_id, expected)
+                event = await self._events.emit_terminal(
+                    run_id,
+                    expected,
+                    owner_token=owner_token,
+                )
             except asyncio.CancelledError:
                 if _task_is_cancelling():
                     raise
@@ -723,8 +843,13 @@ class AnalysisRunner:
             if self._is_expected_terminal_event(event, expected):
                 return
         try:
-            if await self._events.has_terminal(run_id) and await self._terminal_event_matches(
-                run_id, expected
+            if await self._events.has_terminal(
+                run_id,
+                owner_token=owner_token,
+            ) and await self._terminal_event_matches(
+                run_id,
+                expected,
+                owner_token,
             ):
                 return
         except asyncio.CancelledError:
@@ -738,14 +863,19 @@ class AnalysisRunner:
         self,
         run_id: str,
         expected: Mapping[str, str],
+        owner_token: object,
     ) -> bool | None:
         try:
-            high_water_mark = await self._events.high_water_mark(run_id)
+            high_water_mark = await self._events.high_water_mark(
+                run_id,
+                owner_token=owner_token,
+            )
             if high_water_mark == 0:
                 return False
             snapshot = await self._events.replay_snapshot(
                 run_id,
                 high_water_mark=high_water_mark,
+                owner_token=owner_token,
             )
         except asyncio.CancelledError:
             if _task_is_cancelling():
@@ -798,50 +928,63 @@ class AnalysisRunner:
         )
 
     async def _event_exists_before_submission(self, run_id: str) -> bool:
+        coordination = _DelayedCancellation()
         try:
-            await self._events.high_water_mark(run_id)
+            await coordination.await_dependency(self._events.high_water_mark(run_id))
         except EventRunNotFound:
+            coordination.raise_if_pending()
             return False
-        except asyncio.CancelledError:
-            if _task_is_cancelling():
-                raise
+        except BaseException as error:
+            coordination.observe(error)
+            coordination.raise_if_pending()
             self._enter_fail_stop()
             raise RunConsistencyError() from None
-        except Exception:
-            self._enter_fail_stop()
-            raise RunConsistencyError() from None
-        return True
-
-    async def _run_exists_before_submission(self, run_id: str) -> bool:
-        try:
-            await self._runs.get(run_id)
-        except RunNotFound:
-            return False
-        except asyncio.CancelledError:
-            if _task_is_cancelling():
-                raise
-            self._enter_fail_stop()
-            raise RunConsistencyError() from None
-        except Exception:
-            self._enter_fail_stop()
-            raise RunConsistencyError() from None
+        coordination.raise_if_pending()
         return True
 
     async def _run_exists_after_failure(
         self,
         run_id: str,
+        owner_token: object,
         coordination: _DelayedCancellation,
     ) -> bool:
-        return await self._run_record_after_delete(run_id, coordination) is not None
+        return await self._run_record_after_delete(run_id, owner_token, coordination) is not None
+
+    async def _event_generation_after_failure(
+        self,
+        run_id: str,
+        owner_token: object,
+        coordination: _DelayedCancellation,
+    ) -> str:
+        for _ in range(3):
+            try:
+                await coordination.await_dependency(
+                    self._events.high_water_mark(run_id, owner_token=owner_token)
+                )
+            except EventRunNotFound:
+                return "missing"
+            except EventOwnershipMismatch:
+                return "foreign"
+            except asyncio.CancelledError as error:
+                coordination.observe(error)
+            except Exception:
+                pass
+            else:
+                return "owned"
+        self._raise_coordination_failure(coordination, run_id)
+        raise AssertionError("unreachable")
 
     async def _event_high_water_after_failure(
         self,
         run_id: str,
+        owner_token: object | None,
         coordination: _DelayedCancellation,
     ) -> int | None:
         for _ in range(3):
             try:
-                return await coordination.await_dependency(self._events.high_water_mark(run_id))
+                return await coordination.await_dependency(
+                    self._events.high_water_mark(run_id, owner_token=owner_token)
+                )
             except EventRunNotFound:
                 return None
             except asyncio.CancelledError as error:
@@ -854,9 +997,13 @@ class AnalysisRunner:
     async def _event_exists_after_failure(
         self,
         run_id: str,
+        owner_token: object | None,
         coordination: _DelayedCancellation,
     ) -> bool:
-        return await self._event_high_water_after_failure(run_id, coordination) is not None
+        return (
+            await self._event_high_water_after_failure(run_id, owner_token, coordination)
+            is not None
+        )
 
     async def _rollback_submission(
         self,
@@ -867,24 +1014,41 @@ class AnalysisRunner:
     ) -> None:
         state = coordination or _DelayedCancellation()
         if event_state.owned:
-            if not await self._delete_event_for_rollback(run_id, state):
+            if not await self._delete_event_for_rollback(
+                run_id,
+                event_state.owner_token,
+                state,
+            ):
                 self._raise_coordination_failure(state, run_id)
             event_state.deleted = True
-        if not await self._delete_owned_queued_run(run_id, state):
+        if not await self._delete_owned_queued_run(
+            run_id,
+            event_state.owner_token,
+            state,
+        ):
             if event_state.owned and event_state.deleted:
-                await self._restore_owned_event_run(run_id, state)
+                await self._restore_owned_event_run(
+                    run_id,
+                    event_state.owner_token,
+                    state,
+                )
             self._raise_coordination_failure(state, run_id)
         state.raise_if_pending()
 
     async def _delete_event_for_rollback(
         self,
         run_id: str,
+        owner_token: object,
         coordination: _DelayedCancellation,
     ) -> bool:
         for _ in range(3):
             try:
                 await coordination.await_dependency(
-                    self._events.delete_run(run_id, allow_unstarted=True)
+                    self._events.delete_run(
+                        run_id,
+                        allow_unstarted=True,
+                        owner_token=owner_token,
+                    )
                 )
             except EventRunNotFound:
                 return True
@@ -892,23 +1056,34 @@ class AnalysisRunner:
                 coordination.observe(error)
             except Exception:
                 pass
-            if not await self._event_exists_after_failure(run_id, coordination):
+            if not await self._event_exists_after_failure(
+                run_id,
+                owner_token,
+                coordination,
+            ):
                 return True
         return False
 
     async def _delete_owned_queued_run(
         self,
         run_id: str,
+        owner_token: object | None,
         coordination: _DelayedCancellation,
     ) -> bool:
         for _ in range(3):
             try:
-                await coordination.await_dependency(self._runs.delete_queued(run_id))
+                await coordination.await_dependency(
+                    self._runs.delete_queued(run_id, owner_token=owner_token)
+                )
             except asyncio.CancelledError as error:
                 coordination.observe(error)
             except Exception:
                 pass
-            record = await self._run_record_after_delete(run_id, coordination)
+            record = await self._run_record_after_delete(
+                run_id,
+                owner_token,
+                coordination,
+            )
             if record is None:
                 return True
             if record.lifecycle_status is not RunLifecycleStatus.QUEUED:
@@ -918,16 +1093,23 @@ class AnalysisRunner:
     async def _delete_terminal_run(
         self,
         run_id: str,
+        owner_token: object | None,
         coordination: _DelayedCancellation,
     ) -> bool:
         for _ in range(3):
             try:
-                await coordination.await_dependency(self._runs.delete_terminal(run_id))
+                await coordination.await_dependency(
+                    self._runs.delete_terminal(run_id, owner_token=owner_token)
+                )
             except asyncio.CancelledError as error:
                 coordination.observe(error)
             except Exception:
                 pass
-            record = await self._run_record_after_delete(run_id, coordination)
+            record = await self._run_record_after_delete(
+                run_id,
+                owner_token,
+                coordination,
+            )
             if record is None:
                 return True
             if record.lifecycle_status is not RunLifecycleStatus.TERMINAL:
@@ -937,11 +1119,14 @@ class AnalysisRunner:
     async def _run_record_after_delete(
         self,
         run_id: str,
+        owner_token: object | None,
         coordination: _DelayedCancellation,
     ) -> RunRecord | None:
         for _ in range(3):
             try:
-                return await coordination.await_dependency(self._runs.get(run_id))
+                return await coordination.await_dependency(
+                    self._runs.get(run_id, owner_token=owner_token)
+                )
             except RunNotFound:
                 return None
             except asyncio.CancelledError as error:
@@ -954,24 +1139,35 @@ class AnalysisRunner:
     async def _restore_owned_event_run(
         self,
         run_id: str,
+        owner_token: object,
         coordination: _DelayedCancellation,
     ) -> None:
-        high_water_mark = await self._event_high_water_after_failure(run_id, coordination)
+        high_water_mark = await self._event_high_water_after_failure(
+            run_id,
+            owner_token,
+            coordination,
+        )
         for _ in range(3):
             if high_water_mark is not None:
                 break
             try:
-                await coordination.await_dependency(self._events.create_run(run_id))
+                await coordination.await_dependency(
+                    self._events.create_run(run_id, owner_token=owner_token)
+                )
             except asyncio.CancelledError as error:
                 coordination.observe(error)
             except Exception:
                 pass
-            high_water_mark = await self._event_high_water_after_failure(run_id, coordination)
+            high_water_mark = await self._event_high_water_after_failure(
+                run_id,
+                owner_token,
+                coordination,
+            )
         if high_water_mark is None:
             self._raise_coordination_failure(coordination, run_id)
         for _ in range(3):
             if high_water_mark == 1 and await self._restored_created_event_matches(
-                run_id, coordination
+                run_id, owner_token, coordination
             ):
                 return
             if high_water_mark != 0:
@@ -983,13 +1179,18 @@ class AnalysisRunner:
                         "runtime",
                         "run.created",
                         {"status": "queued"},
+                        owner_token=owner_token,
                     )
                 )
             except asyncio.CancelledError as error:
                 coordination.observe(error)
             except Exception:
                 pass
-            high_water_mark = await self._event_high_water_after_failure(run_id, coordination)
+            high_water_mark = await self._event_high_water_after_failure(
+                run_id,
+                owner_token,
+                coordination,
+            )
             if high_water_mark is None:
                 self._raise_coordination_failure(coordination, run_id)
         self._raise_coordination_failure(coordination, run_id)
@@ -997,12 +1198,17 @@ class AnalysisRunner:
     async def _restored_created_event_matches(
         self,
         run_id: str,
+        owner_token: object,
         coordination: _DelayedCancellation,
     ) -> bool:
         for _ in range(3):
             try:
                 snapshot = await coordination.await_dependency(
-                    self._events.replay_snapshot(run_id, high_water_mark=1)
+                    self._events.replay_snapshot(
+                        run_id,
+                        high_water_mark=1,
+                        owner_token=owner_token,
+                    )
                 )
             except asyncio.CancelledError as error:
                 coordination.observe(error)
@@ -1029,31 +1235,45 @@ class AnalysisRunner:
         raise RunConsistencyError()
 
     async def _prune_locked(self) -> None:
+        coordination = _DelayedCancellation()
         try:
-            expired = await self._runs.expired_terminal_ids()
-        except asyncio.CancelledError:
-            if _task_is_cancelling():
+            expired = await coordination.await_dependency(self._runs.expired_terminal_ids())
+        except BaseException as error:
+            coordination.observe(error)
+            coordination.raise_if_pending()
+            if isinstance(error, asyncio.CancelledError):
                 raise
             raise RunConsistencyError() from None
-        except Exception:
-            raise RunConsistencyError() from None
+        coordination.raise_if_pending()
         for run_id in expired:
-            coordination = _DelayedCancellation()
+            owner_token = self._ownership_tokens.get(run_id)
             deleted = False
             for _ in range(3):
                 try:
-                    await coordination.await_dependency(self._events.delete_run(run_id))
+                    await coordination.await_dependency(
+                        self._events.delete_run(run_id, owner_token=owner_token)
+                    )
                 except EventRunNotFound:
                     deleted = True
                 except asyncio.CancelledError as error:
                     coordination.observe(error)
                 except Exception:
                     pass
-                if deleted or not await self._event_exists_after_failure(run_id, coordination):
+                if deleted or not await self._event_exists_after_failure(
+                    run_id,
+                    owner_token,
+                    coordination,
+                ):
                     deleted = True
                     break
-            if deleted and not await self._delete_terminal_run(run_id, coordination):
+            if deleted and not await self._delete_terminal_run(
+                run_id,
+                owner_token,
+                coordination,
+            ):
                 self._raise_coordination_failure(coordination, run_id)
+            if deleted:
+                self._ownership_tokens.pop(run_id, None)
             coordination.raise_if_pending()
 
     def _enter_fail_stop(self, run_id: str | None = None) -> None:
@@ -1077,6 +1297,7 @@ __all__ = [
     "RunCapacityExceeded",
     "RunConsistencyError",
     "RunNotFound",
+    "RunOwnershipMismatch",
     "RunRecord",
     "RunStateConflict",
     "RunStore",
