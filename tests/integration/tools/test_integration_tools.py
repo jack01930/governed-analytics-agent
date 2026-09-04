@@ -1,8 +1,11 @@
 import pytest
 
+from governed_analytics.config import DatabaseSettings
+from governed_analytics.persistence.database import create_async_database_engine
 from governed_analytics.safety.sql_policy import ValidatedSql
 from governed_analytics.safety.sql_policy import validate_sql as policy_validate_sql
 from governed_analytics.tools import (
+    AsyncEngineSqlExecutionBackend,
     ErrorCode,
     ExecuteSqlRequest,
     ExecuteSqlTool,
@@ -13,6 +16,27 @@ from governed_analytics.tools import (
     ProfileTool,
     SchemaTool,
 )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_shared_backend_matches_default_and_remains_owned_by_caller() -> None:
+    engine = create_async_database_engine(DatabaseSettings())  # type: ignore[call-arg]
+    backend = AsyncEngineSqlExecutionBackend(engine)
+    request = ExecuteSqlRequest(
+        sql="select category_id from categories order by category_id fetch first 3 rows only"
+    )
+    try:
+        shared_first = await ExecuteSqlTool(backend=backend).run(request)
+        shared_second = await ExecuteSqlTool(backend=backend).run(request)
+        default = await ExecuteSqlTool().run(request)
+    finally:
+        await engine.dispose()
+
+    assert shared_first.ok and shared_first.data is not None
+    assert shared_second.ok and shared_second.data is not None
+    assert default.ok and default.data is not None
+    assert shared_first.data == shared_second.data == default.data
 
 
 def test_static_tools_expose_full_ordered_contract() -> None:

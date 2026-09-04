@@ -19,9 +19,11 @@ from .contracts import (
     ToolError,
     ToolResponse,
 )
+from .execution import AsyncEngineSqlExecutionBackend, SqlExecutionBackend
 from .tools import ExecuteSqlTool, MetricTool, ProfileTool, SchemaTool
 
 __all__ = [
+    "AsyncEngineSqlExecutionBackend",
     "ColumnInfo",
     "ErrorCode",
     "ExecuteSqlRequest",
@@ -39,6 +41,7 @@ __all__ = [
     "QueryResult",
     "SchemaRequest",
     "SchemaTool",
+    "SqlExecutionBackend",
     "SqlParameterValue",
     "TableInfo",
     "ToolError",
