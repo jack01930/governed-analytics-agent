@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import re
 import threading
@@ -19,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sse_starlette.event import ServerSentEvent
 
 import governed_analytics.api.dependencies as dependencies
 from governed_analytics.api.app import create_app
@@ -453,14 +453,32 @@ async def _await_with_deadline[T](
     seconds: float,
     failure_message: str,
 ) -> T:
-    deadline = asyncio.timeout(seconds)
+    loop = asyncio.get_running_loop()
+    expires_at = loop.time() + seconds
+    task = asyncio.ensure_future(operation)
     try:
-        async with deadline:
-            return await operation
-    except TimeoutError:
-        if not deadline.expired():
-            raise
-        raise AssertionError(failure_message) from None
+        done, _ = await asyncio.wait(
+            {task},
+            timeout=max(0.0, expires_at - loop.time()),
+        )
+    except BaseException:
+        if not task.done():
+            task.cancel()
+            task.add_done_callback(_observe_background_task)
+        raise
+    if task in done and loop.time() <= expires_at:
+        return await task
+    if not task.done():
+        task.cancel()
+        task.add_done_callback(_observe_background_task)
+    else:
+        await asyncio.gather(task, return_exceptions=True)
+    raise AssertionError(failure_message)
+
+
+def _observe_background_task[T](task: asyncio.Future[T]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 class _GatedBackend:
@@ -627,6 +645,17 @@ class _CloseRaisesStream:
         raise RuntimeError("close failed")
 
 
+class _CloseSucceedsStream:
+    def __aiter__(self) -> _CloseSucceedsStream:
+        return self
+
+    async def __anext__(self) -> RunEvent:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        return None
+
+
 class _BlockingCloseLines:
     def __init__(self) -> None:
         self._release_gate = asyncio.Event()
@@ -661,12 +690,32 @@ class _BlockingCloseLines:
             await self._cancellation_changed.wait_for(lambda: self.cancellations >= expected)
 
 
-async def _tracked_close_failure_probe() -> int:
+@dataclass(frozen=True)
+class _TrackedCloseProbeResult:
+    runtime_error_observed: bool
+    active_leases: int
+
+
+async def _tracked_close_probe(delegate: AsyncIterator[RunEvent]) -> _TrackedCloseProbeResult:
     probe = _LifespanProbe(active_leases=1)
-    tracked = _TrackedEventStream(_CloseRaisesStream(), probe, open_high_water=0)
-    with contextlib.suppress(RuntimeError):
+    tracked = _TrackedEventStream(delegate, probe, open_high_water=0)
+    runtime_error_observed = False
+    try:
         await tracked.aclose()
-    return probe.active_leases
+    except RuntimeError:
+        runtime_error_observed = True
+    return _TrackedCloseProbeResult(
+        runtime_error_observed=runtime_error_observed,
+        active_leases=probe.active_leases,
+    )
+
+
+async def _tracked_close_failure_probe() -> _TrackedCloseProbeResult:
+    return await _tracked_close_probe(_CloseRaisesStream())
+
+
+async def _tracked_close_success_probe() -> _TrackedCloseProbeResult:
+    return await _tracked_close_probe(_CloseSucceedsStream())
 
 
 async def _close_resists_repeated_cancellation_probe() -> bool:
@@ -711,11 +760,16 @@ async def _blocking_cleanup_fault_probe() -> bool:
     try:
         await _collect_sse_lines(stream, cleanup_seconds=0.02)
     except AssertionError as failure:
+        await _await_with_deadline(
+            stream.wait_for_cancellations(1),
+            seconds=_GATE_DEADLINE_SECONDS,
+            failure_message=_GATE_DEADLINE_ERROR,
+        )
         introduced = _pending_tasks(current) - pending_before
         named_cleanup = tuple(task for task in introduced if task.get_name() == "sse-test-cleanup")
         observed = (
             str(failure) == _CLEANUP_DEADLINE_ERROR
-            and stream.cancellations == 2
+            and stream.cancellations == 1
             and len(introduced) == 1
             and len(named_cleanup) == 1
             and not named_cleanup[0].done()
@@ -752,21 +806,11 @@ async def _close_with_deadline(
 ) -> None:
     cleanup = asyncio.ensure_future(close())
     cleanup.set_name("sse-test-cleanup")
-    done, _ = await asyncio.wait({cleanup}, timeout=seconds)
-    if done:
-        await cleanup
-        return
-
-    cleanup.cancel()
-    done, _ = await asyncio.wait({cleanup}, timeout=seconds)
-    if not done:
-        cleanup.cancel()
-        done, _ = await asyncio.wait({cleanup}, timeout=seconds)
-    if not done:
-        cleanup.add_done_callback(lambda task: None if task.cancelled() else task.exception())
-    else:
-        await asyncio.gather(cleanup, return_exceptions=True)
-    raise AssertionError(_CLEANUP_DEADLINE_ERROR)
+    await _await_with_deadline(
+        cleanup,
+        seconds=seconds,
+        failure_message=_CLEANUP_DEADLINE_ERROR,
+    )
 
 
 async def _collect_sse_lines(
@@ -928,20 +972,27 @@ def _sse_payloads(
         _assert_serialized_output_has_no_secrets_or_sql(line, database)
 
     payloads: list[dict[str, object]] = []
-    frame: dict[str, str] = {}
+    frame: list[tuple[str, str]] = []
     seen_ids: set[str] = set()
 
     def finish_frame() -> None:
         if not frame:
             return
-        _safe_output_require(frozenset(frame) == frozenset({"id", "event", "data"}))
-        protocol_id = frame["id"]
-        protocol_event = frame["event"]
+        protocol_ids = tuple(value for name, value in frame if name == "id")
+        protocol_events = tuple(value for name, value in frame if name == "event")
+        data_values = tuple(value for name, value in frame if name == "data")
+        _safe_output_require(len(protocol_ids) == 1)
+        _safe_output_require(len(protocol_events) == 1)
+        _safe_output_require(bool(data_values))
+        protocol_id = protocol_ids[0]
+        protocol_event = protocol_events[0]
         _safe_output_require(bool(protocol_id) and "\x00" not in protocol_id)
         _safe_output_require(protocol_id not in seen_ids)
         _safe_output_require(protocol_event in _EVENT_DATA_KEYS)
+        serialized_data = "\n".join(data_values)
+        _assert_serialized_output_has_no_secrets_or_sql(serialized_data, database)
         try:
-            untrusted_payload = json.loads(frame["data"])
+            untrusted_payload = json.loads(serialized_data)
         except json.JSONDecodeError:
             raise AssertionError(_SAFE_OUTPUT_ERROR) from None
         _assert_safe_tree(untrusted_payload)
@@ -971,8 +1022,7 @@ def _sse_payloads(
             value = value[1:]
         _safe_output_require(field_name in {"id", "event", "data", "retry"})
         _safe_output_require(field_name != "retry")
-        _safe_output_require(field_name not in frame)
-        frame[field_name] = value
+        frame.append((field_name, value))
     _safe_output_require(not frame)
     return tuple(payloads)
 
@@ -1186,11 +1236,23 @@ def _assert_serialized_output_has_no_secrets_or_sql(
     _assert_safe_tree(wire_value)
     string_values = tuple(_string_leaves(wire_value))
     credential_assignment = re.compile(
-        r"(?i)(?:\b(?:authorization|api[\s_-]*key|password|access[\s_-]*token)"
+        r"(?i)(?:\b(?:authorization|api[\s_-]*key|password|access[\s_-]*token|"
+        r"token|secret|credentials)"
         r"[\"']?\s*[:=]\s*\S+|\bbearer\s+\S+)"
     )
     _safe_output_require(not any(credential_assignment.search(value) for value in string_values))
     normalized_values = tuple(_normalize_sql_text(value) for value in string_values)
+    sql_statement = re.compile(
+        r"(?:\bselect\b.+\bfrom\b|"
+        r"\bwith\b\s+(?:recursive\s+)?[a-z_][\w$]*\s+as\s*\(|"
+        r"\binsert\s+into\b|"
+        r"\bupdate\b.+\bset\b|"
+        r"\bdelete\s+from\b|"
+        r"\b(?:create|alter|drop|truncate)\s+"
+        r"(?:table|index|schema|view|materialized\s+view|database|role|function|"
+        r"procedure|type|extension)\b)"
+    )
+    _safe_output_require(not any(sql_statement.search(value) for value in normalized_values))
     normalized_sql_canaries = tuple(
         _normalize_sql_text(sql) for sql in (_COMPARISON_SQL, _REGION_SQL, _SKU_SQL, _SEGMENT_SQL)
     )
@@ -1243,6 +1305,216 @@ def _assert_failure_is_redacted(
         operand in message or operand in safe_trace for operand in sensitive_operands
     ):
         pytest.fail("safe-output failure diagnostics leaked operands", pytrace=False)
+
+
+def _safe_created_event(*, status: str = "queued") -> dict[str, object]:
+    return {
+        "event_id": "safe-event-1",
+        "sequence": 1,
+        "run_id": "safe-run",
+        "timestamp": "2026-09-05T00:00:00Z",
+        "node": "runtime",
+        "type": "run.created",
+        "data": {"status": status},
+    }
+
+
+def _oracle_database() -> DatabaseSettings:
+    return DatabaseSettings(  # type: ignore[call-arg]
+        _env_file=None,
+        database_url=(
+            "postgresql+asyncpg://analytics_readonly:oracle_password@localhost/oracle_db"
+        ),
+    )
+
+
+def test_sse_parser_accepts_real_crlf_multiline_data_and_rejects_malformed_frames() -> None:
+    database = _oracle_database()
+    safe_event = _safe_created_event()
+    encoded = ServerSentEvent(
+        data=json.dumps(safe_event, indent=2),
+        event="run.created",
+        id="safe-event-1",
+        sep="\r\n",
+    ).encode()
+    real_lines = tuple(encoded.decode("utf-8").splitlines())
+    _safe_output_require(sum(line.startswith("data:") for line in real_lines) > 1)
+    _safe_output_require(_sse_payloads(iter(real_lines), database) == (safe_event,))
+
+    no_space_frame = (
+        "",
+        ":heartbeat",
+        "",
+        "id:safe-event-1",
+        "event:run.created",
+        f"data:{json.dumps(safe_event)}",
+        "",
+        "",
+    )
+    _safe_output_require(_sse_payloads(iter(no_space_frame), database) == (safe_event,))
+
+    malformed_frames = (
+        (
+            "id: safe-event-1",
+            "id: duplicate-event-id",
+            "event: run.created",
+            f"data: {json.dumps(safe_event)}",
+            "",
+        ),
+        (
+            "id: safe-event-1",
+            "event: run.created",
+            "event: run.created",
+            f"data: {json.dumps(safe_event)}",
+            "",
+        ),
+        ("id: safe-event-1", f"data: {json.dumps(safe_event)}", ""),
+        ("id: safe-event-1", "event: run.created", ""),
+        (
+            "id: safe-event-1",
+            "event: run.started",
+            f"data: {json.dumps(safe_event)}",
+            "",
+        ),
+    )
+    for malformed_frame in malformed_frames:
+        with pytest.raises(AssertionError) as frame_failure:
+            _sse_payloads(iter(malformed_frame), database)
+        _assert_failure_is_redacted(
+            frame_failure,
+            tuple(line for line in malformed_frame if line),
+        )
+
+
+def test_sse_safe_output_oracle_scans_parsed_string_leaves() -> None:
+    database = _oracle_database()
+    unsafe_statuses = (
+        "token=credential-canary",
+        "secret=credential-canary",
+        "credentials=credential-canary",
+        "DELETE FROM audit_log WHERE true",
+        "SELECT account_id FROM audit_log",
+        "WITH exposed AS (SELECT 1) SELECT * FROM exposed",
+        "INSERT INTO audit_log(message) VALUES ('exposed')",
+        "UPDATE audit_log SET message = 'exposed'",
+        "CREATE TABLE exposed_audit_log(id integer)",
+        "ALTER TABLE audit_log ADD COLUMN exposed integer",
+        "DROP TABLE audit_log",
+        "TRUNCATE TABLE audit_log",
+    )
+    for unsafe_status in unsafe_statuses:
+        unsafe_event = _safe_created_event(status=unsafe_status)
+        unsafe_frame = (
+            "id: safe-event-1",
+            "event: run.created",
+            f"data: {json.dumps(unsafe_event)}",
+            "",
+        )
+        with pytest.raises(AssertionError) as unsafe_failure:
+            _sse_payloads(iter(unsafe_frame), database)
+        _assert_failure_is_redacted(
+            unsafe_failure,
+            (unsafe_status, json.dumps(unsafe_event), *unsafe_frame[:-1]),
+        )
+
+    natural_language = _safe_created_event(status="select the best evidence")
+    natural_language_frame = (
+        "id: safe-event-1",
+        "event: run.created",
+        f"data: {json.dumps(natural_language)}",
+        "",
+    )
+    _safe_output_require(
+        _sse_payloads(iter(natural_language_frame), database) == (natural_language,)
+    )
+
+
+async def _late_success_after_cancellation(
+    started: asyncio.Event,
+    release: asyncio.Event,
+    finished: asyncio.Event,
+) -> str:
+    started.set()
+    try:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+    finally:
+        finished.set()
+    return "late-success"
+
+
+@pytest.mark.asyncio
+async def test_await_deadline_rejects_late_success_and_reclaims_hostile_task() -> None:
+    deadline_seconds = 0.01
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    hostile = asyncio.create_task(
+        _late_success_after_cancellation(started, release, finished),
+        name="sse-hostile-late-success",
+    )
+    await started.wait()
+    loop = asyncio.get_running_loop()
+    release_handle = loop.call_later(deadline_seconds * 5, release.set)
+    started_at = loop.time()
+    try:
+        with pytest.raises(AssertionError) as deadline_failure:
+            await _await_with_deadline(
+                hostile,
+                seconds=deadline_seconds,
+                failure_message=_SSE_DEADLINE_ERROR,
+            )
+        elapsed = loop.time() - started_at
+        _safe_output_require(str(deadline_failure.value) == _SSE_DEADLINE_ERROR)
+        _safe_output_require(elapsed < deadline_seconds * 4)
+        _safe_output_require(not hostile.done())
+    finally:
+        release_handle.cancel()
+        release.set()
+        await asyncio.gather(hostile, return_exceptions=True)
+    _safe_output_require(finished.is_set())
+    _safe_output_require(hostile.done())
+
+
+@pytest.mark.asyncio
+async def test_close_deadline_uses_one_budget_and_reclaims_hostile_task() -> None:
+    deadline_seconds = 0.04
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    hostile = asyncio.create_task(
+        _late_success_after_cancellation(started, release, finished),
+        name="sse-hostile-close",
+    )
+    await started.wait()
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        with pytest.raises(AssertionError) as cleanup_failure:
+            await _close_with_deadline(lambda: hostile, seconds=deadline_seconds)
+        elapsed = loop.time() - started_at
+        _safe_output_require(str(cleanup_failure.value) == _CLEANUP_DEADLINE_ERROR)
+        _safe_output_require(elapsed < deadline_seconds * 2.25)
+        _safe_output_require(not hostile.done())
+    finally:
+        release.set()
+        await asyncio.gather(hostile, return_exceptions=True)
+    _safe_output_require(finished.is_set())
+    _safe_output_require(hostile.done())
+
+
+@pytest.mark.asyncio
+async def test_tracked_close_probe_requires_observed_runtime_error_and_releases_lease() -> None:
+    failure_result = await _tracked_close_failure_probe()
+    _safe_output_require(failure_result.runtime_error_observed is True)
+    _safe_output_require(failure_result.active_leases == 0)
+
+    success_result = await _tracked_close_success_probe()
+    _safe_output_require(success_result.runtime_error_observed is False)
+    _safe_output_require(success_result.active_leases == 0)
 
 
 @pytest.mark.integration
@@ -1494,7 +1766,10 @@ def test_post_sse_status_and_trace_share_one_lifespan_engine(
                     failure_message=_SSE_DEADLINE_ERROR,
                 )
             )
-        _safe_output_require(portal.call(_tracked_close_failure_probe) == 0)
+        _safe_output_require(
+            portal.call(_tracked_close_failure_probe)
+            == _TrackedCloseProbeResult(runtime_error_observed=True, active_leases=0)
+        )
         _safe_output_require(portal.call(_close_resists_repeated_cancellation_probe) is True)
         _safe_output_require(portal.call(_blocking_cleanup_fault_probe) is True)
         event_store = probe.event_store
