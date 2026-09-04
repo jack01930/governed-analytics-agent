@@ -1783,3 +1783,437 @@ async def test_terminal_matcher_ignores_events_beyond_high_water_snapshot() -> N
 
     with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
         await runner.wait("run-1")
+
+
+class CreateThenFailBlockingReadRunStore(InMemoryRunStore):
+    def __init__(self, *, clock: FakeClock) -> None:
+        super().__init__(max_runs=3, retention_seconds=3600, clock=clock)
+        self.block_get = False
+        self.read_started = asyncio.Event()
+
+    async def create(self, run_id: str, query: str) -> Any:
+        record = await super().create(run_id, query)
+        if run_id == "run-1":
+            self.block_get = True
+            raise RuntimeError(SENTINEL)
+        return record
+
+    async def get(self, run_id: str) -> Any:
+        if run_id == "run-1" and self.block_get:
+            self.block_get = False
+            self.read_started.set()
+            await asyncio.Event().wait()
+        return await super().get(run_id)
+
+
+@pytest.mark.asyncio
+async def test_run_create_reconciliation_delays_cancellation_through_blocked_read() -> None:
+    clock = FakeClock()
+    runs = CreateThenFailBlockingReadRunStore(clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    ids = iter(("run-1", "run-2"))
+    runner = AnalysisRunner(
+        settings=settings(max_runs=3),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: next(ids),
+    )
+
+    submission = asyncio.create_task(runner.submit("first"))
+    await runs.read_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    assert (await runner.submit("second")).run_id == "run-2"
+    assert (await runner.wait("run-2")).final_status is FinalStatus.COMPLETED
+
+
+class EventCreateThenFailBlockingReadStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.block_read = False
+        self.read_started = asyncio.Event()
+
+    async def create_run(self, run_id: str) -> None:
+        await super().create_run(run_id)
+        if run_id == "run-1":
+            self.block_read = True
+            raise RuntimeError(SENTINEL)
+
+    async def high_water_mark(self, run_id: str) -> int:
+        if run_id == "run-1" and self.block_read:
+            self.block_read = False
+            self.read_started.set()
+            await asyncio.Event().wait()
+        return await super().high_water_mark(run_id)
+
+
+@pytest.mark.asyncio
+async def test_event_create_reconciliation_delays_cancellation_through_blocked_read() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=3, retention_seconds=3600, clock=clock)
+    events = EventCreateThenFailBlockingReadStore(clock=clock.now)
+    ids = iter(("run-1", "run-2"))
+    runner = AnalysisRunner(
+        settings=settings(max_runs=3),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: next(ids),
+    )
+
+    submission = asyncio.create_task(runner.submit("first"))
+    await events.read_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+    assert (await runner.submit("second")).run_id == "run-2"
+    assert (await runner.wait("run-2")).final_status is FinalStatus.COMPLETED
+
+
+class PersistentRunCreateReadFailureStore(InMemoryRunStore):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.created = False
+
+    async def create(self, run_id: str, query: str) -> Any:
+        await super().create(run_id, query)
+        self.created = True
+        raise RuntimeError(SENTINEL)
+
+    async def get(self, run_id: str) -> Any:
+        if self.created:
+            raise RuntimeError(SENTINEL)
+        return await super().get(run_id)
+
+
+@pytest.mark.asyncio
+async def test_persistent_run_create_readback_failure_stably_fail_stops() -> None:
+    clock = FakeClock()
+    runs = PersistentRunCreateReadFailureStore(
+        max_runs=2,
+        retention_seconds=3600,
+        clock=clock,
+    )
+    events = InMemoryEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+    assert (await InMemoryRunStore.get(runs, "run-1")).lifecycle_status == "queued"
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+class PersistentEventCreateReadFailureStore(InMemoryEventStore):
+    async def create_run(self, run_id: str) -> None:
+        await super().create_run(run_id)
+        raise RuntimeError(SENTINEL)
+
+    async def high_water_mark(self, run_id: str) -> int:
+        try:
+            await super().high_water_mark(run_id)
+        except EventRunNotFound:
+            raise
+        raise RuntimeError(SENTINEL)
+
+
+@pytest.mark.asyncio
+async def test_persistent_event_create_readback_failure_stably_fail_stops() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = PersistentEventCreateReadFailureStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("query")
+    assert (await runs.get("run-1")).lifecycle_status == "queued"
+    assert await InMemoryEventStore.high_water_mark(events, "run-1") == 0
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+class DeleteThenFailBlockingReadEventStore(InMemoryEventStore):
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime],
+        fail_created: bool,
+    ) -> None:
+        super().__init__(clock=clock)
+        self.fail_created = fail_created
+        self.block_read = False
+        self.read_started = asyncio.Event()
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+        if self.fail_created and event_type == "run.created":
+            self.fail_created = False
+            raise RuntimeError(SENTINEL)
+        return await super().emit(run_id, node, event_type, data)
+
+    async def delete_run(self, run_id: str, *, allow_unstarted: bool = False) -> bool:
+        await super().delete_run(run_id, allow_unstarted=allow_unstarted)
+        self.block_read = True
+        raise RuntimeError(SENTINEL)
+
+    async def high_water_mark(self, run_id: str) -> int:
+        if self.block_read:
+            self.block_read = False
+            self.read_started.set()
+            await asyncio.Event().wait()
+        return await super().high_water_mark(run_id)
+
+
+@pytest.mark.asyncio
+async def test_rollback_delete_readback_delays_cancellation_until_pair_is_clean() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = DeleteThenFailBlockingReadEventStore(clock=clock.now, fail_created=True)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.read_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+    assert (await runner.submit("replacement")).run_id == "run-1"
+    assert (await runner.wait("run-1")).final_status is FinalStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_prune_delete_readback_delays_cancellation_until_pair_is_clean() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
+    events = DeleteThenFailBlockingReadEventStore(clock=clock.now, fail_created=False)
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "new",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.read_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    with pytest.raises(RunNotFound):
+        await runs.get("old")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("old")
+    assert (await runner.submit("replacement")).run_id == "new"
+    assert (await runner.wait("new")).final_status is FinalStatus.COMPLETED
+
+
+class RestoreCancellationEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime], window: str) -> None:
+        super().__init__(clock=clock)
+        self.window = window
+        self.initial_created_failed = False
+        self.restore_create_calls = 0
+        self.restore_emit_calls = 0
+        self.restore_started = asyncio.Event()
+
+    async def create_run(self, run_id: str) -> None:
+        if self.initial_created_failed:
+            self.restore_create_calls += 1
+            if self.window == "create" and self.restore_create_calls == 1:
+                self.restore_started.set()
+                await asyncio.Event().wait()
+        await super().create_run(run_id)
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> Any:
+        if event_type == "run.created" and not self.initial_created_failed:
+            self.initial_created_failed = True
+            raise RuntimeError(SENTINEL)
+        if event_type == "run.created":
+            self.restore_emit_calls += 1
+            if self.window == "emit" and self.restore_emit_calls == 1:
+                self.restore_started.set()
+                await asyncio.Event().wait()
+        return await super().emit(run_id, node, event_type, data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window", ["create", "emit"])
+async def test_restore_compensation_delays_cancellation_until_run_created(window: str) -> None:
+    clock = FakeClock()
+    runs = SideEffectFailureRunStore(
+        clock=clock,
+        method="delete_queued",
+        timing="before",
+        persistent=True,
+    )
+    events = RestoreCancellationEventStore(clock=clock.now, window=window)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+
+    submission = asyncio.create_task(runner.submit("query"))
+    await events.restore_started.wait()
+    submission.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+    assert (await runs.get("run-1")).lifecycle_status == "queued"
+    assert await events.high_water_mark("run-1") == 1
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.submit("must be rejected")
+
+
+class IncompleteSnapshotEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.replay: list[RunEvent] = []
+        self.stream_called = False
+
+    async def emit(self, run_id: str, node: str, event_type: str, data: Any) -> RunEvent:
+        event = await super().emit(run_id, node, event_type, data)
+        self.replay.append(event)
+        return event
+
+    async def has_terminal(self, run_id: str) -> bool:
+        del run_id
+        return True
+
+    async def replay_snapshot(
+        self,
+        run_id: str,
+        *,
+        high_water_mark: int,
+    ) -> tuple[RunEvent, ...]:
+        del run_id, high_water_mark
+        return tuple(self.replay[:1])
+
+    async def stream(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int | None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        del run_id, after_sequence
+        self.stream_called = True
+        raise RuntimeError(SENTINEL)
+        yield  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_incomplete_terminal_snapshot_fail_stops_without_live_stream() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = IncompleteSnapshotEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.wait("run-1")
+    await runner.shutdown()
+    assert events.stream_called is False
+
+
+class NonBoundaryTerminalSnapshotEventStore(IncompleteSnapshotEventStore):
+    async def stream(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int | None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        del after_sequence
+        for event in await self.replay_snapshot(run_id, high_water_mark=3):
+            yield event
+
+    async def replay_snapshot(
+        self,
+        run_id: str,
+        *,
+        high_water_mark: int,
+    ) -> tuple[RunEvent, ...]:
+        del high_water_mark
+        terminal = RunEvent(
+            event_id=f"{run_id}:2",
+            sequence=2,
+            run_id=run_id,
+            timestamp=self._clock(),
+            node="runtime",
+            type="run.terminal",
+            data={"final_status": "completed", "stop_reason": "answer_complete"},
+        )
+        trailing = self.replay[1].model_copy(update={"event_id": f"{run_id}:3", "sequence": 3})
+        return self.replay[0], terminal, trailing
+
+    async def high_water_mark(self, run_id: str) -> int:
+        del run_id
+        return 3
+
+
+@pytest.mark.asyncio
+async def test_matching_terminal_must_be_snapshot_boundary_event() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = NonBoundaryTerminalSnapshotEventStore(clock=clock.now)
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=cast(Any, immediate_executor(completed_result)),
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+
+    with pytest.raises(RunConsistencyError, match="run stores are inconsistent"):
+        await runner.wait("run-1")

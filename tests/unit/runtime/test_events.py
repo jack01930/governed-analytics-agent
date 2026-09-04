@@ -167,6 +167,23 @@ async def test_events_are_monotonic_and_terminal_is_unique() -> None:
         await store.emit("run-1", "runtime", "run.started", {"status": "running"})
 
 
+@pytest.mark.asyncio
+async def test_replay_snapshot_returns_exact_captured_prefix_without_live_wait() -> None:
+    store = InMemoryEventStore()
+    await store.create_run("run-1")
+
+    assert await store.replay_snapshot("run-1", high_water_mark=0) == ()
+    created = await store.emit("run-1", "runtime", "run.created", {"status": "queued"})
+    captured = await store.high_water_mark("run-1")
+    await store.emit("run-1", "runtime", "run.started", {"status": "running"})
+
+    assert await store.replay_snapshot("run-1", high_water_mark=captured) == (created,)
+    with pytest.raises(EventCursorAhead):
+        await store.replay_snapshot("run-1", high_water_mark=3)
+    with pytest.raises(InvalidEventCursor):
+        await store.replay_snapshot("run-1", high_water_mark=-1)
+
+
 def test_public_modules_import_in_a_fresh_process_without_order_dependency() -> None:
     completed = subprocess.run(
         [

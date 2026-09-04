@@ -666,6 +666,13 @@ class EventStore(Protocol):
 
     async def high_water_mark(self, run_id: str) -> int: ...
 
+    async def replay_snapshot(
+        self,
+        run_id: str,
+        *,
+        high_water_mark: int,
+    ) -> tuple[RunEvent, ...]: ...
+
     async def has_terminal(self, run_id: str) -> bool: ...
 
     def stream(self, run_id: str, *, after_sequence: int | None) -> AsyncIterator[RunEvent]: ...
@@ -780,6 +787,22 @@ class InMemoryEventStore:
         buffer, condition = await self._locked_buffer(run_id)
         try:
             return len(buffer.events)
+        finally:
+            condition.release()
+
+    async def replay_snapshot(
+        self,
+        run_id: str,
+        *,
+        high_water_mark: int,
+    ) -> tuple[RunEvent, ...]:
+        if type(high_water_mark) is not int or high_water_mark < 0:
+            raise InvalidEventCursor()
+        buffer, condition = await self._locked_buffer(run_id)
+        try:
+            if high_water_mark > len(buffer.events):
+                raise EventCursorAhead()
+            return tuple(buffer.events[:high_water_mark])
         finally:
             condition.release()
 

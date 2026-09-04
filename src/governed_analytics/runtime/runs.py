@@ -91,6 +91,23 @@ def _task_is_cancelling() -> bool:
     return task is not None and task.cancelling() > 0
 
 
+class _DelayedCancellation:
+    def __init__(self) -> None:
+        self.pending: asyncio.CancelledError | None = None
+
+    def observe(self, error: BaseException) -> None:
+        if (
+            isinstance(error, asyncio.CancelledError)
+            and _task_is_cancelling()
+            and self.pending is None
+        ):
+            self.pending = error
+
+    def raise_if_pending(self) -> None:
+        if self.pending is not None:
+            raise self.pending
+
+
 class RunRecord(BaseModel):
     """Frozen public projection of one run, excluding internal agent state."""
 
@@ -403,17 +420,25 @@ class AnalysisRunner:
             except (RunAlreadyExists, RunCapacityExceeded):
                 raise
             except BaseException as error:
-                if not run_existed_before and await self._run_exists_after_failure(run_id):
-                    await self._delete_owned_queued_run(run_id)
-                if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
-                    raise
+                coordination = _DelayedCancellation()
+                coordination.observe(error)
+                owned_run_exists = not run_existed_before and await self._run_exists_after_failure(
+                    run_id, coordination
+                )
+                if owned_run_exists and not await self._delete_owned_queued_run(
+                    run_id, coordination
+                ):
+                    self._raise_coordination_failure(coordination)
+                coordination.raise_if_pending()
                 raise RunSubmissionFailed() from None
             try:
                 event_existed_before = await self._event_exists_before_submission(run_id)
             except BaseException as error:
-                await self._delete_owned_queued_run(run_id)
-                if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
-                    raise
+                coordination = _DelayedCancellation()
+                coordination.observe(error)
+                if not await self._delete_owned_queued_run(run_id, coordination):
+                    self._raise_coordination_failure(coordination)
+                coordination.raise_if_pending()
                 if isinstance(error, RunConsistencyError):
                     raise
                 raise RunSubmissionFailed() from None
@@ -428,11 +453,15 @@ class AnalysisRunner:
                     {"status": "queued"},
                 )
             except BaseException as error:
+                coordination = _DelayedCancellation()
+                coordination.observe(error)
                 if not event_existed_before and not events_created:
-                    events_created = await self._event_exists_after_failure(run_id)
-                await self._rollback_submission(run_id, events_created=events_created)
-                if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
-                    raise
+                    events_created = await self._event_exists_after_failure(run_id, coordination)
+                await self._rollback_submission(
+                    run_id,
+                    events_created=events_created,
+                    coordination=coordination,
+                )
                 raise RunSubmissionFailed() from None
             if self._consistency_failed:
                 await self._rollback_submission(run_id, events_created=True)
@@ -442,9 +471,13 @@ class AnalysisRunner:
                 task = asyncio.create_task(coroutine, name=f"analysis:{run_id}")
             except BaseException as error:
                 coroutine.close()
-                await self._rollback_submission(run_id, events_created=True)
-                if isinstance(error, asyncio.CancelledError) and _task_is_cancelling():
-                    raise
+                coordination = _DelayedCancellation()
+                coordination.observe(error)
+                await self._rollback_submission(
+                    run_id,
+                    events_created=True,
+                    coordination=coordination,
+                )
                 raise RunSubmissionFailed() from None
             self._tasks[run_id] = task
 
@@ -682,20 +715,25 @@ class AnalysisRunner:
             high_water_mark = await self._events.high_water_mark(run_id)
             if high_water_mark == 0:
                 return False
-            async for event in self._events.stream(run_id, after_sequence=None):
-                if event.sequence > high_water_mark:
-                    return False
-                if event.type == "run.terminal":
-                    return self._is_expected_terminal_event(event, expected)
-                if event.sequence == high_water_mark:
-                    return False
+            snapshot = await self._events.replay_snapshot(
+                run_id,
+                high_water_mark=high_water_mark,
+            )
         except asyncio.CancelledError:
             if _task_is_cancelling():
                 raise
             return None
         except Exception:
             return None
-        return False
+        if len(snapshot) != high_water_mark:
+            return False
+        if any(event.sequence != index for index, event in enumerate(snapshot, start=1)):
+            return False
+        if any(event.run_id != run_id for event in snapshot):
+            return False
+        if any(event.type == "run.terminal" for event in snapshot[:-1]):
+            return False
+        return self._is_expected_terminal_event(snapshot[-1], expected)
 
     @staticmethod
     def _is_expected_terminal_event(
@@ -761,168 +799,150 @@ class AnalysisRunner:
             raise RunConsistencyError() from None
         return True
 
-    async def _run_exists_after_failure(self, run_id: str) -> bool:
-        try:
-            await self._runs.get(run_id)
-        except RunNotFound:
-            return False
-        except asyncio.CancelledError:
-            if _task_is_cancelling():
-                raise
-            self._enter_fail_stop()
-            raise RunConsistencyError() from None
-        except Exception:
-            self._enter_fail_stop()
-            raise RunConsistencyError() from None
-        return True
+    async def _run_exists_after_failure(
+        self,
+        run_id: str,
+        coordination: _DelayedCancellation,
+    ) -> bool:
+        return await self._run_record_after_delete(run_id, coordination) is not None
 
-    async def _event_exists_after_failure(self, run_id: str) -> bool:
-        try:
-            await self._events.high_water_mark(run_id)
-        except EventRunNotFound:
-            return False
-        except asyncio.CancelledError:
-            if _task_is_cancelling():
-                raise
-            self._enter_fail_stop()
-            raise RunConsistencyError() from None
-        except Exception:
-            self._enter_fail_stop()
-            raise RunConsistencyError() from None
-        return True
-
-    async def _rollback_submission(self, run_id: str, *, events_created: bool) -> None:
-        pending_cancellation: asyncio.CancelledError | None = None
-        if events_created:
-            event_deleted, pending_cancellation = await self._delete_event_for_rollback(run_id)
-            if not event_deleted:
-                self._enter_fail_stop()
-                if pending_cancellation is not None:
-                    raise pending_cancellation
-                raise RunConsistencyError()
-        try:
-            await self._delete_owned_queued_run(run_id)
-        except asyncio.CancelledError as error:
-            pending_cancellation = pending_cancellation or error
-            record = await self._run_record_after_delete(run_id)
-            if record is not None:
-                self._enter_fail_stop()
-                try:
-                    await self._restore_owned_event_run(run_id)
-                except RunConsistencyError:
-                    raise pending_cancellation from None
-        except RunConsistencyError:
-            self._enter_fail_stop()
+    async def _event_high_water_after_failure(
+        self,
+        run_id: str,
+        coordination: _DelayedCancellation,
+    ) -> int | None:
+        for _ in range(3):
             try:
-                await self._restore_owned_event_run(run_id)
-            except RunConsistencyError:
-                if pending_cancellation is not None:
-                    raise pending_cancellation from None
-                raise
-            if pending_cancellation is not None:
-                raise pending_cancellation from None
-            raise
-        if pending_cancellation is not None:
-            raise pending_cancellation
+                return await self._events.high_water_mark(run_id)
+            except EventRunNotFound:
+                return None
+            except asyncio.CancelledError as error:
+                coordination.observe(error)
+            except Exception:
+                pass
+        self._raise_coordination_failure(coordination, run_id)
+        raise AssertionError("unreachable")
+
+    async def _event_exists_after_failure(
+        self,
+        run_id: str,
+        coordination: _DelayedCancellation,
+    ) -> bool:
+        return await self._event_high_water_after_failure(run_id, coordination) is not None
+
+    async def _rollback_submission(
+        self,
+        run_id: str,
+        *,
+        events_created: bool,
+        coordination: _DelayedCancellation | None = None,
+    ) -> None:
+        state = coordination or _DelayedCancellation()
+        if events_created and not await self._delete_event_for_rollback(run_id, state):
+            self._raise_coordination_failure(state, run_id)
+        if not await self._delete_owned_queued_run(run_id, state):
+            await self._restore_owned_event_run(run_id, state)
+            self._raise_coordination_failure(state, run_id)
+        state.raise_if_pending()
 
     async def _delete_event_for_rollback(
         self,
         run_id: str,
-    ) -> tuple[bool, asyncio.CancelledError | None]:
-        pending_cancellation: asyncio.CancelledError | None = None
+        coordination: _DelayedCancellation,
+    ) -> bool:
         for _ in range(3):
-            failed = False
             try:
-                deleted = await self._events.delete_run(run_id, allow_unstarted=True)
+                await self._events.delete_run(run_id, allow_unstarted=True)
             except EventRunNotFound:
-                return True, pending_cancellation
+                return True
             except asyncio.CancelledError as error:
-                pending_cancellation = pending_cancellation or error
-                deleted = False
-                failed = True
+                coordination.observe(error)
             except Exception:
-                deleted = False
-                failed = True
-            if not await self._event_exists_after_failure(run_id):
-                return True, pending_cancellation
-            if not failed and not deleted:
-                return False, pending_cancellation
-        return False, pending_cancellation
+                pass
+            if not await self._event_exists_after_failure(run_id, coordination):
+                return True
+        return False
 
-    async def _delete_owned_queued_run(self, run_id: str) -> None:
-        pending_cancellation: asyncio.CancelledError | None = None
+    async def _delete_owned_queued_run(
+        self,
+        run_id: str,
+        coordination: _DelayedCancellation,
+    ) -> bool:
         for _ in range(3):
             try:
-                deleted = await self._runs.delete_queued(run_id)
+                await self._runs.delete_queued(run_id)
             except asyncio.CancelledError as error:
-                pending_cancellation = pending_cancellation or error
-                deleted = False
+                coordination.observe(error)
             except Exception:
-                deleted = False
-            record = await self._run_record_after_delete(run_id)
+                pass
+            record = await self._run_record_after_delete(run_id, coordination)
             if record is None:
-                if pending_cancellation is not None:
-                    raise pending_cancellation
-                return
+                return True
             if record.lifecycle_status is not RunLifecycleStatus.QUEUED:
-                break
-            if deleted:
-                break
-        self._enter_fail_stop()
-        if pending_cancellation is not None:
-            raise pending_cancellation
-        raise RunConsistencyError()
+                self._raise_coordination_failure(coordination, run_id)
+        return False
 
-    async def _delete_terminal_run(self, run_id: str) -> None:
-        pending_cancellation: asyncio.CancelledError | None = None
+    async def _delete_terminal_run(
+        self,
+        run_id: str,
+        coordination: _DelayedCancellation,
+    ) -> bool:
         for _ in range(3):
             try:
-                deleted = await self._runs.delete_terminal(run_id)
+                await self._runs.delete_terminal(run_id)
             except asyncio.CancelledError as error:
-                pending_cancellation = pending_cancellation or error
-                deleted = False
+                coordination.observe(error)
             except Exception:
-                deleted = False
-            record = await self._run_record_after_delete(run_id)
+                pass
+            record = await self._run_record_after_delete(run_id, coordination)
             if record is None:
-                if pending_cancellation is not None:
-                    raise pending_cancellation
-                return
+                return True
             if record.lifecycle_status is not RunLifecycleStatus.TERMINAL:
-                break
-            if deleted:
-                break
-        self._enter_fail_stop(run_id)
-        if pending_cancellation is not None:
-            raise pending_cancellation
-        raise RunConsistencyError()
+                self._raise_coordination_failure(coordination, run_id)
+        return False
 
-    async def _run_record_after_delete(self, run_id: str) -> RunRecord | None:
-        try:
-            return await self._runs.get(run_id)
-        except RunNotFound:
-            return None
-        except asyncio.CancelledError:
-            self._enter_fail_stop(run_id)
-            raise
-        except Exception:
-            self._enter_fail_stop(run_id)
-            raise RunConsistencyError() from None
-
-    async def _restore_owned_event_run(self, run_id: str) -> None:
+    async def _run_record_after_delete(
+        self,
+        run_id: str,
+        coordination: _DelayedCancellation,
+    ) -> RunRecord | None:
         for _ in range(3):
             try:
-                high_water_mark = await self._events.high_water_mark(run_id)
-            except EventRunNotFound:
-                try:
-                    await self._events.create_run(run_id)
-                except Exception:
-                    continue
-                high_water_mark = 0
+                return await self._runs.get(run_id)
+            except RunNotFound:
+                return None
+            except asyncio.CancelledError as error:
+                coordination.observe(error)
             except Exception:
-                continue
-            if high_water_mark >= 1:
+                pass
+        self._raise_coordination_failure(coordination, run_id)
+        raise AssertionError("unreachable")
+
+    async def _restore_owned_event_run(
+        self,
+        run_id: str,
+        coordination: _DelayedCancellation,
+    ) -> None:
+        high_water_mark = await self._event_high_water_after_failure(run_id, coordination)
+        for _ in range(3):
+            if high_water_mark is not None:
+                break
+            try:
+                await self._events.create_run(run_id)
+            except asyncio.CancelledError as error:
+                coordination.observe(error)
+            except Exception:
+                pass
+            high_water_mark = await self._event_high_water_after_failure(run_id, coordination)
+        if high_water_mark is None:
+            self._raise_coordination_failure(coordination, run_id)
+        for _ in range(3):
+            if high_water_mark == 1 and await self._restored_created_event_matches(
+                run_id, coordination
+            ):
                 return
+            if high_water_mark != 0:
+                self._raise_coordination_failure(coordination, run_id)
             try:
                 await self._events.emit(
                     run_id,
@@ -930,10 +950,45 @@ class AnalysisRunner:
                     "run.created",
                     {"status": "queued"},
                 )
+            except asyncio.CancelledError as error:
+                coordination.observe(error)
             except Exception:
-                continue
-            return
+                pass
+            high_water_mark = await self._event_high_water_after_failure(run_id, coordination)
+            if high_water_mark is None:
+                self._raise_coordination_failure(coordination, run_id)
+        self._raise_coordination_failure(coordination, run_id)
+
+    async def _restored_created_event_matches(
+        self,
+        run_id: str,
+        coordination: _DelayedCancellation,
+    ) -> bool:
+        for _ in range(3):
+            try:
+                snapshot = await self._events.replay_snapshot(run_id, high_water_mark=1)
+            except asyncio.CancelledError as error:
+                coordination.observe(error)
+            except Exception:
+                pass
+            else:
+                return (
+                    len(snapshot) == 1
+                    and snapshot[0].run_id == run_id
+                    and snapshot[0].sequence == 1
+                    and snapshot[0].type == "run.created"
+                    and dict(snapshot[0].data) == {"status": "queued"}
+                )
+        self._raise_coordination_failure(coordination, run_id)
+        raise AssertionError("unreachable")
+
+    def _raise_coordination_failure(
+        self,
+        coordination: _DelayedCancellation,
+        run_id: str | None = None,
+    ) -> None:
         self._enter_fail_stop(run_id)
+        coordination.raise_if_pending()
         raise RunConsistencyError()
 
     async def _prune_locked(self) -> None:
@@ -946,31 +1001,23 @@ class AnalysisRunner:
         except Exception:
             raise RunConsistencyError() from None
         for run_id in expired:
-            pending_cancellation: asyncio.CancelledError | None = None
+            coordination = _DelayedCancellation()
             deleted = False
             for _ in range(3):
-                failed = False
                 try:
-                    deleted = await self._events.delete_run(run_id)
+                    await self._events.delete_run(run_id)
                 except EventRunNotFound:
                     deleted = True
                 except asyncio.CancelledError as error:
-                    pending_cancellation = pending_cancellation or error
-                    failed = True
+                    coordination.observe(error)
                 except Exception:
-                    failed = True
-                if deleted or not await self._event_exists_after_failure(run_id):
+                    pass
+                if deleted or not await self._event_exists_after_failure(run_id, coordination):
                     deleted = True
                     break
-                if not failed:
-                    break
-            if deleted:
-                try:
-                    await self._delete_terminal_run(run_id)
-                except asyncio.CancelledError as error:
-                    pending_cancellation = pending_cancellation or error
-            if pending_cancellation is not None:
-                raise pending_cancellation
+            if deleted and not await self._delete_terminal_run(run_id, coordination):
+                self._raise_coordination_failure(coordination, run_id)
+            coordination.raise_if_pending()
 
     def _enter_fail_stop(self, run_id: str | None = None) -> None:
         self._accepting = False
