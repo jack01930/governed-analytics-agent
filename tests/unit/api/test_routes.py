@@ -197,6 +197,80 @@ class PendingReadEventStore(InMemoryEventStore):
             yield item
 
 
+class OrdinaryGeneratorEventStore(CannedEventStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_started = asyncio.Event()
+        self.event_arrived = asyncio.Event()
+        self.release_completed = asyncio.Event()
+        self.emit_terminal = False
+
+    async def open_stream(
+        self, run_id: str, *, after_sequence: int | None
+    ) -> AsyncIterator[RunEvent]:
+        del run_id, after_sequence
+
+        async def generate() -> AsyncGenerator[RunEvent, None]:
+            try:
+                self.read_started.set()
+                await self.event_arrived.wait()
+                if self.emit_terminal:
+                    yield event(4)
+            finally:
+                self.release_completed.set()
+
+        return generate()
+
+
+class MinimalProtocolIterator:
+    def __init__(
+        self,
+        *,
+        block_read: bool = False,
+        fail_read: bool = False,
+        fail_close_once: bool = False,
+    ) -> None:
+        self.block_read = block_read
+        self.fail_read = fail_read
+        self.fail_close_once = fail_close_once
+        self.anext_calls = 0
+        self.aclose_calls = 0
+        self.read_started = asyncio.Event()
+        self.read_release = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_release.set()
+
+    def __aiter__(self) -> MinimalProtocolIterator:
+        return self
+
+    async def __anext__(self) -> RunEvent:
+        self.anext_calls += 1
+        self.read_started.set()
+        if self.fail_read:
+            raise RuntimeError("read failed")
+        if self.block_read:
+            await self.read_release.wait()
+        return event(1)
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        await self.close_release.wait()
+        if self.fail_close_once and self.aclose_calls == 1:
+            raise RuntimeError("close failed")
+
+
+class ProtocolIteratorEventStore(CannedEventStore):
+    def __init__(self, opened: AsyncIterator[RunEvent]) -> None:
+        super().__init__()
+        self.opened = opened
+
+    async def open_stream(
+        self, run_id: str, *, after_sequence: int | None
+    ) -> AsyncIterator[RunEvent]:
+        del run_id, after_sequence
+        return self.opened
+
+
 def factory_for(
     runner: FakeRunner,
     events: CannedEventStore | None = None,
@@ -563,6 +637,189 @@ async def test_sse_response_disconnect_while_next_event_is_pending_releases_leas
         allow_unstarted=True,
         owner_token=owner,
     )
+
+
+@pytest.mark.asyncio
+async def test_sse_protocol_async_generator_pending_disconnect_runs_finally() -> None:
+    events = OrdinaryGeneratorEventStore()
+    response = await sse_events("run-1", direct_container(events))
+
+    async def send(_message: Message) -> None:
+        return None
+
+    async def receive() -> Message:
+        await events.read_started.wait()
+        return {"type": "http.disconnect"}
+
+    await asyncio.wait_for(
+        response(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/v1/analyses/run-1/events",
+                "raw_path": b"/v1/analyses/run-1/events",
+                "query_string": b"",
+                "headers": [],
+                "client": ("testclient", 50000),
+                "server": ("testserver", 80),
+            },
+            receive,
+            send,
+        ),
+        timeout=1,
+    )
+
+    assert events.release_completed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_sse_protocol_wrapper_delegates_concurrent_close_once_then_stops_reads() -> None:
+    opened = MinimalProtocolIterator()
+    opened.close_release.clear()
+    response = await sse_events(
+        "run-1",
+        direct_container(ProtocolIteratorEventStore(opened)),
+    )
+    wrapped = cast(Any, response.body_iterator)
+    closes = tuple(asyncio.create_task(wrapped.aclose()) for _ in range(3))
+    await asyncio.sleep(0)
+    opened.close_release.set()
+
+    await asyncio.gather(*closes)
+    assert opened.aclose_calls == 1
+    with pytest.raises(StopAsyncIteration):
+        await anext(wrapped)
+    assert opened.anext_calls == 0
+    await wrapped.aclose()
+    assert opened.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sse_protocol_wrapper_linearizes_close_before_or_during_read() -> None:
+    close_first = MinimalProtocolIterator()
+    close_first.close_release.clear()
+    first_response = await sse_events(
+        "run-1",
+        direct_container(ProtocolIteratorEventStore(close_first)),
+    )
+    first_wrapped = cast(Any, first_response.body_iterator)
+    first_close = asyncio.create_task(first_wrapped.aclose())
+    await asyncio.sleep(0)
+    first_read = asyncio.create_task(anext(first_wrapped))
+    close_first.close_release.set()
+    first_results = await asyncio.gather(
+        first_close,
+        first_read,
+        return_exceptions=True,
+    )
+    assert first_results[0] is None
+    assert isinstance(first_results[1], StopAsyncIteration)
+    assert close_first.anext_calls == 0
+
+    read_first = MinimalProtocolIterator(block_read=True)
+    second_response = await sse_events(
+        "run-1",
+        direct_container(ProtocolIteratorEventStore(read_first)),
+    )
+    second_wrapped = cast(Any, second_response.body_iterator)
+    second_read = asyncio.create_task(anext(second_wrapped))
+    await read_first.read_started.wait()
+    await second_wrapped.aclose()
+    read_first.read_release.set()
+    second_result = (await asyncio.gather(second_read, return_exceptions=True))[0]
+    assert isinstance(second_result, asyncio.CancelledError)
+    assert read_first.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sse_protocol_wrapper_errors_cancellation_and_close_retry() -> None:
+    read_error = MinimalProtocolIterator(fail_read=True)
+    error_response = await sse_events(
+        "run-1",
+        direct_container(ProtocolIteratorEventStore(read_error)),
+    )
+    error_wrapped = cast(Any, error_response.body_iterator)
+    with pytest.raises(RuntimeError, match="read failed"):
+        await anext(error_wrapped)
+    with pytest.raises(StopAsyncIteration):
+        await anext(error_wrapped)
+    assert (read_error.anext_calls, read_error.aclose_calls) == (1, 1)
+
+    cancelled = MinimalProtocolIterator(block_read=True)
+    cancel_response = await sse_events(
+        "run-1",
+        direct_container(ProtocolIteratorEventStore(cancelled)),
+    )
+    cancel_wrapped = cast(Any, cancel_response.body_iterator)
+    cancelled_read = asyncio.create_task(anext(cancel_wrapped))
+    await cancelled.read_started.wait()
+    cancelled_read.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_read
+    assert cancelled.aclose_calls == 1
+    with pytest.raises(StopAsyncIteration):
+        await anext(cancel_wrapped)
+    assert cancelled.anext_calls == 1
+
+    retry = MinimalProtocolIterator(fail_close_once=True)
+    retry_response = await sse_events(
+        "run-1",
+        direct_container(ProtocolIteratorEventStore(retry)),
+    )
+    retry_wrapped = cast(Any, retry_response.body_iterator)
+    first_closes = await asyncio.gather(
+        retry_wrapped.aclose(),
+        retry_wrapped.aclose(),
+        return_exceptions=True,
+    )
+    assert all(isinstance(result, RuntimeError) for result in first_closes)
+    assert retry.aclose_calls == 1
+    assert (await anext(retry_wrapped))["id"] == "run-1:1"
+    await retry_wrapped.aclose()
+    assert retry.aclose_calls == 2
+    with pytest.raises(StopAsyncIteration):
+        await anext(retry_wrapped)
+
+
+@pytest.mark.asyncio
+async def test_sse_protocol_async_generator_event_arrival_disconnect_race() -> None:
+    events = OrdinaryGeneratorEventStore()
+    events.emit_terminal = True
+    response = await sse_events("run-1", direct_container(events))
+
+    async def send(_message: Message) -> None:
+        return None
+
+    async def receive() -> Message:
+        await events.read_started.wait()
+        events.event_arrived.set()
+        await asyncio.sleep(0)
+        return {"type": "http.disconnect"}
+
+    await asyncio.wait_for(
+        response(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/v1/analyses/run-1/events",
+                "raw_path": b"/v1/analyses/run-1/events",
+                "query_string": b"",
+                "headers": [],
+                "client": ("testclient", 50000),
+                "server": ("testserver", 80),
+            },
+            receive,
+            send,
+        ),
+        timeout=1,
+    )
+    assert events.release_completed.is_set()
 
 
 @pytest.mark.asyncio

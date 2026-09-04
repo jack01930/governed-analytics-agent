@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from decimal import Decimal
 from typing import Annotated
@@ -45,26 +46,90 @@ health_router = APIRouter(tags=["health"])
 class _SseEventIterator:
     def __init__(self, opened: AsyncIterator[RunEvent]) -> None:
         self._opened = opened
+        self._state_lock = asyncio.Lock()
+        self._read_task: asyncio.Task[RunEvent] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._closing = False
+        self._closed = False
 
     def __aiter__(self) -> _SseEventIterator:
         return self
 
     async def __anext__(self) -> dict[str, str]:
+        async with self._state_lock:
+            if self._closing or self._closed:
+                raise StopAsyncIteration
+            if self._read_task is not None:
+                raise RuntimeError("event stream read already in progress")
+            read_task: asyncio.Task[RunEvent] = asyncio.create_task(self._read_next())
+            self._read_task = read_task
         try:
-            event = await anext(self._opened)
+            event = await read_task
+        except asyncio.CancelledError:
+            if not read_task.done():
+                read_task.cancel()
+            await asyncio.gather(read_task, return_exceptions=True)
+            await self.aclose()
+            raise
         except BaseException:
             await self.aclose()
             raise
+        finally:
+            async with self._state_lock:
+                if self._read_task is read_task:
+                    self._read_task = None
+        async with self._state_lock:
+            should_stop = self._closing or self._closed
+        if should_stop:
+            await self.aclose()
+            raise StopAsyncIteration
         return {
             "id": event.event_id,
             "event": event.type,
             "data": event.model_dump_json(),
         }
 
+    async def _read_next(self) -> RunEvent:
+        return await anext(self._opened)
+
     async def aclose(self) -> None:
-        close = getattr(self._opened, "aclose", None)
-        if callable(close):
-            await close()
+        async with self._state_lock:
+            if self._closed:
+                return
+            if self._close_task is None:
+                self._closing = True
+                self._close_task = asyncio.create_task(self._finish_close())
+                self._close_task.add_done_callback(self._consume_close_result)
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    async def _finish_close(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            async with self._state_lock:
+                read_task = self._read_task
+            if read_task is not None and not read_task.done():
+                read_task.cancel()
+            if read_task is not None:
+                await asyncio.gather(read_task, return_exceptions=True)
+            close = getattr(self._opened, "aclose", None)
+            if callable(close):
+                await close()
+        except BaseException:
+            async with self._state_lock:
+                if self._close_task is current_task:
+                    self._close_task = None
+                self._closing = False
+            raise
+        else:
+            async with self._state_lock:
+                self._closed = True
+                self._closing = False
+
+    @staticmethod
+    def _consume_close_result(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
 
 
 def get_container(request: Request) -> AppContainer:
