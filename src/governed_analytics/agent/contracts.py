@@ -768,20 +768,29 @@ class StructuredModelRequest(_FrozenModel):
         )
 
     def prompt_bytes(self) -> bytes:
-        prompt: JsonValue = _normalize_and_freeze_object(
+        envelope: JsonValue = _normalize_and_freeze_object(
             {
-                "system_prompt": self.system_prompt,
-                "user_payload": self.user_payload,
-                "output_schema_name": self.output_schema_name,
-                "output_schema_summary": self.output_schema_summary,
+                "messages": (
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": self.user_json()},
+                ),
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": self.output_schema_name,
+                        "schema": self.output_schema_summary,
+                        "strict": True,
+                    },
+                },
             }
         )
-        return json.dumps(
-            _thaw_json(prompt),
+        serialized_envelope = json.dumps(
+            _thaw_json(envelope),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        return serialized_envelope + bytes(512)
 
     def for_repair(self, *, failure_category: str) -> StructuredModelRequest:
         failure_category = _require_nonblank(failure_category)

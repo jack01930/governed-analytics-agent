@@ -1,3 +1,4 @@
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -216,6 +217,39 @@ def test_json_inputs_are_deeply_frozen_and_serialized_deterministically() -> Non
         nested_mapping["new"] = 1  # type: ignore[index]
     assert first.user_json() == second.user_json()
     assert first.prompt_bytes() == second.prompt_bytes()
+
+
+def test_prompt_bytes_include_provider_envelope_schema_and_fixed_protocol_overhead() -> None:
+    request = StructuredModelRequest(
+        purpose="behavior",
+        system_prompt="Return a decision.",
+        user_payload={"query": "六月GMV"},
+        output_schema_name="BehaviorDecision",
+        output_schema_summary={"title": "BehaviorDecision", "type": "object"},
+        max_output_tokens=128,
+    )
+    expected_envelope = {
+        "messages": [
+            {"role": "system", "content": "Return a decision."},
+            {"role": "user", "content": '{"query":"六月GMV"}'},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "BehaviorDecision",
+                "schema": {"title": "BehaviorDecision", "type": "object"},
+                "strict": True,
+            },
+        },
+    }
+    expected_payload = json.dumps(
+        expected_envelope,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert request.prompt_bytes() == expected_payload + bytes(512)
 
 
 def test_structured_request_repair_preserves_bound_schema() -> None:

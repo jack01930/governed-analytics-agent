@@ -5,13 +5,20 @@ from pathlib import Path
 
 import pytest
 
+from governed_analytics.evals.pricing import ModelPricing as EvalModelPricing
 from governed_analytics.evals.pricing import (
     PricingContractError,
     estimate_cost_cny,
     load_model_pricing,
 )
+from governed_analytics.pricing import ModelPricing
+from governed_analytics.pricing import load_model_pricing as load_public_model_pricing
 
 PRICING_PATH = "data/pricing/deepseek-v4-flash-2026-09-01.yaml"
+
+
+def test_evals_pricing_remains_a_compatible_public_facade() -> None:
+    assert EvalModelPricing is ModelPricing
 
 
 def test_pricing_record_is_versioned_and_cost_is_exact_decimal() -> None:
@@ -110,6 +117,7 @@ def test_pricing_loader_is_cwd_independent_and_sanitizes_unreadable_inputs(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     assert load_model_pricing(PRICING_PATH).currency == "CNY"
+    assert load_public_model_pricing(PRICING_PATH).currency == "CNY"
 
     broken = tmp_path / "bad.yaml"
     broken.write_bytes(b"\xff")
