@@ -93,27 +93,16 @@ def _event_purpose(action: AgentAction) -> str:
     return "profile_context"
 
 
-def _safe_event_columns(
-    state: AgentState,
-    observation: Observation,
-) -> tuple[str, ...]:
-    if any(_SAFE_COLUMN.fullmatch(column) is None for column in observation.columns):
+def _safe_event_columns(observation: Observation) -> tuple[str, ...]:
+    if any(
+        _SAFE_COLUMN.fullmatch(column) is None or sensitive_identifier(column)
+        for column in observation.columns
+    ):
         return ()
-    if observation.tool_name is ActionType.EXECUTE_SQL:
-        contract = state["answer_contract"]
-        if contract is None or observation.contract_id is None:
-            return ()
-        try:
-            expected = contract.contract(observation.contract_id).column_names
-        except KeyError:
-            return ()
-        if observation.columns != expected:
-            return ()
     return observation.columns
 
 
 def tool_completed_data(
-    state: AgentState,
     action: AgentAction,
     observation: Observation,
 ) -> Mapping[str, JsonValue]:
@@ -121,7 +110,7 @@ def tool_completed_data(
         "tool_name": action.action_type.value,
         "purpose": _event_purpose(action),
         "query_id": observation.query_id,
-        "columns": _safe_event_columns(state, observation),
+        "columns": _safe_event_columns(observation),
         "row_count": observation.row_count,
         "possibly_truncated": observation.possibly_truncated,
     }
@@ -419,7 +408,6 @@ async def _emit_tool_result(
     context: AgentContext,
     *,
     node: str,
-    state: AgentState,
     action: AgentAction,
     observation: Observation,
 ) -> bool:
@@ -428,7 +416,7 @@ async def _emit_tool_result(
             context,
             node=node,
             event_type="tool.completed",
-            data=tool_completed_data(state, action, observation),
+            data=tool_completed_data(action, observation),
         )
     return await emit_domain_event(
         context,
@@ -549,7 +537,6 @@ def _profile_safe_arguments(action: AgentAction) -> tuple[tuple[str, JsonValue],
 
 
 def _invocation_matches_action(
-    state: AgentState,
     action: AgentAction,
     invocation: ToolInvocation,
 ) -> bool:
@@ -583,15 +570,9 @@ def _invocation_matches_action(
             return False
         if not observation.ok:
             return observation.columns == ()
-        contract = state["answer_contract"]
-        if contract is None or action.contract_id is None:
-            return False
-        try:
-            expected_columns = contract.contract(action.contract_id).column_names
-        except KeyError:
-            return False
-        return observation.columns == expected_columns and not any(
-            sensitive_identifier(column) for column in observation.columns
+        return all(
+            _SAFE_COLUMN.fullmatch(column) is not None and not sensitive_identifier(column)
+            for column in observation.columns
         )
     profile_arguments = _profile_safe_arguments(action)
     if profile_arguments is None or trace.safe_arguments != profile_arguments:
@@ -609,6 +590,33 @@ def _invocation_matches_action(
         "time_range": ("min_value", "max_value"),
     }[operation]
     return observation.columns == expected_columns
+
+
+def _govern_tool_invocation(
+    action: AgentAction,
+    candidate: object,
+) -> ToolInvocation:
+    """Normalize an untrusted tool-port return before any later attribute access."""
+
+    if not isinstance(candidate, ToolInvocation):
+        return _safe_failure_invocation(action)
+    try:
+        if not isinstance(candidate.observation, Observation) or not isinstance(
+            candidate.trace, ToolCallTrace
+        ):
+            return _safe_failure_invocation(action)
+        validated = ToolInvocation.model_validate(
+            {
+                "observation": candidate.observation.model_dump(mode="python"),
+                "trace": candidate.trace.model_dump(mode="python"),
+            }
+        )
+        if not _invocation_matches_action(action, validated):
+            return _safe_failure_invocation(action)
+    except Exception:
+        propagate_cancellation()
+        return _safe_failure_invocation(action)
+    return validated
 
 
 async def invoke_tool(
@@ -636,18 +644,17 @@ async def invoke_tool(
         ):
             raise SafeDependencyError("event_sink_failed")
         try:
-            invocation = await context.tools.invoke(action, node="invoke_tool")
+            candidate = await context.tools.invoke(action, node="invoke_tool")
         except Exception:
             propagate_cancellation()
             invocation = _safe_failure_invocation(action)
-        if not _invocation_matches_action(state, action, invocation):
-            invocation = _safe_failure_invocation(action)
+        else:
+            invocation = _govern_tool_invocation(action, candidate)
         context.trace_recorder.append_tool(invocation.trace)
         trace_recorded = True
         if not await _emit_tool_result(
             context,
             node="invoke_tool",
-            state=state,
             action=action,
             observation=invocation.observation,
         ):
@@ -1109,18 +1116,17 @@ async def repair(
         ):
             raise SafeDependencyError("event_sink_failed")
         try:
-            tool_invocation = await context.tools.invoke(repaired_action, node="repair")
+            candidate = await context.tools.invoke(repaired_action, node="repair")
         except Exception:
             propagate_cancellation()
             tool_invocation = _safe_failure_invocation(repaired_action)
-        if not _invocation_matches_action(state, repaired_action, tool_invocation):
-            tool_invocation = _safe_failure_invocation(repaired_action)
+        else:
+            tool_invocation = _govern_tool_invocation(repaired_action, candidate)
         context.trace_recorder.append_tool(tool_invocation.trace)
         tool_trace_recorded = True
         if not await _emit_tool_result(
             context,
             node="repair",
-            state=state,
             action=repaired_action,
             observation=tool_invocation.observation,
         ):

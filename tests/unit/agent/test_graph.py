@@ -72,6 +72,12 @@ ATTRIBUTION_QUERY = "为什么2026年6月第二周GMV比第一周下降？"  # n
 CLARIFY_QUERY = "GMV怎么样？"  # noqa: RUF001
 QUERY_ID = "a" * 64
 SynthesisFactory = Callable[[StructuredModelRequest], Mapping[str, object]]
+RAW_INVALID_TOOL_RESULT_SENTINEL = "raw_invalid_tool_result_sentinel"
+
+
+class InvalidToolReturn:
+    def __repr__(self) -> str:
+        return RAW_INVALID_TOOL_RESULT_SENTINEL
 
 
 class FrozenClock:
@@ -745,20 +751,18 @@ async def test_attribution_checks_decline_then_three_dimensions() -> None:
 
 @pytest.mark.asyncio
 async def test_repairable_column_contract_failure_repairs_once() -> None:
-    # Column metadata is now rejected at the invocation boundary, so exercise the
-    # same result-contract repair path with a governed-column type mismatch.
     repaired = execute_action(sql="select cast(125 as numeric) as gmv")
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(),),
+        actions=(execute_action(sql="select cast(125 as numeric) as value"),),
         synthesis_output=synthesis(),
         repairs=(repaired,),
     )
     context, tools, model, events, backend = context_for(
         scripts,
         (
-            query_result(("gmv",), (("not-a-number",),), query_id="c" * 64),
+            query_result(("value",), (("125",),), query_id="c" * 64),
             query_result(("gmv",), (("125",),), query_id="d" * 64),
         ),
     )
@@ -774,7 +778,9 @@ async def test_repairable_column_contract_failure_repairs_once() -> None:
     assert tools.calls.count(ActionType.EXECUTE_SQL) == backend.calls == 2
     assert [call.purpose for call in model.calls].count("repair") == 1
     assert result.first_candidate is not None
-    assert result.first_candidate.columns == ("gmv",)
+    assert result.first_candidate.columns == ("value",)
+    assert result.observation_validations[0].error_code == "column_contract_mismatch"
+    assert result.observation_validations[0].repairable is True
     repair_events = [item for item in events.items if item[1].startswith("repair.")]
     assert [item[1] for item in repair_events] == ["repair.started", "repair.completed"]
     assert all(set(item[2]) == {"repair_count", "error_code", "success"} for item in repair_events)
@@ -785,14 +791,14 @@ async def test_second_contract_failure_stops_without_third_execute() -> None:
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(),),
-        repairs=(execute_action(),),
+        actions=(execute_action(sql="select cast(125 as numeric) as value"),),
+        repairs=(execute_action(sql="select cast(125 as numeric) as still_wrong"),),
     )
     context, tools, _, _, backend = context_for(
         scripts,
         (
-            query_result(("gmv",), (("not-a-number",),), query_id="c" * 64),
-            query_result(("gmv",), (("still-not-a-number",),), query_id="d" * 64),
+            query_result(("value",), (("125",),), query_id="c" * 64),
+            query_result(("still_wrong",), (("125",),), query_id="d" * 64),
         ),
     )
 
@@ -806,6 +812,10 @@ async def test_second_contract_failure_stops_without_third_execute() -> None:
     assert result.governance.tool_calls == 4
     assert result.governance.execute_calls == 2
     assert tools.calls.count(ActionType.EXECUTE_SQL) == backend.calls == 2
+    assert tuple(item.error_code for item in result.observation_validations) == (
+        "column_contract_mismatch",
+        "column_contract_mismatch",
+    )
 
 
 @pytest.mark.asyncio
@@ -2038,6 +2048,116 @@ async def test_injected_raw_safe_error_is_replaced_by_allowlisted_internal_error
         }
     )
     assert raw_safe_error not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_result",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(InvalidToolReturn(), id="plain-object"),
+        pytest.param(
+            ToolInvocation.model_construct(
+                observation=InvalidToolReturn(),
+                trace=InvalidToolReturn(),
+            ),
+            id="malformed-tool-invocation",
+        ),
+    ],
+)
+async def test_invalid_tool_invocation_result_is_one_safe_internal_failure(
+    bad_result: object,
+) -> None:
+    class InvalidResultTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            del node
+            self.calls.append(cast(AgentAction, action).action_type)
+            return bad_result
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, ())
+    context = replace_context(context, tools=InvalidResultTools(tools.registry))
+
+    state = cast(
+        AgentState,
+        await build_agent_graph().ainvoke(
+            new_agent_state(run_id="invalid-tool-result", query=QUERY),
+            context=context,
+        ),
+    )
+
+    assert state["final_answer"] is not None
+    assert state["final_answer"].status is FinalStatus.INTERNAL_ERROR
+    assert state["final_answer"].stop_reason is StopReason.INTERNAL_ERROR
+    assert state["governance"].execute_calls == 1
+    assert state["governance"].action_loops == 1
+    assert state["action_loop_pending"] is False
+    execute_observations = tuple(
+        item for item in state["observations"] if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    execute_traces = tuple(
+        item for item in state["tool_call_traces"] if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    assert len(execute_observations) == 1
+    assert execute_observations[0].safe_error == "internal_tool_error"
+    assert len(execute_traces) == 1
+    assert execute_traces[0].safe_error == "internal_tool_error"
+    assert [item[1] for item in events.items].count("tool.failed") == 1
+    rendered = json.dumps(
+        {
+            "observation": execute_observations[0].model_dump(mode="json"),
+            "trace": execute_traces[0].model_dump(mode="json"),
+            "events": events.items,
+        }
+    )
+    assert RAW_INVALID_TOOL_RESULT_SENTINEL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_invalid_repair_tool_result_is_one_safe_failed_repair() -> None:
+    class InvalidRepairResultTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            if node == "repair":
+                self.calls.append(cast(AgentAction, action).action_type)
+                return InvalidToolReturn()
+            return await super().invoke(action, node=node)
+
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(sql="select cast(125 as numeric) as value"),),
+        repairs=(execute_action(),),
+    )
+    context, tools, _, events, _ = context_for(
+        scripts,
+        (query_result(("value",), (("125",),)),),
+    )
+    context = replace_context(context, tools=InvalidRepairResultTools(tools.registry))
+
+    result = await run_agent(run_id="invalid-repair-tool-result", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.EXECUTION_FAILED
+    assert result.final_answer.stop_reason is StopReason.REPAIR_FAILED
+    assert result.governance.execute_calls == 2
+    assert result.governance.action_loops == 1
+    assert result.governance.repair_count == 1
+    assert result.observations[-1].safe_error == "internal_tool_error"
+    assert result.safe_trace.tool_calls[-1].safe_error == "internal_tool_error"
+    execute_observations = tuple(
+        item for item in result.observations if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    execute_traces = tuple(
+        item for item in result.safe_trace.tool_calls if item.tool_name is ActionType.EXECUTE_SQL
+    )
+    assert len(execute_observations) == len(execute_traces) == 2
+    assert [item[1] for item in events.items].count("tool.failed") == 1
+    assert RAW_INVALID_TOOL_RESULT_SENTINEL not in json.dumps(
+        {
+            "observations": [item.model_dump(mode="json") for item in execute_observations],
+            "traces": [item.model_dump(mode="json") for item in execute_traces],
+            "events": events.items,
+        }
+    )
 
 
 @pytest.mark.asyncio
