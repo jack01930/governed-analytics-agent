@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -39,6 +40,7 @@ from governed_analytics.tools import (
 SIMPLE_GMV_QUERY = "2026年6月GMV是多少？"  # noqa: RUF001
 ATTRIBUTION_QUERY = "比较六月前两周GMV，并按区域、SKU、客户分群解释下降。"  # noqa: RUF001
 PREMISE_NOT_MET_QUERY = "比较五月后两周GMV，并在没有下降时停止归因。"  # noqa: RUF001
+_AGENT_DEADLINE_SECONDS = 8.0
 
 SIMPLE_GMV_SQL = """
 select coalesce(sum(oi.net_amount), 0) as gmv
@@ -441,7 +443,11 @@ async def _run_fixture(query: str, scripts: AgentScripts, run_id: str) -> AgentR
             trace_recorder=recorder,
             clock=clock,
         )
-        return await run_agent(run_id=run_id, query=query, context=context)
+        try:
+            async with asyncio.timeout(_AGENT_DEADLINE_SECONDS):
+                return await run_agent(run_id=run_id, query=query, context=context)
+        except TimeoutError:
+            raise AssertionError("agent integration exceeded deterministic test deadline") from None
     finally:
         await engine.dispose()
 
