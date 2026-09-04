@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -14,8 +14,10 @@ from governed_analytics.agent.contracts import (
     JsonValue,
     Observation,
     ObservationContract,
+    ObservationValidation,
     RepairRecord,
     ResultShape,
+    SortKey,
     StopReason,
     TimeWindow,
     TypedMetricPlan,
@@ -43,7 +45,7 @@ def metric_info() -> MetricInfo:
         default_filters=("status = 'paid'",),
         dimensions=("region", "product", "segment"),
         source_tables=("orders",),
-        unit="CNY",
+        unit="cny",
         version="v1",
     )
 
@@ -217,8 +219,12 @@ def test_validation_accepts_strict_json_representations_for_all_column_types() -
         hypothesis_id="typed_result",
         columns=(
             ColumnContract(name="label", data_type="string", role="dimension"),
-            ColumnContract(name="quantity", data_type="integer", role="metric"),
-            ColumnContract(name="amount", data_type="decimal", role="metric"),
+            ColumnContract(
+                name="quantity", data_type="integer", role="metric", unit="count"
+            ),
+            ColumnContract(
+                name="amount", data_type="decimal", role="metric", unit="cny"
+            ),
             ColumnContract(name="active", data_type="boolean", role="metric"),
             ColumnContract(name="day", data_type="date", role="period"),
             ColumnContract(name="recorded_at", data_type="datetime", role="period"),
@@ -247,6 +253,98 @@ def test_validation_accepts_strict_json_representations_for_all_column_types() -
     assert validate_observation(execute, invalid_integer, contract).error_code == (
         "type_contract_mismatch"
     )
+
+
+@pytest.mark.parametrize(
+    ("data_type", "rows", "valid"),
+    [
+        ("string", (("10",), ("2",)), True),
+        ("integer", ((10,), (2,)), False),
+        ("decimal", (("10",), ("2",)), False),
+        ("date", (("2026-01-01",), ("2026-02-01",)), True),
+        (
+            "datetime",
+            (
+                ("2026-01-01T00:30:00+01:00",),
+                ("2026-01-01T00:00:00+00:00",),
+            ),
+            True,
+        ),
+        ("boolean", ((False,), (True,)), True),
+    ],
+)
+def test_sorting_uses_declared_column_type(
+    data_type: Literal["string", "integer", "decimal", "boolean", "date", "datetime"],
+    rows: tuple[tuple[object, ...], ...],
+    valid: bool,
+) -> None:
+    numeric = data_type in {"integer", "decimal"}
+    role: Literal["metric", "dimension"] = "metric" if numeric else "dimension"
+    contract = ObservationContract(
+        contract_id="typed_sort",
+        hypothesis_id="typed_sort",
+        columns=(
+            ColumnContract(
+                name="value",
+                data_type=data_type,
+                role=role,
+                unit="count" if numeric else None,
+            ),
+        ),
+        shape=ResultShape.TABLE,
+        min_rows=0,
+        max_rows=10,
+        key_columns=("value",),
+        order_by=(SortKey(column="value", direction="asc"),),
+    )
+    item = observation(
+        contract_id="typed_sort",
+        hypothesis_id="typed_sort",
+        columns=("value",),
+        rows=rows,
+    )
+
+    result = validate_observation(action("typed_sort"), item, contract)
+
+    assert result.valid is valid
+    assert result.error_code == (None if valid else "order_contract_mismatch")
+
+
+def test_string_tie_break_accepts_only_one_stable_top_k_order() -> None:
+    contract = ObservationContract(
+        contract_id="stable_top_k",
+        hypothesis_id="stable_top_k",
+        columns=(
+            ColumnContract(name="label", data_type="string", role="dimension"),
+            ColumnContract(name="amount", data_type="decimal", role="metric", unit="cny"),
+        ),
+        shape=ResultShape.TOP_K,
+        min_rows=1,
+        max_rows=2,
+        key_columns=("label",),
+        order_by=(
+            SortKey(column="amount", direction="desc"),
+            SortKey(column="label", direction="asc"),
+        ),
+        limit=2,
+    )
+    stable = observation(
+        contract_id="stable_top_k",
+        hypothesis_id="stable_top_k",
+        columns=contract.column_names,
+        rows=(("10", "5"), ("2", "5")),
+    )
+    unstable = observation(
+        contract_id="stable_top_k",
+        hypothesis_id="stable_top_k",
+        columns=contract.column_names,
+        rows=(("2", "5"), ("10", "5")),
+    )
+
+    assert validate_observation(action("stable_top_k"), stable, contract).valid
+    assert validate_observation(
+        action("stable_top_k"), unstable, contract
+    ).error_code == "order_contract_mismatch"
 
 
 def test_ratio_requires_null_exactly_for_zero_denominator() -> None:
@@ -346,6 +444,55 @@ def test_evidence_is_emitted_only_for_one_validated_execute_observation() -> Non
         update={"valid": False, "error_code": "type_contract_mismatch"}
     )
     assert extract_evidence(execute, item, invalid, contract) == ()
+
+
+def test_evidence_recomputes_validation_and_rejects_forged_or_stale_markers() -> None:
+    contract = answer_contract().contract("region_contribution")
+    execute = action("region_contribution")
+    valid_item = observation(rows=(("华南", "12"), ("华北", "10")))
+    valid_marker = validate_observation(execute, valid_item, contract)
+    forged = ObservationValidation(
+        observation_id=valid_item.observation_id,
+        contract_id=contract.contract_id,
+        valid=True,
+    )
+    wrong_columns = observation(
+        columns=("area", "loss"),
+        rows=(("华南", "12"),),
+        observation_id=valid_item.observation_id,
+    )
+    wrong_order = observation(
+        rows=(("华南", "10"), ("华北", "12")),
+        observation_id=valid_item.observation_id,
+    )
+    truncated = observation(
+        truncated=True,
+        observation_id=valid_item.observation_id,
+    )
+
+    assert extract_evidence(execute, valid_item, valid_marker, contract)
+    assert extract_evidence(execute, wrong_columns, forged, contract) == ()
+    assert extract_evidence(execute, wrong_order, valid_marker, contract) == ()
+    assert extract_evidence(execute, truncated, valid_marker, contract) == ()
+
+
+def test_evidence_uses_contract_units_without_column_name_guessing() -> None:
+    contract = answer_contract().contract("segment_contribution")
+    item = observation(
+        contract_id=contract.contract_id,
+        columns=contract.column_names,
+        rows=(("new", "50", "40", "-10"),),
+    )
+    execute = action(contract.contract_id)
+    validation = validate_observation(execute, item, contract)
+
+    evidence = extract_evidence(execute, item, validation, contract)
+
+    assert {entry.claim_key: entry.unit for entry in evidence} == {
+        "previous_gmv": "cny",
+        "current_gmv": "cny",
+        "delta": "cny",
+    }
 
 
 def test_attribution_assessment_requires_decline_then_all_three_dimensions() -> None:

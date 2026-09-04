@@ -398,6 +398,19 @@ class ColumnContract(_FrozenModel):
     data_type: Literal["string", "integer", "decimal", "boolean", "date", "datetime"]
     role: Literal["dimension", "metric", "period", "identifier"]
     nullable: bool = False
+    unit: Identifier | None = None
+
+    @model_validator(mode="after")
+    def _validate_unit(self) -> ColumnContract:
+        requires_unit = self.role == "metric" and self.data_type in {
+            "integer",
+            "decimal",
+        }
+        if requires_unit and self.unit is None:
+            raise ValueError("numeric metric columns require unit")
+        if not requires_unit and self.unit is not None:
+            raise ValueError("only numeric metric columns may carry unit")
+        return self
 
 
 class TypedMetricPlan(_FrozenModel):

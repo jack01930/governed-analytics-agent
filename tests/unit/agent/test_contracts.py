@@ -58,7 +58,11 @@ def test_answer_contract_has_distinct_subcontracts_for_attribution() -> None:
     comparison = ObservationContract(
         contract_id="gmv_comparison",
         hypothesis_id="confirm_decline",
-        columns=(ColumnContract(name="current_gmv", data_type="decimal", role="metric"),),
+        columns=(
+            ColumnContract(
+                name="current_gmv", data_type="decimal", role="metric", unit="cny"
+            ),
+        ),
         shape=ResultShape.SCALAR,
         min_rows=1,
         max_rows=1,
@@ -82,7 +86,11 @@ def test_answer_contract_covers_every_required_hypothesis() -> None:
     comparison = ObservationContract(
         contract_id="gmv_comparison",
         hypothesis_id="confirm_decline",
-        columns=(ColumnContract(name="current_gmv", data_type="decimal", role="metric"),),
+        columns=(
+            ColumnContract(
+                name="current_gmv", data_type="decimal", role="metric", unit="cny"
+            ),
+        ),
         shape=ResultShape.SCALAR,
         min_rows=1,
         max_rows=1,
@@ -94,6 +102,19 @@ def test_answer_contract_covers_every_required_hypothesis() -> None:
             required_hypotheses=("confirm_decline", "channel_contribution"),
             observation_contracts=(comparison,),
         )
+
+
+def test_numeric_metric_columns_require_units_and_other_columns_forbid_them() -> None:
+    with pytest.raises(ValidationError, match="numeric metric columns require unit"):
+        ColumnContract(name="amount", data_type="decimal", role="metric")
+    with pytest.raises(ValidationError, match="only numeric metric columns may carry unit"):
+        ColumnContract(name="region", data_type="string", role="dimension", unit="cny")
+
+    column = ColumnContract(
+        name="orders", data_type="integer", role="metric", unit="count"
+    )
+
+    assert column.unit == "count"
 
 
 def test_action_cannot_request_finish_or_omit_execute_contract() -> None:

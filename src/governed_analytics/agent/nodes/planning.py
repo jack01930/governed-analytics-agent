@@ -38,6 +38,8 @@ def _simple_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerContrac
         raise ValueError("simple plans require exactly one metric_value hypothesis")
     if not set(plan.dimensions).issubset(metric.dimensions):
         raise ValueError("plan dimension is not allowed by MetricInfo")
+    if plan.top_k is not None and not plan.dimensions:
+        raise ValueError("Top-K plans require at least one key dimension")
 
     column_names = (*plan.dimensions, plan.metric_id)
     available = set(column_names)
@@ -51,6 +53,12 @@ def _simple_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerContrac
     order_by.extend(
         SortKey(column=column, direction="asc")
         for column in plan.tie_break
+        if column not in ordered_columns
+    )
+    ordered_columns = {item.column for item in order_by}
+    order_by.extend(
+        SortKey(column=column, direction="asc")
+        for column in plan.dimensions
         if column not in ordered_columns
     )
     if plan.top_k is not None:
@@ -78,6 +86,7 @@ def _simple_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerContrac
             role="metric",
             nullable=plan.zero_denominator_policy == "return_null"
             and plan.denominator is not None,
+            unit=metric.unit,
         )
     )
     observation_contract = ObservationContract(
@@ -133,7 +142,16 @@ def _attribution_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerCo
         raise ValueError("GMV attribution dimensions must be region, product, and segment")
     if not _ATTRIBUTION_DIMENSIONS.issubset(metric.dimensions):
         raise ValueError("MetricInfo does not support all GMV attribution dimensions")
-    if tuple(item.hypothesis_id for item in plan.hypotheses) != _ATTRIBUTION_HYPOTHESES:
+    expected_hypotheses = (
+        ("confirm_decline", "confirm_decline", None),
+        ("region_contribution", "dimension_contribution", "region"),
+        ("sku_contribution", "dimension_contribution", "product"),
+        ("segment_contribution", "dimension_contribution", "segment"),
+    )
+    actual_hypotheses = tuple(
+        (item.hypothesis_id, item.kind, item.dimension) for item in plan.hypotheses
+    )
+    if actual_hypotheses != expected_hypotheses:
         raise ValueError("GMV attribution hypotheses must use the fixed governed identifiers")
 
     limit = plan.top_k or _DEFAULT_TOP_K
@@ -141,13 +159,18 @@ def _attribution_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerCo
         contract_id="gmv_comparison",
         hypothesis_id="confirm_decline",
         columns=(
-            ColumnContract(name="current_gmv", data_type="decimal", role="metric"),
-            ColumnContract(name="previous_gmv", data_type="decimal", role="metric"),
+            ColumnContract(
+                name="current_gmv", data_type="decimal", role="metric", unit=metric.unit
+            ),
+            ColumnContract(
+                name="previous_gmv", data_type="decimal", role="metric", unit=metric.unit
+            ),
             ColumnContract(
                 name="change_rate",
                 data_type="decimal",
                 role="metric",
                 nullable=True,
+                unit="ratio",
             ),
         ),
         shape=ResultShape.SINGLE_ROW,
@@ -155,7 +178,9 @@ def _attribution_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerCo
         max_rows=1,
     )
     monetary_metric = (
-        ColumnContract(name="gmv_loss", data_type="decimal", role="metric"),
+        ColumnContract(
+            name="gmv_loss", data_type="decimal", role="metric", unit=metric.unit
+        ),
     )
     region = _top_k_contract(
         contract_id="region_contribution",
@@ -177,9 +202,15 @@ def _attribution_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerCo
         contract_id="segment_contribution",
         dimension="segment",
         metric_columns=(
-            ColumnContract(name="previous_gmv", data_type="decimal", role="metric"),
-            ColumnContract(name="current_gmv", data_type="decimal", role="metric"),
-            ColumnContract(name="delta", data_type="decimal", role="metric"),
+            ColumnContract(
+                name="previous_gmv", data_type="decimal", role="metric", unit=metric.unit
+            ),
+            ColumnContract(
+                name="current_gmv", data_type="decimal", role="metric", unit=metric.unit
+            ),
+            ColumnContract(
+                name="delta", data_type="decimal", role="metric", unit=metric.unit
+            ),
         ),
         order_column="delta",
         order_direction="asc",
@@ -199,6 +230,8 @@ def compile_answer_contract(
     """Compile only governed result shapes from a typed plan and metric catalog entry."""
 
     _require_metric_binding(plan, metric)
+    if plan.top_k is not None and plan.top_k > 500:
+        raise ValueError("top_k cannot exceed the 500-row QueryResult limit")
     if plan.analysis_type is AnalysisType.SIMPLE:
         return _simple_contract(plan, metric)
     if plan.analysis_type is AnalysisType.ATTRIBUTION:

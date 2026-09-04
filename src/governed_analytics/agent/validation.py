@@ -8,7 +8,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from itertools import pairwise
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import ValidationError
 
@@ -145,30 +145,62 @@ def _valid_type(value: object, column: ColumnContract) -> bool:
     return False
 
 
-def _compare(left: object, right: object, sort: SortKey) -> int:
+def _compare(
+    left: object,
+    right: object,
+    sort: SortKey,
+    column: ColumnContract,
+) -> int:
     if left is None or right is None:
         if left is right:
             return 0
         left_first = sort.nulls == "first"
         return -1 if (left is None) == left_first else 1
-    left_decimal = _decimal(left)
-    right_decimal = _decimal(right)
-    if left_decimal is not None and right_decimal is not None:
-        comparison = (left_decimal > right_decimal) - (left_decimal < right_decimal)
+    if column.data_type == "decimal":
+        decimal_left = _decimal(left)
+        decimal_right = _decimal(right)
+        if decimal_left is None or decimal_right is None:
+            raise ValueError("validated decimal sort value is missing")
+        comparison = (decimal_left > decimal_right) - (decimal_left < decimal_right)
+    elif column.data_type == "integer":
+        integer_left = cast(int, left)
+        integer_right = cast(int, right)
+        comparison = (integer_left > integer_right) - (integer_left < integer_right)
+    elif column.data_type == "boolean":
+        boolean_left = cast(bool, left)
+        boolean_right = cast(bool, right)
+        comparison = (boolean_left > boolean_right) - (boolean_left < boolean_right)
+    elif column.data_type == "date":
+        date_left = date.fromisoformat(cast(str, left))
+        date_right = date.fromisoformat(cast(str, right))
+        comparison = (date_left > date_right) - (date_left < date_right)
+    elif column.data_type == "datetime":
+        datetime_left = datetime.fromisoformat(cast(str, left))
+        datetime_right = datetime.fromisoformat(cast(str, right))
+        comparison = (datetime_left > datetime_right) - (
+            datetime_left < datetime_right
+        )
     else:
-        comparison = (str(left) > str(right)) - (str(left) < str(right))
+        string_left = cast(str, left)
+        string_right = cast(str, right)
+        comparison = (string_left > string_right) - (string_left < string_right)
     return comparison if sort.direction == "asc" else -comparison
 
 
 def _ordered(
     rows: tuple[tuple[object, ...], ...],
-    columns: tuple[str, ...],
-    order_by: tuple[SortKey, ...],
+    contract: ObservationContract,
 ) -> bool:
-    indexes = {name: index for index, name in enumerate(columns)}
+    indexes = {name: index for index, name in enumerate(contract.column_names)}
+    columns = {column.name: column for column in contract.columns}
     for left, right in pairwise(rows):
-        for sort in order_by:
-            comparison = _compare(left[indexes[sort.column]], right[indexes[sort.column]], sort)
+        for sort in contract.order_by:
+            comparison = _compare(
+                left[indexes[sort.column]],
+                right[indexes[sort.column]],
+                sort,
+                columns[sort.column],
+            )
             if comparison < 0:
                 break
             if comparison > 0:
@@ -255,7 +287,7 @@ def validate_observation(
     keys = tuple(tuple(row[indexes[name]] for name in contract.key_columns) for row in result.rows)
     if len(keys) != len(set(keys)):
         return _invalid(observation, contract, "key_not_unique", repairable=True)
-    if contract.order_by and not _ordered(result.rows, result.columns, contract.order_by):
+    if contract.order_by and not _ordered(result.rows, contract):
         return _invalid(
             observation, contract, "order_contract_mismatch", repairable=True
         )
@@ -288,8 +320,10 @@ def extract_evidence(
 ) -> tuple[EvidenceItem, ...]:
     """Project numeric claims only after a valid, one-to-one Execute validation."""
 
+    recomputed = validate_observation(action, observation, contract)
     if (
-        not validation.valid
+        recomputed != validation
+        or not recomputed.valid
         or validation.observation_id != observation.observation_id
         or validation.contract_id != contract.contract_id
         or action.action_type is not ActionType.EXECUTE_SQL
@@ -339,15 +373,7 @@ def extract_evidence(
                     dimensions=dimensions,
                     stance=stance,
                     numeric_value=numeric_value,
-                    unit=(
-                        "ratio"
-                        if numeric_value is not None and column.name.endswith("rate")
-                        else "cny"
-                        if numeric_value is not None and "gmv" in column.name
-                        else "metric_unit"
-                        if numeric_value is not None
-                        else None
-                    ),
+                    unit=column.unit if numeric_value is not None else None,
                     verified=True,
                 )
             )
