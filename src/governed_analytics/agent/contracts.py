@@ -939,7 +939,12 @@ class FinalAnswer(_FrozenModel):
             raise ValueError("result summary contains unsafe or evaluation-only fields")
         allowed: dict[FinalStatus, set[StopReason]] = {
             FinalStatus.COMPLETED: {StopReason.ANSWER_COMPLETE, StopReason.PREMISE_NOT_MET},
-            FinalStatus.PARTIAL: {StopReason.EVIDENCE_PARTIAL, StopReason.RESULT_TRUNCATED},
+            FinalStatus.PARTIAL: {
+                StopReason.EVIDENCE_PARTIAL,
+                StopReason.RESULT_TRUNCATED,
+                StopReason.SQL_TIMEOUT,
+                StopReason.TASK_TIMEOUT,
+            },
             FinalStatus.CLARIFICATION_REQUIRED: {StopReason.MISSING_REQUIRED_FIELDS},
             FinalStatus.REFUSED: {
                 StopReason.UNSAFE_REQUEST,
@@ -957,7 +962,6 @@ class FinalAnswer(_FrozenModel):
                 StopReason.EXECUTE_LIMIT,
                 StopReason.PROFILE_LIMIT,
                 StopReason.ANALYSIS_LOOP_LIMIT,
-                StopReason.TASK_TIMEOUT,
             },
             FinalStatus.POLICY_BLOCKED: {
                 StopReason.SQL_POLICY_REJECTED,
@@ -966,6 +970,7 @@ class FinalAnswer(_FrozenModel):
             FinalStatus.MODEL_UNAVAILABLE: {StopReason.MODEL_UNAVAILABLE},
             FinalStatus.EXECUTION_FAILED: {
                 StopReason.SQL_TIMEOUT,
+                StopReason.TASK_TIMEOUT,
                 StopReason.DATABASE_ERROR,
                 StopReason.STRUCTURED_OUTPUT_INVALID,
                 StopReason.PLAN_INVALID,

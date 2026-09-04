@@ -27,6 +27,8 @@ from governed_analytics.agent.state import AgentState
 from governed_analytics.agent.validation import assess_evidence
 from governed_analytics.runtime.budgets import BudgetExceeded
 
+_TIMEOUT_REASONS = frozenset({StopReason.SQL_TIMEOUT, StopReason.TASK_TIMEOUT})
+
 
 def _assessment(state: AgentState) -> EvidenceAssessment | None:
     if not state["plan_revisions"]:
@@ -184,7 +186,6 @@ def _status_for_reason(reason: StopReason) -> FinalStatus:
         StopReason.EXECUTE_LIMIT,
         StopReason.PROFILE_LIMIT,
         StopReason.ANALYSIS_LOOP_LIMIT,
-        StopReason.TASK_TIMEOUT,
     }:
         return FinalStatus.BUDGET_EXHAUSTED
     if reason in {StopReason.SQL_POLICY_REJECTED, StopReason.SENSITIVE_RESULT_BLOCKED}:
@@ -218,6 +219,28 @@ def _deterministic_answer(state: AgentState) -> FinalAnswer:
             completed_dimensions=completed,
             missing_dimensions=gaps,
             limitations=("result_truncated",),
+            result_summary=_result_summary(state),
+        )
+    if state["stop_reason"] in _TIMEOUT_REASONS:
+        reason = state["stop_reason"]
+        assert reason is not None
+        if verified:
+            return FinalAnswer(
+                status=FinalStatus.PARTIAL,
+                stop_reason=reason,
+                answer="已返回超时前验证通过的部分证据, 分析尚未完整。",
+                evidence_ids=tuple(item.evidence_id for item in verified),
+                completed_dimensions=completed,
+                missing_dimensions=gaps,
+                limitations=(f"stopped:{reason.value}",),
+                result_summary=_result_summary(state),
+            )
+        return FinalAnswer(
+            status=FinalStatus.EXECUTION_FAILED,
+            stop_reason=reason,
+            answer="分析在形成可验证证据前超时。",
+            missing_dimensions=gaps,
+            limitations=(f"stopped:{reason.value}",),
             result_summary=_result_summary(state),
         )
     if assessment is not None and assessment.complete:

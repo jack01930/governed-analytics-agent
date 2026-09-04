@@ -1425,6 +1425,54 @@ async def test_result_truncated_preserves_reason_with_existing_verified_evidence
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [StopReason.SQL_TIMEOUT, StopReason.TASK_TIMEOUT])
+async def test_timeout_without_evidence_is_execution_failed_and_preserves_reason(
+    reason: StopReason,
+) -> None:
+    context, _, _, _, _ = context_for(scripts_for(QUERY), ())
+    state = new_agent_state(run_id=f"no-evidence-{reason.value}", query=QUERY)
+    state["stop_reason"] = reason
+
+    delta = await finalize(state, Runtime(context=context))
+
+    answer = delta["final_answer"]
+    assert isinstance(answer, FinalAnswer)
+    assert answer.status is FinalStatus.EXECUTION_FAILED
+    assert answer.stop_reason is reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [StopReason.SQL_TIMEOUT, StopReason.TASK_TIMEOUT])
+async def test_timeout_with_verified_evidence_is_partial_and_preserves_reason(
+    reason: StopReason,
+) -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(),),
+        synthesis_output=synthesis(),
+    )
+    context, _, _, _, _ = context_for(scripts, (query_result(),))
+    state = cast(
+        AgentState,
+        await build_agent_graph().ainvoke(
+            new_agent_state(run_id=f"evidence-{reason.value}", query=QUERY),
+            context=context,
+        ),
+    )
+    state["final_answer"] = None
+    state["stop_reason"] = reason
+
+    delta = await finalize(state, Runtime(context=context))
+
+    answer = delta["final_answer"]
+    assert isinstance(answer, FinalAnswer)
+    assert answer.status is FinalStatus.PARTIAL
+    assert answer.stop_reason is reason
+    assert answer.evidence_ids == tuple(item.evidence_id for item in state["evidence"])
+
+
+@pytest.mark.asyncio
 async def test_select_star_is_output_policy_blocked_before_backend() -> None:
     scripts = scripts_for(
         QUERY,

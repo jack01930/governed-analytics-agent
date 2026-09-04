@@ -31,8 +31,7 @@ _MONEY = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 _MAX_SEQUENCE = 2**63 - 1
 _SENSITIVE_IDENTIFIER = re.compile(
     r"(?:^|[_.:-])(?:api[_-]?key|apikey|secret|password|token|authorization|bearer|"
-    r"prompt|payload|endpoint|provider|credential|credentials|raw|parameters?|sql)"
-    r"(?:$|[_.:-])|^(?:sk|pk)-",
+    r"prompt|payload|endpoint)(?:$|[_.:-])|^(?:sk|pk)-",
     re.IGNORECASE,
 )
 
@@ -170,7 +169,9 @@ _STOP_REASONS = frozenset(
 _TERMINAL_REASONS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         "completed": frozenset({"answer_complete", "premise_not_met"}),
-        "partial": frozenset({"evidence_partial", "result_truncated"}),
+        "partial": frozenset(
+            {"evidence_partial", "result_truncated", "sql_timeout", "task_timeout"}
+        ),
         "clarification_required": frozenset({"missing_required_fields"}),
         "refused": frozenset({"unsafe_request", "sensitive_data_request"}),
         "unsupported": frozenset({"unsupported_analysis", "unsupported_data_domain"}),
@@ -183,7 +184,6 @@ _TERMINAL_REASONS: Mapping[str, frozenset[str]] = MappingProxyType(
                 "execute_limit",
                 "profile_limit",
                 "analysis_loop_limit",
-                "task_timeout",
             }
         ),
         "policy_blocked": frozenset({"sql_policy_rejected", "sensitive_result_blocked"}),
@@ -191,6 +191,7 @@ _TERMINAL_REASONS: Mapping[str, frozenset[str]] = MappingProxyType(
         "execution_failed": frozenset(
             {
                 "sql_timeout",
+                "task_timeout",
                 "database_error",
                 "structured_output_invalid",
                 "plan_invalid",

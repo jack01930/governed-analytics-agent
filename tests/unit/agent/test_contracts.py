@@ -59,9 +59,7 @@ def test_answer_contract_has_distinct_subcontracts_for_attribution() -> None:
         contract_id="gmv_comparison",
         hypothesis_id="confirm_decline",
         columns=(
-            ColumnContract(
-                name="current_gmv", data_type="decimal", role="metric", unit="cny"
-            ),
+            ColumnContract(name="current_gmv", data_type="decimal", role="metric", unit="cny"),
         ),
         shape=ResultShape.SCALAR,
         min_rows=1,
@@ -87,9 +85,7 @@ def test_answer_contract_covers_every_required_hypothesis() -> None:
         contract_id="gmv_comparison",
         hypothesis_id="confirm_decline",
         columns=(
-            ColumnContract(
-                name="current_gmv", data_type="decimal", role="metric", unit="cny"
-            ),
+            ColumnContract(name="current_gmv", data_type="decimal", role="metric", unit="cny"),
         ),
         shape=ResultShape.SCALAR,
         min_rows=1,
@@ -110,9 +106,7 @@ def test_numeric_metric_columns_require_units_and_other_columns_forbid_them() ->
     with pytest.raises(ValidationError, match="only numeric metric columns may carry unit"):
         ColumnContract(name="region", data_type="string", role="dimension", unit="cny")
 
-    column = ColumnContract(
-        name="orders", data_type="integer", role="metric", unit="count"
-    )
+    column = ColumnContract(name="orders", data_type="integer", role="metric", unit="count")
 
     assert column.unit == "count"
 
@@ -288,9 +282,7 @@ def test_structured_request_repair_preserves_only_bound_schema_and_safe_instruct
         max_output_tokens=128,
     )
 
-    repair = request.for_repair(
-        failure_category=AgentModelErrorCategory.INVALID_STRUCTURE
-    )
+    repair = request.for_repair(failure_category=AgentModelErrorCategory.INVALID_STRUCTURE)
 
     assert request.output_schema_name == "BehaviorDecision"
     assert repair.purpose == "repair"
@@ -458,6 +450,33 @@ def test_final_answer_result_summary_rejects_sensitive_aliases(unsafe_key: str) 
             stop_reason=StopReason.ANSWER_COMPLETE,
             answer="done",
             result_summary={"metrics": {unsafe_key: "hidden"}},
+        )
+
+
+@pytest.mark.parametrize("reason", [StopReason.SQL_TIMEOUT, StopReason.TASK_TIMEOUT])
+def test_timeout_terminal_statuses_preserve_the_timeout_reason(reason: StopReason) -> None:
+    failed = FinalAnswer(
+        status=FinalStatus.EXECUTION_FAILED,
+        stop_reason=reason,
+        answer="timed out",
+    )
+    partial = FinalAnswer(
+        status=FinalStatus.PARTIAL,
+        stop_reason=reason,
+        answer="partial timeout",
+        evidence_ids=("evidence-1",),
+    )
+
+    assert failed.stop_reason is reason
+    assert partial.stop_reason is reason
+
+
+def test_task_timeout_is_never_a_budget_exhausted_terminal() -> None:
+    with pytest.raises(ValidationError):
+        FinalAnswer(
+            status=FinalStatus.BUDGET_EXHAUSTED,
+            stop_reason=StopReason.TASK_TIMEOUT,
+            answer="not a budget outcome",
         )
 
 

@@ -411,7 +411,7 @@ async def test_every_wire_event_rejects_extra_keys(
                 "tool_name": "execute_sql",
                 "purpose": "p",
                 "query_id": "a" * 64,
-                "columns": ("raw_sql",),
+                "columns": ("secret_token",),
                 "row_count": 1,
                 "possibly_truncated": False,
             },
@@ -487,6 +487,72 @@ async def test_terminal_status_and_stop_reason_must_match() -> None:
             "run-1",
             {"final_status": "completed", "stop_reason": "internal_error"},
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["sql_timeout", "task_timeout"])
+@pytest.mark.parametrize("final_status", ["execution_failed", "partial"])
+async def test_terminal_timeout_statuses_preserve_the_timeout_reason(
+    final_status: str,
+    reason: str,
+) -> None:
+    store = InMemoryEventStore()
+    await store.create_run("run-1")
+
+    event = await store.emit_terminal(
+        "run-1", {"final_status": final_status, "stop_reason": reason}
+    )
+
+    assert event.data == MappingProxyType({"final_status": final_status, "stop_reason": reason})
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_timeout_rejects_budget_exhausted() -> None:
+    store = InMemoryEventStore()
+    await store.create_run("run-1")
+    with pytest.raises(InvalidRunEvent):
+        await store.emit_terminal(
+            "run-1",
+            {"final_status": "budget_exhausted", "stop_reason": "task_timeout"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_task7_safe_raw_sql_identifiers_cross_the_bound_sink() -> None:
+    store = InMemoryEventStore()
+    await store.create_run("run-1")
+    sink = BoundEventSink(store, "run-1")
+
+    await sink.emit(
+        "build_plan",
+        "plan.created",
+        {
+            "plan_id": "sql_plan",
+            "revision": 1,
+            "analysis_type": "simple",
+            "metric_id": "provider_metric",
+            "hypothesis_ids": ("raw_hypothesis",),
+        },
+    )
+    await sink.emit(
+        "invoke_tool",
+        "tool.completed",
+        {
+            "tool_name": "execute_sql",
+            "purpose": "credential_contract",
+            "query_id": "a" * 64,
+            "columns": ("raw_value", "parameter_count"),
+            "row_count": 1,
+            "possibly_truncated": False,
+        },
+    )
+    await store.emit_terminal(
+        "run-1", {"final_status": "completed", "stop_reason": "answer_complete"}
+    )
+    events = [event async for event in store.stream("run-1", after_sequence=0)]
+    event = next(event for event in events if event.type == "tool.completed")
+
+    assert event.data["columns"] == ("raw_value", "parameter_count")
 
 
 @pytest.mark.asyncio
