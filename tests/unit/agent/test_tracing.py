@@ -210,6 +210,7 @@ def test_agent_run_result_rejects_validation_for_non_execute_or_wrong_contract()
     validation = ObservationValidation(
         observation_id="observation-1",
         contract_id="metric_value_contract",
+        validation_fingerprint="f" * 64,
         valid=True,
     )
 
@@ -253,6 +254,7 @@ def test_agent_run_result_rejects_verified_evidence_without_matching_valid_valid
     invalid_validation = ObservationValidation(
         observation_id="observation-1",
         contract_id="metric_value_contract",
+        validation_fingerprint="f" * 64,
         valid=False,
         error_code="wrong_shape",
     )
@@ -306,6 +308,7 @@ def test_agent_run_result_final_answer_only_references_verified_evidence() -> No
     validation = ObservationValidation(
         observation_id="observation-1",
         contract_id="metric_value_contract",
+        validation_fingerprint="f" * 64,
         valid=True,
     )
 

@@ -120,6 +120,20 @@ def test_simple_plan_compiles_scalar_or_grouped_contract() -> None:
     assert grouped.observation_contracts[0].shape == ResultShape.TABLE
     assert grouped.observation_contracts[0].column_names == ("region", "gmv")
     assert grouped.observation_contracts[0].key_columns == ("region",)
+    assert grouped.observation_contracts[0].order_by == ()
+
+
+def test_grouped_table_preserves_only_explicit_sort_and_tie_break() -> None:
+    plan = simple_plan(dimensions=("region", "product")).model_copy(
+        update={
+            "sort": (SortKey(column="gmv", direction="desc"),),
+            "tie_break": ("region",),
+        }
+    )
+
+    contract = compile_answer_contract(plan, metric_info()).observation_contracts[0]
+
+    assert tuple(item.column for item in contract.order_by) == ("gmv", "region")
 
 
 @pytest.mark.parametrize(

@@ -161,6 +161,7 @@ def test_observation_validation_is_linked_by_id_without_copying_payload() -> Non
     validation = ObservationValidation(
         observation_id="observation-1",
         contract_id="metric_value_contract",
+        validation_fingerprint="f" * 64,
         valid=False,
         error_code="missing_column",
         repairable=True,
@@ -404,6 +405,7 @@ def test_observation_validation_state_combinations_are_strict() -> None:
         ObservationValidation(
             observation_id="observation-1",
             contract_id="metric_value_contract",
+            validation_fingerprint="f" * 64,
             valid=True,
             error_code="missing_column",
         )
@@ -411,7 +413,24 @@ def test_observation_validation_state_combinations_are_strict() -> None:
         ObservationValidation(
             observation_id="observation-1",
             contract_id="metric_value_contract",
+            validation_fingerprint="f" * 64,
             valid=False,
+        )
+
+
+def test_observation_validation_requires_strict_input_fingerprint() -> None:
+    with pytest.raises(ValidationError):
+        ObservationValidation(  # type: ignore[call-arg]
+            observation_id="observation-1",
+            contract_id="metric_value_contract",
+            valid=True,
+        )
+    with pytest.raises(ValidationError):
+        ObservationValidation(
+            observation_id="observation-1",
+            contract_id="metric_value_contract",
+            validation_fingerprint="not-a-hash",
+            valid=True,
         )
 
 

@@ -561,6 +561,7 @@ class AnalysisAction(AgentAction):
 class ObservationValidation(_FrozenModel):
     observation_id: Identifier
     contract_id: Identifier
+    validation_fingerprint: QueryId
     valid: bool
     error_code: Identifier | None = None
     repairable: bool = False

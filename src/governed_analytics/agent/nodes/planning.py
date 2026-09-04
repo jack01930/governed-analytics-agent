@@ -55,13 +55,13 @@ def _simple_contract(plan: TypedMetricPlan, metric: MetricInfo) -> AnswerContrac
         for column in plan.tie_break
         if column not in ordered_columns
     )
-    ordered_columns = {item.column for item in order_by}
-    order_by.extend(
-        SortKey(column=column, direction="asc")
-        for column in plan.dimensions
-        if column not in ordered_columns
-    )
     if plan.top_k is not None:
+        ordered_columns = {item.column for item in order_by}
+        order_by.extend(
+            SortKey(column=column, direction="asc")
+            for column in plan.dimensions
+            if column not in ordered_columns
+        )
         shape = ResultShape.TOP_K
         max_rows = plan.top_k
         limit = plan.top_k

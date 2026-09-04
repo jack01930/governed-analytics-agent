@@ -1,3 +1,5 @@
+import json
+import re
 from datetime import UTC, datetime
 from typing import Literal, cast
 
@@ -347,6 +349,31 @@ def test_string_tie_break_accepts_only_one_stable_top_k_order() -> None:
     ).error_code == "order_contract_mismatch"
 
 
+def test_grouped_table_without_order_contract_accepts_any_valid_row_order() -> None:
+    contract = ObservationContract(
+        contract_id="unordered_group",
+        hypothesis_id="unordered_group",
+        columns=(
+            ColumnContract(name="region", data_type="string", role="dimension"),
+            ColumnContract(name="amount", data_type="decimal", role="metric", unit="cny"),
+        ),
+        shape=ResultShape.TABLE,
+        min_rows=0,
+        max_rows=10,
+        key_columns=("region",),
+    )
+    descending_labels = observation(
+        contract_id="unordered_group",
+        hypothesis_id="unordered_group",
+        columns=contract.column_names,
+        rows=(("z", "1"), ("a", "2")),
+    )
+
+    assert validate_observation(
+        action("unordered_group"), descending_labels, contract
+    ).valid
+
+
 def test_ratio_requires_null_exactly_for_zero_denominator() -> None:
     contract = answer_contract().contract("gmv_comparison")
     zero = observation(
@@ -454,6 +481,7 @@ def test_evidence_recomputes_validation_and_rejects_forged_or_stale_markers() ->
     forged = ObservationValidation(
         observation_id=valid_item.observation_id,
         contract_id=contract.contract_id,
+        validation_fingerprint="f" * 64,
         valid=True,
     )
     wrong_columns = observation(
@@ -474,6 +502,74 @@ def test_evidence_recomputes_validation_and_rejects_forged_or_stale_markers() ->
     assert extract_evidence(execute, wrong_columns, forged, contract) == ()
     assert extract_evidence(execute, wrong_order, valid_marker, contract) == ()
     assert extract_evidence(execute, truncated, valid_marker, contract) == ()
+
+
+def test_validation_fingerprint_binds_all_current_valid_inputs_and_evidence_id() -> None:
+    contract = answer_contract().contract("region_contribution")
+    execute = action("region_contribution")
+    original = observation(rows=(("华南", "12"), ("华北", "10")))
+    original_marker = validate_observation(execute, original, contract)
+    original_evidence = extract_evidence(execute, original, original_marker, contract)
+
+    changed_query = observation(
+        query_id="b" * 64,
+        rows=(("华南", "12"), ("华北", "10")),
+        observation_id=original.observation_id,
+    )
+    changed_query_marker = validate_observation(execute, changed_query, contract)
+    changed_query_evidence = extract_evidence(
+        execute, changed_query, changed_query_marker, contract
+    )
+
+    changed_rows = observation(
+        rows=(("华南", "13"), ("华北", "9")),
+        observation_id=original.observation_id,
+    )
+    changed_rows_marker = validate_observation(execute, changed_rows, contract)
+    changed_rows_evidence = extract_evidence(
+        execute, changed_rows, changed_rows_marker, contract
+    )
+
+    private_action_sentinel = "private_action_sentinel"
+    changed_action = execute.model_copy(
+        update={
+            "purpose": "changed purpose",
+            "arguments": {"sql": private_action_sentinel},
+        }
+    )
+    changed_action_marker = validate_observation(changed_action, original, contract)
+    changed_action_evidence = extract_evidence(
+        changed_action, original, changed_action_marker, contract
+    )
+
+    assert original_evidence and changed_query_evidence
+    assert changed_rows_evidence and changed_action_evidence
+    assert extract_evidence(execute, changed_query, original_marker, contract) == ()
+    assert extract_evidence(execute, changed_rows, original_marker, contract) == ()
+    assert extract_evidence(changed_action, original, original_marker, contract) == ()
+    fingerprints = {
+        original_marker.validation_fingerprint,
+        changed_query_marker.validation_fingerprint,
+        changed_rows_marker.validation_fingerprint,
+        changed_action_marker.validation_fingerprint,
+    }
+    assert len(fingerprints) == 4
+    assert all(re.fullmatch(r"[0-9a-f]{64}", item) for item in fingerprints)
+    evidence_ids = {
+        original_evidence[0].evidence_id,
+        changed_query_evidence[0].evidence_id,
+        changed_rows_evidence[0].evidence_id,
+        changed_action_evidence[0].evidence_id,
+    }
+    assert len(evidence_ids) == 4
+    rendered = json.dumps(
+        {
+            "fingerprints": tuple(fingerprints),
+            "evidence_ids": tuple(evidence_ids),
+        }
+    )
+    assert private_action_sentinel not in rendered
+    assert "华南" not in rendered
 
 
 def test_evidence_uses_contract_units_without_column_name_guessing() -> None:

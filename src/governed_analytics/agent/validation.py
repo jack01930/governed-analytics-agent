@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from datetime import date, datetime
@@ -58,9 +59,29 @@ _ATTRIBUTION_DIMENSIONS = frozenset(
 )
 
 
+def _validation_fingerprint(
+    action: AgentAction,
+    observation: Observation,
+    contract: ObservationContract,
+) -> str:
+    canonical = json.dumps(
+        {
+            "action": action.model_dump(mode="json"),
+            "observation": observation.model_dump(mode="json"),
+            "contract": contract.model_dump(mode="json"),
+        },
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(bytes(canonical, "utf-8")).hexdigest()
+
+
 def _invalid(
     observation: Observation,
     contract: ObservationContract,
+    validation_fingerprint: str,
     error_code: str,
     *,
     repairable: bool = False,
@@ -68,6 +89,7 @@ def _invalid(
     return ObservationValidation(
         observation_id=observation.observation_id,
         contract_id=contract.contract_id,
+        validation_fingerprint=validation_fingerprint,
         valid=False,
         error_code=error_code,
         repairable=repairable and error_code in _REPAIRABLE_ERRORS,
@@ -77,29 +99,46 @@ def _invalid(
 def _restore_query_result(
     observation: Observation,
     contract: ObservationContract,
+    validation_fingerprint: str,
 ) -> QueryResult | ObservationValidation:
     payload = observation.payload
     if not isinstance(payload, Mapping):
-        return _invalid(observation, contract, "invalid_query_result_payload")
+        return _invalid(
+            observation, contract, validation_fingerprint, "invalid_query_result_payload"
+        )
     rows = payload.get("rows")
     columns = payload.get("columns")
     if not isinstance(rows, tuple) or not isinstance(columns, tuple):
-        return _invalid(observation, contract, "invalid_query_result_payload")
+        return _invalid(
+            observation, contract, validation_fingerprint, "invalid_query_result_payload"
+        )
     if any(not isinstance(row, tuple) or len(row) != len(columns) for row in rows):
-        return _invalid(observation, contract, "row_shape_mismatch", repairable=True)
+        return _invalid(
+            observation,
+            contract,
+            validation_fingerprint,
+            "row_shape_mismatch",
+            repairable=True,
+        )
     if payload.get("row_count") != len(rows):
-        return _invalid(observation, contract, "query_result_mismatch")
+        return _invalid(
+            observation, contract, validation_fingerprint, "query_result_mismatch"
+        )
     try:
         result = QueryResult.model_validate(dict(payload))
     except (TypeError, ValueError, ValidationError):
-        return _invalid(observation, contract, "invalid_query_result_payload")
+        return _invalid(
+            observation, contract, validation_fingerprint, "invalid_query_result_payload"
+        )
     if (
         result.query_id != observation.query_id
         or result.columns != observation.columns
         or result.row_count != observation.row_count
         or result.possibly_truncated != observation.possibly_truncated
     ):
-        return _invalid(observation, contract, "query_result_mismatch")
+        return _invalid(
+            observation, contract, validation_fingerprint, "query_result_mismatch"
+        )
     return result
 
 
@@ -229,6 +268,7 @@ def validate_observation(
 ) -> ObservationValidation:
     """Validate one Execute Observation against exactly one referenced contract."""
 
+    validation_fingerprint = _validation_fingerprint(action, observation, contract)
     if (
         action.action_type is not ActionType.EXECUTE_SQL
         or observation.tool_name is not ActionType.EXECUTE_SQL
@@ -237,23 +277,32 @@ def validate_observation(
         or action.hypothesis_id != contract.hypothesis_id
         or observation.hypothesis_id != contract.hypothesis_id
     ):
-        return _invalid(observation, contract, "observation_link_mismatch")
+        return _invalid(
+            observation, contract, validation_fingerprint, "observation_link_mismatch"
+        )
     if not observation.ok:
         return _invalid(
             observation,
             contract,
+            validation_fingerprint,
             _FAILED_TOOL_ERRORS.get(observation.safe_error or "", "unknown_tool_error"),
         )
     if observation.possibly_truncated and not contract.allow_truncation:
-        return _invalid(observation, contract, "result_truncated")
+        return _invalid(
+            observation, contract, validation_fingerprint, "result_truncated"
+        )
 
-    restored = _restore_query_result(observation, contract)
+    restored = _restore_query_result(observation, contract, validation_fingerprint)
     if isinstance(restored, ObservationValidation):
         return restored
     result = restored
     if result.columns != contract.column_names:
         return _invalid(
-            observation, contract, "column_contract_mismatch", repairable=True
+            observation,
+            contract,
+            validation_fingerprint,
+            "column_contract_mismatch",
+            repairable=True,
         )
     if not contract.min_rows <= result.row_count <= contract.max_rows:
         error_code = (
@@ -261,9 +310,21 @@ def validate_observation(
             if contract.limit is not None and result.row_count > contract.limit
             else "row_count_mismatch"
         )
-        return _invalid(observation, contract, error_code, repairable=True)
+        return _invalid(
+            observation,
+            contract,
+            validation_fingerprint,
+            error_code,
+            repairable=True,
+        )
     if contract.limit is not None and result.row_count > contract.limit:
-        return _invalid(observation, contract, "limit_exceeded", repairable=True)
+        return _invalid(
+            observation,
+            contract,
+            validation_fingerprint,
+            "limit_exceeded",
+            repairable=True,
+        )
 
     for row in result.rows:
         for value, column in zip(row, contract.columns, strict=True):
@@ -271,29 +332,51 @@ def validate_observation(
                 return _invalid(
                     observation,
                     contract,
+                    validation_fingerprint,
                     "nullable_contract_mismatch",
                     repairable=True,
                 )
             if not _valid_type(value, column):
                 return _invalid(
-                    observation, contract, "type_contract_mismatch", repairable=True
+                    observation,
+                    contract,
+                    validation_fingerprint,
+                    "type_contract_mismatch",
+                    repairable=True,
                 )
 
     ratio_error = _ratio_policy_error(contract, result)
     if ratio_error is not None:
-        return _invalid(observation, contract, ratio_error, repairable=True)
+        return _invalid(
+            observation,
+            contract,
+            validation_fingerprint,
+            ratio_error,
+            repairable=True,
+        )
 
     indexes = {name: index for index, name in enumerate(result.columns)}
     keys = tuple(tuple(row[indexes[name]] for name in contract.key_columns) for row in result.rows)
     if len(keys) != len(set(keys)):
-        return _invalid(observation, contract, "key_not_unique", repairable=True)
+        return _invalid(
+            observation,
+            contract,
+            validation_fingerprint,
+            "key_not_unique",
+            repairable=True,
+        )
     if contract.order_by and not _ordered(result.rows, contract):
         return _invalid(
-            observation, contract, "order_contract_mismatch", repairable=True
+            observation,
+            contract,
+            validation_fingerprint,
+            "order_contract_mismatch",
+            repairable=True,
         )
     return ObservationValidation(
         observation_id=observation.observation_id,
         contract_id=contract.contract_id,
+        validation_fingerprint=validation_fingerprint,
         valid=True,
     )
 
@@ -337,7 +420,9 @@ def extract_evidence(
         or observation.query_id is None
     ):
         return ()
-    restored = _restore_query_result(observation, contract)
+    restored = _restore_query_result(
+        observation, contract, recomputed.validation_fingerprint
+    )
     if isinstance(restored, ObservationValidation):
         return ()
 
@@ -361,6 +446,8 @@ def extract_evidence(
                         + sha256(
                             (
                                 f"{observation.observation_id}:"
+                                f"{observation.query_id}:"
+                                f"{recomputed.validation_fingerprint}:"
                                 f"{row_index}:{column.name}"
                             ).encode()
                         ).hexdigest()
