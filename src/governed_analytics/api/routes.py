@@ -45,14 +45,11 @@ health_router = APIRouter(tags=["health"])
 class _SseEventIterator:
     def __init__(self, opened: AsyncIterator[RunEvent]) -> None:
         self._opened = opened
-        self._closed = False
 
     def __aiter__(self) -> _SseEventIterator:
         return self
 
     async def __anext__(self) -> dict[str, str]:
-        if self._closed:
-            raise StopAsyncIteration
         try:
             event = await anext(self._opened)
         except BaseException:
@@ -65,9 +62,6 @@ class _SseEventIterator:
         }
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
         close = getattr(self._opened, "aclose", None)
         if callable(close):
             await close()

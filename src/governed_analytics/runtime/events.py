@@ -723,28 +723,84 @@ class _OpenedEventStream:
     ) -> None:
         self._buffer = buffer
         self._iterator = iterator
+        self._state_lock = asyncio.Lock()
+        self._read_task: asyncio.Task[RunEvent] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._closing = False
         self._closed = False
+        self._lease_released = False
 
     def __aiter__(self) -> Self:
         return self
 
     async def __anext__(self) -> RunEvent:
-        if self._closed:
-            raise StopAsyncIteration
+        async with self._state_lock:
+            if self._closing or self._closed:
+                raise StopAsyncIteration
+            if self._read_task is not None:
+                raise RuntimeError("event stream read already in progress")
+            read_task = asyncio.create_task(anext(self._iterator))
+            self._read_task = read_task
         try:
-            return await anext(self._iterator)
+            event = await read_task
+        except asyncio.CancelledError:
+            if not read_task.done():
+                read_task.cancel()
+            await asyncio.gather(read_task, return_exceptions=True)
+            await self.aclose()
+            raise
         except StopAsyncIteration:
             await self.aclose()
             raise
+        except BaseException:
+            await self.aclose()
+            raise
+        finally:
+            async with self._state_lock:
+                if self._read_task is read_task:
+                    self._read_task = None
+        async with self._state_lock:
+            if self._closing or self._closed:
+                raise StopAsyncIteration
+        return event
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        await self._iterator.aclose()
-        async with self._buffer.condition:
-            self._buffer.active_streams -= 1
-            self._buffer.condition.notify_all()
+        async with self._state_lock:
+            if self._close_task is None:
+                self._closing = True
+                self._close_task = asyncio.create_task(self._finish_close())
+                self._close_task.add_done_callback(self._consume_close_result)
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    async def _finish_close(self) -> None:
+        close_error: BaseException | None = None
+        try:
+            async with self._state_lock:
+                read_task = self._read_task
+            if read_task is not None and not read_task.done():
+                read_task.cancel()
+            if read_task is not None:
+                await asyncio.gather(read_task, return_exceptions=True)
+            try:
+                await self._iterator.aclose()
+            except BaseException as error:
+                close_error = error
+        finally:
+            async with self._buffer.condition:
+                if not self._lease_released:
+                    self._buffer.active_streams -= 1
+                    self._lease_released = True
+                    self._buffer.condition.notify_all()
+            async with self._state_lock:
+                self._closed = close_error is None
+        if close_error is not None:
+            raise close_error
+
+    @staticmethod
+    def _consume_close_result(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
 
 
 def _utc_now() -> datetime:
@@ -1027,11 +1083,7 @@ def parse_last_event_id(
         safe_run_id = _safe_run_id(run_id)
     except InvalidRunEvent:
         raise InvalidEventCursor() from None
-    if (
-        type(high_water_mark) is not int
-        or high_water_mark < 0
-        or high_water_mark > _MAX_SEQUENCE
-    ):
+    if type(high_water_mark) is not int or high_water_mark < 0 or high_water_mark > _MAX_SEQUENCE:
         raise InvalidEventCursor()
     if value is None:
         return None

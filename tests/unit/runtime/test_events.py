@@ -4,7 +4,7 @@ import asyncio
 import json
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any
@@ -294,6 +294,68 @@ async def test_open_stream_acquires_retention_lease_before_first_iteration() -> 
     assert await store.delete_run("run-1", owner_token=owner) is False
     await unopened.aclose()
     assert await store.delete_run("run-1", owner_token=owner) is True
+
+
+class CloseFailureEventStore(InMemoryEventStore):
+    async def _stream_buffer(
+        self,
+        buffer: Any,
+        *,
+        after_sequence: int | None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        try:
+            async for item in super()._stream_buffer(
+                buffer,
+                after_sequence=after_sequence,
+            ):
+                yield item
+        finally:
+            raise RuntimeError("close failed")
+
+
+@pytest.mark.asyncio
+async def test_opened_stream_sequential_and_concurrent_close_is_idempotent() -> None:
+    store = InMemoryEventStore()
+    owner = object()
+    await store.create_run("run-1", owner_token=owner)
+    opened = await store.open_stream("run-1", after_sequence=None)
+
+    results = await asyncio.gather(opened.aclose(), opened.aclose())
+    assert all(result is None for result in results)
+    await opened.aclose()
+    await opened.aclose()
+    assert store._runs["run-1"].active_streams == 0
+    assert await store.delete_run(
+        "run-1",
+        allow_unstarted=True,
+        owner_token=owner,
+    )
+
+
+@pytest.mark.asyncio
+async def test_opened_stream_close_failure_still_releases_lease_once() -> None:
+    store = CloseFailureEventStore()
+    owner = object()
+    await store.create_run("run-1", owner_token=owner)
+    await store.emit_terminal(
+        "run-1",
+        {"final_status": "completed", "stop_reason": "answer_complete"},
+        owner_token=owner,
+    )
+    opened = await store.open_stream("run-1", after_sequence=None)
+    await anext(opened)
+
+    results = await asyncio.gather(
+        opened.aclose(),
+        opened.aclose(),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, RuntimeError) for result in results)
+    with pytest.raises(RuntimeError, match="close failed"):
+        await opened.aclose()
+    assert store._runs["run-1"].active_streams == 0
+    assert await store.delete_run("run-1", owner_token=owner)
 
 
 @pytest.mark.asyncio

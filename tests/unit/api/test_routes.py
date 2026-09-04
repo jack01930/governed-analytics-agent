@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -176,6 +176,25 @@ class ExceptionalEventStore(CannedEventStore):
     ) -> AsyncIterator[RunEvent]:
         del run_id, after_sequence
         return self.opened
+
+
+class PendingReadEventStore(InMemoryEventStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_started = asyncio.Event()
+
+    async def _stream_buffer(
+        self,
+        buffer: Any,
+        *,
+        after_sequence: int | None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        self.read_started.set()
+        async for item in super()._stream_buffer(
+            buffer,
+            after_sequence=after_sequence,
+        ):
+            yield item
 
 
 def factory_for(
@@ -503,6 +522,151 @@ async def test_sse_response_asgi_disconnect_closes_lease_while_send_is_blocked()
     )
 
     assert await events.delete_run("run-1", owner_token=owner) is True
+
+
+@pytest.mark.asyncio
+async def test_sse_response_disconnect_while_next_event_is_pending_releases_lease() -> None:
+    events = PendingReadEventStore()
+    owner = object()
+    await events.create_run("run-1", owner_token=owner)
+    response = await sse_events("run-1", direct_container(events))
+    iterator = cast(Any, response.body_iterator)
+
+    async def send(_message: Message) -> None:
+        return None
+
+    async def receive() -> Message:
+        await events.read_started.wait()
+        return {"type": "http.disconnect"}
+
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/v1/analyses/run-1/events",
+        "raw_path": b"/v1/analyses/run-1/events",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    await asyncio.wait_for(response(scope, receive, send), timeout=1)
+    await asyncio.sleep(0)
+
+    assert events._runs["run-1"].active_streams == 0
+    assert iterator._opened._read_task is None
+    assert iterator._opened._close_task.done()
+    assert await events.delete_run(
+        "run-1",
+        allow_unstarted=True,
+        owner_token=owner,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sse_response_disconnect_races_with_terminal_event_arrival() -> None:
+    async def run_race(allow_arrival_to_run: bool) -> None:
+        events = PendingReadEventStore()
+        owner = object()
+        await events.create_run("run-1", owner_token=owner)
+        response = await sse_events("run-1", direct_container(events))
+        arrival: asyncio.Task[RunEvent] | None = None
+
+        async def send(_message: Message) -> None:
+            return None
+
+        async def receive() -> Message:
+            nonlocal arrival
+            await events.read_started.wait()
+            arrival = asyncio.create_task(
+                events.emit_terminal(
+                    "run-1",
+                    {
+                        "final_status": "completed",
+                        "stop_reason": "answer_complete",
+                    },
+                    owner_token=owner,
+                )
+            )
+            if allow_arrival_to_run:
+                await asyncio.sleep(0)
+            return {"type": "http.disconnect"}
+
+        await asyncio.wait_for(
+            response(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "scheme": "http",
+                    "path": "/v1/analyses/run-1/events",
+                    "raw_path": b"/v1/analyses/run-1/events",
+                    "query_string": b"",
+                    "headers": [],
+                    "client": ("testclient", 50000),
+                    "server": ("testserver", 80),
+                },
+                receive,
+                send,
+            ),
+            timeout=1,
+        )
+        assert arrival is not None
+        await arrival
+        assert await events.delete_run("run-1", owner_token=owner)
+
+    await run_race(False)
+    await run_race(True)
+
+
+@pytest.mark.asyncio
+async def test_sse_response_task_cancellation_and_close_share_one_completion() -> None:
+    events = PendingReadEventStore()
+    owner = object()
+    await events.create_run("run-1", owner_token=owner)
+    response = await sse_events("run-1", direct_container(events))
+    iterator = cast(Any, response.body_iterator)
+    read = asyncio.create_task(anext(iterator))
+    await events.read_started.wait()
+
+    read.cancel()
+    results = await asyncio.gather(
+        read,
+        iterator.aclose(),
+        iterator.aclose(),
+        return_exceptions=True,
+    )
+
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert all(result is None for result in results[1:])
+    await iterator.aclose()
+    assert await events.delete_run(
+        "run-1",
+        allow_unstarted=True,
+        owner_token=owner,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sse_response_unstarted_sequential_and_concurrent_close_is_idempotent() -> None:
+    events = InMemoryEventStore()
+    owner = object()
+    await events.create_run("run-1", owner_token=owner)
+    response = await sse_events("run-1", direct_container(events))
+    iterator = cast(Any, response.body_iterator)
+
+    results = await asyncio.gather(iterator.aclose(), iterator.aclose())
+    assert all(result is None for result in results)
+    await iterator.aclose()
+    await iterator.aclose()
+    assert await events.delete_run(
+        "run-1",
+        allow_unstarted=True,
+        owner_token=owner,
+    )
 
 
 @pytest.mark.asyncio
