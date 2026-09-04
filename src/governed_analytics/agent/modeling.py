@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from governed_analytics.agent.contracts import (
     AgentFinishReason,
+    AgentModelErrorCategory,
     GovernanceSnapshot,
     ModelCallTrace,
     ModelReservation,
@@ -30,7 +31,12 @@ from governed_analytics.agent.ports import (
 )
 from governed_analytics.runtime.budgets import BudgetExceeded
 
-STRUCTURE_ERRORS = frozenset({"invalid_json", "invalid_structure"})
+STRUCTURE_ERRORS = frozenset(
+    {
+        AgentModelErrorCategory.INVALID_JSON,
+        AgentModelErrorCategory.INVALID_STRUCTURE,
+    }
+)
 _REPAIRABLE_PURPOSES = frozenset({"behavior", "plan", "action", "synthesis"})
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
@@ -45,19 +51,37 @@ def _safe_model(value: object) -> str:
     return "unknown-model"
 
 
-def _stop_reason(category: str) -> StopReason:
+def _safe_error_category(error: AgentModelError) -> AgentModelErrorCategory:
+    try:
+        return AgentModelErrorCategory(error.category)
+    except (TypeError, ValueError):
+        return AgentModelErrorCategory.PROVIDER_CALL_FAILED
+
+
+def _safe_nonnegative_integer(value: object) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _safe_finish_reason(value: object) -> AgentFinishReason | None:
+    return value if isinstance(value, AgentFinishReason) else None
+
+
+def _stop_reason(category: AgentModelErrorCategory) -> StopReason:
     if category in {
-        "provider_call_failed",
-        "missing_content",
-        "invalid_content_type",
-        "missing_usage",
-        "invalid_usage",
-        "missing_model",
+        AgentModelErrorCategory.PROVIDER_CALL_FAILED,
+        AgentModelErrorCategory.MISSING_CONTENT,
+        AgentModelErrorCategory.INVALID_CONTENT_TYPE,
+        AgentModelErrorCategory.MISSING_USAGE,
+        AgentModelErrorCategory.INVALID_USAGE,
+        AgentModelErrorCategory.MISSING_MODEL,
     }:
         return StopReason.MODEL_UNAVAILABLE
-    if category in STRUCTURE_ERRORS or category == "schema_identity_mismatch":
+    if (
+        category in STRUCTURE_ERRORS
+        or category is AgentModelErrorCategory.SCHEMA_IDENTITY_MISMATCH
+    ):
         return StopReason.STRUCTURED_OUTPUT_INVALID
-    if category == "repair_failed":
+    if category is AgentModelErrorCategory.REPAIR_FAILED:
         return StopReason.REPAIR_FAILED
     return StopReason.INTERNAL_ERROR
 
@@ -84,7 +108,7 @@ class StructuredModelInvoker:
     ) -> StructuredInvocation[T]:
         if request.output_schema_name != output_type.__name__:
             raise StructuredInvocationError(
-                category="schema_identity_mismatch",
+                category=AgentModelErrorCategory.SCHEMA_IDENTITY_MISMATCH,
                 traces=(),
                 repair_record=None,
                 governance=self._budget.snapshot,
@@ -95,14 +119,14 @@ class StructuredModelInvoker:
             reservation = self._budget.reserve_model_call(request)
         except BudgetExceeded as error:
             raise self._invocation_error(
-                category="budget_exceeded",
+                category=AgentModelErrorCategory.BUDGET_EXCEEDED,
                 traces=(),
                 repair_record=None,
                 stop_reason=error.reason,
             ) from None
         except Exception:
             raise self._invocation_error(
-                category="budget_reservation_failed",
+                category=AgentModelErrorCategory.BUDGET_RESERVATION_FAILED,
                 traces=(),
                 repair_record=None,
                 stop_reason=StopReason.INTERNAL_ERROR,
@@ -123,7 +147,7 @@ class StructuredModelInvoker:
             )
         except Exception:
             safe_error = AgentModelError(
-                "provider_call_failed",
+                AgentModelErrorCategory.PROVIDER_CALL_FAILED,
                 provider_model=_safe_model(self._model.model),
             )
             return await self._handle_first_model_error(
@@ -137,7 +161,7 @@ class StructuredModelInvoker:
         self._append(trace)
         if trace.outcome == "failed":
             raise StructuredInvocationError(
-                category=trace.safe_error or "accounting_contract_failed",
+                category=AgentModelErrorCategory.ACCOUNTING_CONTRACT_FAILED,
                 traces=(trace,),
                 repair_record=None,
                 governance=governance,
@@ -158,18 +182,19 @@ class StructuredModelInvoker:
         reservation: ModelReservation,
         error: AgentModelError,
     ) -> StructuredInvocation[T]:
+        category = _safe_error_category(error)
         governance = self._fail_closed(reservation)
         first_trace = self._error_trace(request, reservation, error, outcome="failed")
         self._append(first_trace)
         traces = (first_trace,)
 
-        if not self._allows_repair(request, error):
+        if not self._allows_repair(request, category, error):
             raise StructuredInvocationError(
-                category=error.category,
+                category=category,
                 traces=traces,
                 repair_record=None,
                 governance=governance,
-                stop_reason=_stop_reason(error.category),
+                stop_reason=_stop_reason(category),
             )
 
         repair_id = uuid4().hex
@@ -177,10 +202,10 @@ class StructuredModelInvoker:
             governance = self._budget.consume_repair()
         except BudgetExceeded as blocked:
             record = self._repair_record(
-                repair_id, request, error.category, outcome="blocked"
+                repair_id, request, category, outcome="blocked"
             )
             raise StructuredInvocationError(
-                category="repair_blocked",
+                category=AgentModelErrorCategory.REPAIR_BLOCKED,
                 traces=traces,
                 repair_record=record,
                 governance=self._budget.snapshot,
@@ -188,25 +213,25 @@ class StructuredModelInvoker:
             ) from None
         except Exception:
             record = self._repair_record(
-                repair_id, request, error.category, outcome="blocked"
+                repair_id, request, category, outcome="blocked"
             )
             raise StructuredInvocationError(
-                category="repair_blocked",
+                category=AgentModelErrorCategory.REPAIR_BLOCKED,
                 traces=traces,
                 repair_record=record,
                 governance=self._budget.snapshot,
                 stop_reason=StopReason.INTERNAL_ERROR,
             ) from None
 
-        repair_request = request.for_repair(failure_category=error.category)
+        repair_request = request.for_repair(failure_category=category)
         try:
             repair_reservation = self._budget.reserve_model_call(repair_request)
         except BudgetExceeded as blocked:
             record = self._repair_record(
-                repair_id, request, error.category, outcome="blocked"
+                repair_id, request, category, outcome="blocked"
             )
             raise StructuredInvocationError(
-                category="repair_blocked",
+                category=AgentModelErrorCategory.REPAIR_BLOCKED,
                 traces=traces,
                 repair_record=record,
                 governance=self._budget.snapshot,
@@ -214,10 +239,10 @@ class StructuredModelInvoker:
             ) from None
         except Exception:
             record = self._repair_record(
-                repair_id, request, error.category, outcome="blocked"
+                repair_id, request, category, outcome="blocked"
             )
             raise StructuredInvocationError(
-                category="repair_blocked",
+                category=AgentModelErrorCategory.REPAIR_BLOCKED,
                 traces=traces,
                 repair_record=record,
                 governance=governance,
@@ -231,6 +256,7 @@ class StructuredModelInvoker:
             self._cancel(repair_reservation, repair_request, started_at=started_at)
             raise
         except AgentModelError as repair_error:
+            repair_category = _safe_error_category(repair_error)
             governance = self._fail_closed(repair_reservation)
             repair_trace = self._error_trace(
                 repair_request,
@@ -240,10 +266,10 @@ class StructuredModelInvoker:
             )
             self._append(repair_trace)
             record = self._repair_record(
-                repair_id, request, error.category, outcome="failed"
+                repair_id, request, category, outcome="failed"
             )
             raise StructuredInvocationError(
-                category=repair_error.category,
+                category=repair_category,
                 traces=(first_trace, repair_trace),
                 repair_record=record,
                 governance=governance,
@@ -252,7 +278,7 @@ class StructuredModelInvoker:
         except Exception:
             governance = self._fail_closed(repair_reservation)
             safe_error = AgentModelError(
-                "provider_call_failed",
+                AgentModelErrorCategory.PROVIDER_CALL_FAILED,
                 provider_model=_safe_model(self._model.model),
             )
             repair_trace = self._error_trace(
@@ -263,10 +289,10 @@ class StructuredModelInvoker:
             )
             self._append(repair_trace)
             record = self._repair_record(
-                repair_id, request, error.category, outcome="failed"
+                repair_id, request, category, outcome="failed"
             )
             raise StructuredInvocationError(
-                category="provider_call_failed",
+                category=AgentModelErrorCategory.PROVIDER_CALL_FAILED,
                 traces=(first_trace, repair_trace),
                 repair_record=record,
                 governance=governance,
@@ -279,16 +305,16 @@ class StructuredModelInvoker:
         self._append(repair_trace)
         if repair_trace.outcome == "failed":
             record = self._repair_record(
-                repair_id, request, error.category, outcome="failed"
+                repair_id, request, category, outcome="failed"
             )
             raise StructuredInvocationError(
-                category=repair_trace.safe_error or "accounting_contract_failed",
+                category=AgentModelErrorCategory.ACCOUNTING_CONTRACT_FAILED,
                 traces=(first_trace, repair_trace),
                 repair_record=record,
                 governance=governance,
                 stop_reason=StopReason.REPAIR_FAILED,
             )
-        record = self._repair_record(repair_id, request, error.category, outcome="success")
+        record = self._repair_record(repair_id, request, category, outcome="success")
         return StructuredInvocation(
             result=repaired_result,
             traces=(first_trace, repair_trace),
@@ -315,7 +341,7 @@ class StructuredModelInvoker:
                 purpose=request.purpose,
                 provider_model=_safe_model(result.provider_model),
                 outcome="failed",
-                safe_error="accounting_contract_failed",
+                safe_error=AgentModelErrorCategory.ACCOUNTING_CONTRACT_FAILED.value,
                 latency_ms=result.latency_ms,
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,
@@ -351,7 +377,7 @@ class StructuredModelInvoker:
             purpose=request.purpose,
             provider_model=_safe_model(self._model.model),
             outcome="cancelled",
-            safe_error="cancelled",
+            safe_error=AgentModelErrorCategory.CANCELLED.value,
             latency_ms=max(0, round((self._clock.monotonic() - started_at) * 1000)),
             input_tokens=0,
             output_tokens=0,
@@ -369,16 +395,18 @@ class StructuredModelInvoker:
         *,
         outcome: str,
     ) -> ModelCallTrace:
+        category = _safe_error_category(error)
+        finish_reason = _safe_finish_reason(error.finish_reason)
         return ModelCallTrace(
             purpose=request.purpose,
             provider_model=_safe_model(error.provider_model or self._model.model),
             outcome=outcome,  # type: ignore[arg-type]
-            safe_error=error.category,
-            latency_ms=max(0, error.latency_ms),
-            input_tokens=max(0, error.input_tokens),
-            output_tokens=max(0, error.output_tokens),
-            finish_reason=error.finish_reason,
-            output_truncated=error.output_truncated,
+            safe_error=category.value,
+            latency_ms=_safe_nonnegative_integer(error.latency_ms),
+            input_tokens=_safe_nonnegative_integer(error.input_tokens),
+            output_tokens=_safe_nonnegative_integer(error.output_tokens),
+            finish_reason=finish_reason,
+            output_truncated=finish_reason is AgentFinishReason.LENGTH,
             estimated_cost_cny=reservation.reserved_cost_cny,
         )
 
@@ -392,11 +420,16 @@ class StructuredModelInvoker:
         self._trace_recorder.append_model((trace,))
 
     @staticmethod
-    def _allows_repair(request: StructuredModelRequest, error: AgentModelError) -> bool:
+    def _allows_repair(
+        request: StructuredModelRequest,
+        category: AgentModelErrorCategory,
+        error: AgentModelError,
+    ) -> bool:
+        finish_reason = _safe_finish_reason(error.finish_reason)
         return (
             request.purpose in _REPAIRABLE_PURPOSES
-            and error.category in STRUCTURE_ERRORS
-            and error.finish_reason
+            and category in STRUCTURE_ERRORS
+            and finish_reason
             not in {AgentFinishReason.LENGTH, AgentFinishReason.CONTENT_FILTER}
         )
 
@@ -404,7 +437,7 @@ class StructuredModelInvoker:
     def _repair_record(
         repair_id: str,
         request: StructuredModelRequest,
-        error_code: str,
+        error_code: AgentModelErrorCategory,
         *,
         outcome: str,
     ) -> RepairRecord:
@@ -412,14 +445,14 @@ class StructuredModelInvoker:
             repair_id=repair_id,
             kind="structured_output",
             target=request.output_schema_name,
-            error_code=error_code,
+            error_code=error_code.value,
             outcome=outcome,  # type: ignore[arg-type]
         )
 
     def _invocation_error(
         self,
         *,
-        category: str,
+        category: AgentModelErrorCategory,
         traces: tuple[ModelCallTrace, ...],
         repair_record: RepairRecord | None,
         stop_reason: StopReason,

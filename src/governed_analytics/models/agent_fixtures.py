@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from pydantic import BaseModel, ValidationError
 
 from governed_analytics.agent.contracts import (
+    AgentModelErrorCategory,
     ModelPurpose,
     ModelUsage,
     StructuredModelRequest,
@@ -30,6 +31,7 @@ class ScriptedAgentModel:
     def __init__(self, scripts: AgentScripts) -> None:
         self._scripts = scripts
         self._ordinals: dict[tuple[str, ModelPurpose], int] = {}
+        self._current_query: str | None = None
 
     @property
     def model(self) -> str:
@@ -41,23 +43,36 @@ class ScriptedAgentModel:
         output_type: type[T],
     ) -> StructuredModelResult[T]:
         if request.output_schema_name != output_type.__name__:
-            raise AgentModelError("schema_identity_mismatch")
+            raise AgentModelError(AgentModelErrorCategory.SCHEMA_IDENTITY_MISMATCH)
 
-        raw_query = request.user_payload.get("query")
-        if not isinstance(raw_query, str):
-            raise AgentModelError("fixture_script_mismatch", provider_model=self.model)
-        query = _normalise_query(raw_query)
+        if request.purpose == "repair":
+            query = self._current_query
+        else:
+            raw_query = request.user_payload.get("query")
+            query = _normalise_query(raw_query) if isinstance(raw_query, str) else None
+            self._current_query = query
+        if query is None:
+            raise AgentModelError(
+                AgentModelErrorCategory.FIXTURE_SCRIPT_MISMATCH,
+                provider_model=self.model,
+            )
         key = (query, request.purpose)
         ordinal = self._ordinals.get(key, 0)
         try:
             script = self._scripts[query][request.purpose][ordinal]
         except (KeyError, IndexError, TypeError):
-            raise AgentModelError("fixture_script_mismatch", provider_model=self.model) from None
+            raise AgentModelError(
+                AgentModelErrorCategory.FIXTURE_SCRIPT_MISMATCH,
+                provider_model=self.model,
+            ) from None
         self._ordinals[key] = ordinal + 1
         try:
             output = output_type.model_validate(script)
         except ValidationError:
-            raise AgentModelError("invalid_structure", provider_model=self.model) from None
+            raise AgentModelError(
+                AgentModelErrorCategory.INVALID_STRUCTURE,
+                provider_model=self.model,
+            ) from None
         return StructuredModelResult(
             output=output,
             provider_model=self.model,

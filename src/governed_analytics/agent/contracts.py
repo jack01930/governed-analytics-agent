@@ -105,6 +105,28 @@ class AgentFinishReason(StrEnum):
     UNKNOWN = "unknown"
 
 
+class AgentModelErrorCategory(StrEnum):
+    """Stable allowlist for every safe Agent model-invocation failure category."""
+
+    INVALID_REQUEST = "invalid_request"
+    SCHEMA_IDENTITY_MISMATCH = "schema_identity_mismatch"
+    PROVIDER_CALL_FAILED = "provider_call_failed"
+    MISSING_CONTENT = "missing_content"
+    INVALID_CONTENT_TYPE = "invalid_content_type"
+    INVALID_JSON = "invalid_json"
+    INVALID_STRUCTURE = "invalid_structure"
+    MISSING_USAGE = "missing_usage"
+    INVALID_USAGE = "invalid_usage"
+    MISSING_MODEL = "missing_model"
+    FIXTURE_SCRIPT_MISMATCH = "fixture_script_mismatch"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    BUDGET_RESERVATION_FAILED = "budget_reservation_failed"
+    REPAIR_BLOCKED = "repair_blocked"
+    REPAIR_FAILED = "repair_failed"
+    ACCOUNTING_CONTRACT_FAILED = "accounting_contract_failed"
+    CANCELLED = "cancelled"
+
+
 class StopReason(StrEnum):
     ANSWER_COMPLETE = "answer_complete"
     PREMISE_NOT_MET = "premise_not_met"
@@ -792,14 +814,27 @@ class StructuredModelRequest(_FrozenModel):
         ).encode("utf-8")
         return serialized_envelope + bytes(512)
 
-    def for_repair(self, *, failure_category: str) -> StructuredModelRequest:
-        failure_category = _require_nonblank(failure_category)
-        payload = dict(self.user_payload)
-        payload["failure_category"] = failure_category
+    def for_repair(
+        self,
+        *,
+        failure_category: AgentModelErrorCategory | str,
+    ) -> StructuredModelRequest:
+        try:
+            safe_category = AgentModelErrorCategory(failure_category)
+        except (TypeError, ValueError):
+            raise ValueError("unsupported agent model error category") from None
         return StructuredModelRequest(
             purpose="repair",
-            system_prompt=self.system_prompt,
-            user_payload=payload,
+            system_prompt=(
+                "Return exactly one JSON object that conforms to the bound output schema."
+            ),
+            user_payload={
+                "failure_category": safe_category.value,
+                "output_schema_name": self.output_schema_name,
+                "re_output_instruction": (
+                    "Re-output the complete answer as schema-valid JSON only."
+                ),
+            },
             output_schema_name=self.output_schema_name,
             output_schema_summary=self.output_schema_summary,
             max_output_tokens=self.max_output_tokens,
@@ -1202,6 +1237,7 @@ __all__ = [
     "ActionType",
     "AgentAction",
     "AgentFinishReason",
+    "AgentModelErrorCategory",
     "AgentRunResult",
     "AnalysisAction",
     "AnalysisType",

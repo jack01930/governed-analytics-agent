@@ -8,6 +8,7 @@ import pytest
 
 from governed_analytics.agent.contracts import (
     AgentFinishReason,
+    AgentModelErrorCategory,
     BehaviorAction,
     BehaviorDecision,
     BehaviorReasonCode,
@@ -148,6 +149,100 @@ async def test_structural_error_repairs_once_and_returns_all_metadata() -> None:
     assert invocation.governance.repair_count == 1
     assert len(invocation.traces) == 2
     assert recorder.snapshot().model_calls == invocation.traces
+
+
+@pytest.mark.asyncio
+async def test_repair_call_receives_only_fixed_safe_payload() -> None:
+    model = _Model([AgentModelError("invalid_structure"), _result()])
+    request = StructuredModelRequest(
+        purpose="behavior",
+        system_prompt="SYSTEM_SENTINEL",
+        user_payload={
+            "query": "QUERY_SENTINEL",
+            "context": "CONTEXT_SENTINEL",
+            "raw_invalid_content": "RAW_RESPONSE_SENTINEL",
+        },
+        output_schema_name="BehaviorDecision",
+        output_schema_summary={"title": "BehaviorDecision", "type": "object"},
+        max_output_tokens=300,
+    )
+
+    await _invoker(model, _budget(), InMemoryTraceRecorder()).invoke(
+        request, BehaviorDecision
+    )
+
+    repair = model.calls[1]
+    assert repair.purpose == "repair"
+    assert repair.system_prompt == (
+        "Return exactly one JSON object that conforms to the bound output schema."
+    )
+    assert dict(repair.user_payload) == {
+        "failure_category": "invalid_structure",
+        "output_schema_name": "BehaviorDecision",
+        "re_output_instruction": "Re-output the complete answer as schema-valid JSON only.",
+    }
+    serialized = repair.model_dump_json()
+    assert "SYSTEM_SENTINEL" not in serialized
+    assert "QUERY_SENTINEL" not in serialized
+    assert "CONTEXT_SENTINEL" not in serialized
+    assert "RAW_RESPONSE_SENTINEL" not in serialized
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"provider_model": "https://endpoint.invalid/sk-secret"},
+        {"input_tokens": -1},
+        {"output_tokens": -1},
+        {"latency_ms": -1},
+    ],
+)
+def test_agent_model_error_rejects_unsafe_metadata_without_echo(
+    kwargs: dict[str, object],
+) -> None:
+    sentinel = next((str(value) for value in kwargs.values() if isinstance(value, str)), "")
+
+    with pytest.raises(ValueError) as raised:
+        AgentModelError(AgentModelErrorCategory.PROVIDER_CALL_FAILED, **kwargs)  # type: ignore[arg-type]
+
+    assert not sentinel or sentinel not in repr(raised.value)
+
+
+def test_agent_model_error_rejects_untrusted_category_without_echo() -> None:
+    sentinel = "https://endpoint.invalid/raw-response/sdk-exception"
+
+    with pytest.raises(ValueError) as raised:
+        AgentModelError(sentinel)
+
+    assert sentinel not in repr(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_invoker_normalizes_mutated_untrusted_error_before_safe_outputs() -> None:
+    category_sentinel = "https://endpoint.invalid/raw-response/sdk-exception"
+    model_sentinel = "sk-secret-provider/raw-response"
+    error = AgentModelError(AgentModelErrorCategory.INVALID_STRUCTURE)
+    error.category = category_sentinel  # type: ignore[assignment]
+    error.provider_model = model_sentinel
+    model = _Model([error])
+
+    with pytest.raises(StructuredInvocationError) as raised:
+        await _invoker(model, _budget(), InMemoryTraceRecorder()).invoke(
+            _request(), BehaviorDecision
+        )
+
+    safe_serialized = repr(
+        (
+            repr(raised.value),
+            raised.value.category,
+            raised.value.repair_record,
+            tuple(trace.model_dump_json() for trace in raised.value.traces),
+        )
+    )
+    assert raised.value.category == AgentModelErrorCategory.PROVIDER_CALL_FAILED
+    assert raised.value.repair_record is None
+    assert category_sentinel not in safe_serialized
+    assert model_sentinel not in safe_serialized
 
 
 @pytest.mark.asyncio

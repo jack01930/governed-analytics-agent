@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from governed_analytics.agent.contracts import (
     AgentFinishReason,
+    AgentModelErrorCategory,
     ModelUsage,
     StructuredModelRequest,
     StructuredModelResult,
@@ -59,7 +60,7 @@ def _normalise_finish_reason(value: object) -> AgentFinishReason | None:
     return known.get(value, AgentFinishReason.UNKNOWN)
 
 
-def _validation_category(error: ValidationError) -> str:
+def _validation_category(error: ValidationError) -> AgentModelErrorCategory:
     error_types = {
         item.get("type")
         for item in error.errors(
@@ -68,7 +69,11 @@ def _validation_category(error: ValidationError) -> str:
             include_input=False,
         )
     }
-    return "invalid_json" if "json_invalid" in error_types else "invalid_structure"
+    return (
+        AgentModelErrorCategory.INVALID_JSON
+        if "json_invalid" in error_types
+        else AgentModelErrorCategory.INVALID_STRUCTURE
+    )
 
 
 class OpenAICompatibleAgentModel:
@@ -77,7 +82,7 @@ class OpenAICompatibleAgentModel:
     def __init__(self, client: AsyncOpenAI, model: str) -> None:
         safe_model = _safe_model_identifier(model)
         if safe_model is None:
-            raise AgentModelError("invalid_request")
+            raise AgentModelError(AgentModelErrorCategory.INVALID_REQUEST)
         self._client = client
         self._model = safe_model
 
@@ -91,7 +96,7 @@ class OpenAICompatibleAgentModel:
         output_type: type[T],
     ) -> StructuredModelResult[T]:
         if request.output_schema_name != output_type.__name__:
-            raise AgentModelError("schema_identity_mismatch")
+            raise AgentModelError(AgentModelErrorCategory.SCHEMA_IDENTITY_MISMATCH)
 
         started_at = monotonic()
         try:
@@ -108,7 +113,10 @@ class OpenAICompatibleAgentModel:
             )
         except Exception:
             latency_ms = max(0, round((monotonic() - started_at) * 1000))
-            raise AgentModelError("provider_call_failed", latency_ms=latency_ms) from None
+            raise AgentModelError(
+                AgentModelErrorCategory.PROVIDER_CALL_FAILED,
+                latency_ms=latency_ms,
+            ) from None
         latency_ms = max(0, round((monotonic() - started_at) * 1000))
 
         provider_model_value: object = None
@@ -142,7 +150,7 @@ class OpenAICompatibleAgentModel:
         try:
             choice = response.choices[0]
         except Exception:
-            raise AgentModelError("missing_content", **metadata) from None
+            raise AgentModelError(AgentModelErrorCategory.MISSING_CONTENT, **metadata) from None
         raw_finish_reason: object = None
         with suppress(Exception):
             raw_finish_reason = choice.finish_reason
@@ -152,22 +160,22 @@ class OpenAICompatibleAgentModel:
         try:
             content = choice.message.content
         except Exception:
-            raise AgentModelError("missing_content", **metadata) from None
+            raise AgentModelError(AgentModelErrorCategory.MISSING_CONTENT, **metadata) from None
         if content is None:
-            raise AgentModelError("missing_content", **metadata)
+            raise AgentModelError(AgentModelErrorCategory.MISSING_CONTENT, **metadata)
         if not isinstance(content, str):
-            raise AgentModelError("invalid_content_type", **metadata)
+            raise AgentModelError(AgentModelErrorCategory.INVALID_CONTENT_TYPE, **metadata)
         try:
             output = output_type.model_validate_json(content)
         except ValidationError as error:
             raise AgentModelError(_validation_category(error), **metadata) from None
 
         if not usage_accessible or usage is None or not usage_fields_accessible:
-            raise AgentModelError("missing_usage", **metadata)
+            raise AgentModelError(AgentModelErrorCategory.MISSING_USAGE, **metadata)
         if input_tokens is None or output_tokens is None:
-            raise AgentModelError("invalid_usage", **metadata)
+            raise AgentModelError(AgentModelErrorCategory.INVALID_USAGE, **metadata)
         if provider_model is None:
-            raise AgentModelError("missing_model", **metadata)
+            raise AgentModelError(AgentModelErrorCategory.MISSING_MODEL, **metadata)
         return StructuredModelResult(
             output=output,
             provider_model=provider_model,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +14,7 @@ from governed_analytics.agent.contracts import (
     ActionType,
     AgentAction,
     AgentFinishReason,
+    AgentModelErrorCategory,
     GovernanceSnapshot,
     JsonValue,
     ModelCallTrace,
@@ -29,13 +31,15 @@ from governed_analytics.agent.contracts import (
     ToolInvocation,
 )
 
+_SAFE_MODEL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
 
 class AgentModelError(ValueError):
     """Stable Agent-model failure carrying only safe call-accounting metadata."""
 
     def __init__(
         self,
-        category: str,
+        category: AgentModelErrorCategory | str,
         *,
         provider_model: str | None = None,
         input_tokens: int = 0,
@@ -44,16 +48,29 @@ class AgentModelError(ValueError):
         finish_reason: AgentFinishReason | None = None,
         output_truncated: bool = False,
     ) -> None:
-        if not category.strip():
-            raise ValueError("category must not be blank")
-        self.category = category
+        try:
+            self.category = AgentModelErrorCategory(category)
+        except (TypeError, ValueError):
+            raise ValueError("unsupported agent model error category") from None
+        if provider_model is not None and (
+            _SAFE_MODEL_IDENTIFIER.fullmatch(provider_model) is None
+            or provider_model.lower().startswith(("sk-", "pk-", "bearer-"))
+        ):
+            raise ValueError("provider_model must be a safe identifier")
+        telemetry = (input_tokens, output_tokens, latency_ms)
+        if any(type(value) is not int or value < 0 for value in telemetry):
+            raise ValueError("model telemetry must be nonnegative integers")
+        if finish_reason is not None and not isinstance(finish_reason, AgentFinishReason):
+            raise ValueError("finish_reason must be normalized")
+        if output_truncated != (finish_reason is AgentFinishReason.LENGTH):
+            raise ValueError("output_truncated must match length finish_reason")
         self.provider_model = provider_model
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.latency_ms = latency_ms
         self.finish_reason = finish_reason
         self.output_truncated = output_truncated
-        super().__init__(category)
+        super().__init__(self.category.value)
 
 
 class AgentModel(Protocol):
@@ -159,7 +176,7 @@ class AgentTools(Protocol):
 class StructuredInvocationError(Exception):
     """Safe model-invocation failure with only governed diagnostic fields."""
 
-    category: str
+    category: AgentModelErrorCategory
     traces: tuple[ModelCallTrace, ...]
     repair_record: RepairRecord | None
     governance: GovernanceSnapshot
@@ -168,20 +185,21 @@ class StructuredInvocationError(Exception):
     def __init__(
         self,
         *,
-        category: str,
+        category: AgentModelErrorCategory | str,
         traces: tuple[ModelCallTrace, ...],
         repair_record: RepairRecord | None,
         governance: GovernanceSnapshot,
         stop_reason: StopReason,
     ) -> None:
-        if not category.strip():
-            raise ValueError("category must not be blank")
-        self.category = category
+        try:
+            self.category = AgentModelErrorCategory(category)
+        except (TypeError, ValueError):
+            raise ValueError("unsupported agent model error category") from None
         self.traces = traces
         self.repair_record = repair_record
         self.governance = governance
         self.stop_reason = stop_reason
-        super().__init__(category)
+        super().__init__(self.category.value)
 
 
 @dataclass(frozen=True, kw_only=True)

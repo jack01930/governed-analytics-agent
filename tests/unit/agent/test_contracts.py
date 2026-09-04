@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from governed_analytics.agent.contracts import (
     ActionType,
     AgentAction,
+    AgentModelErrorCategory,
     AnalysisAction,
     AnswerContract,
     BehaviorAction,
@@ -252,7 +253,45 @@ def test_prompt_bytes_include_provider_envelope_schema_and_fixed_protocol_overhe
     assert request.prompt_bytes() == expected_payload + bytes(512)
 
 
-def test_structured_request_repair_preserves_bound_schema() -> None:
+def test_structured_request_repair_preserves_only_bound_schema_and_safe_instruction() -> None:
+    request = StructuredModelRequest.for_output(
+        purpose="behavior",
+        system_prompt="SYSTEM_SENTINEL Return a decision.",
+        user_payload={
+            "query": "QUERY_SENTINEL",
+            "context": "CONTEXT_SENTINEL",
+            "raw_invalid_content": "RAW_RESPONSE_SENTINEL",
+        },
+        output_type=BehaviorDecision,
+        max_output_tokens=128,
+    )
+
+    repair = request.for_repair(
+        failure_category=AgentModelErrorCategory.INVALID_STRUCTURE
+    )
+
+    assert request.output_schema_name == "BehaviorDecision"
+    assert repair.purpose == "repair"
+    assert repair.system_prompt == (
+        "Return exactly one JSON object that conforms to the bound output schema."
+    )
+    assert repair.output_schema_name == request.output_schema_name
+    assert repair.output_schema_summary == request.output_schema_summary
+    assert repair.max_output_tokens == request.max_output_tokens
+    assert dict(repair.user_payload) == {
+        "failure_category": "invalid_structure",
+        "output_schema_name": "BehaviorDecision",
+        "re_output_instruction": "Re-output the complete answer as schema-valid JSON only.",
+    }
+    serialized = repair.model_dump_json()
+    assert "SYSTEM_SENTINEL" not in serialized
+    assert "QUERY_SENTINEL" not in serialized
+    assert "CONTEXT_SENTINEL" not in serialized
+    assert "RAW_RESPONSE_SENTINEL" not in serialized
+
+
+def test_structured_request_repair_rejects_untrusted_failure_category_safely() -> None:
+    sentinel = "https://endpoint.invalid/raw-response/sdk-exception"
     request = StructuredModelRequest.for_output(
         purpose="behavior",
         system_prompt="Return a decision.",
@@ -261,13 +300,10 @@ def test_structured_request_repair_preserves_bound_schema() -> None:
         max_output_tokens=128,
     )
 
-    repair = request.for_repair(failure_category="schema_validation")
+    with pytest.raises(ValueError) as raised:
+        request.for_repair(failure_category=sentinel)
 
-    assert request.output_schema_name == "BehaviorDecision"
-    assert repair.purpose == "repair"
-    assert repair.output_schema_name == request.output_schema_name
-    assert repair.output_schema_summary == request.output_schema_summary
-    assert repair.user_payload["failure_category"] == "schema_validation"
+    assert sentinel not in repr(raised.value)
 
 
 def test_structured_request_rejects_schema_name_summary_mismatch() -> None:
