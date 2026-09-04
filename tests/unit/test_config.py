@@ -108,7 +108,7 @@ def test_role_scoped_settings_load_only_their_own_url(
 )
 def test_readonly_settings_reject_invalid_driver_role_or_password(database_url: str) -> None:
     with pytest.raises(ValidationError):
-        DatabaseSettings(database_url=database_url)
+        DatabaseSettings(_env_file=None, database_url=database_url)  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize(
@@ -126,7 +126,10 @@ def test_loader_settings_reject_invalid_driver_role_or_password(
     loader_database_url: str,
 ) -> None:
     with pytest.raises(ValidationError):
-        LoaderDatabaseSettings(loader_database_url=loader_database_url)
+        LoaderDatabaseSettings(  # type: ignore[call-arg]
+            _env_file=None,
+            loader_database_url=loader_database_url,
+        )
 
 
 @pytest.mark.parametrize(
@@ -144,11 +147,15 @@ def test_migration_settings_reject_invalid_driver_role_or_password(
     migration_database_url: str,
 ) -> None:
     with pytest.raises(ValidationError):
-        MigrationDatabaseSettings(migration_database_url=migration_database_url)
+        MigrationDatabaseSettings(  # type: ignore[call-arg]
+            _env_file=None,
+            migration_database_url=migration_database_url,
+        )
 
 
 def test_percent_encoded_nonempty_password_is_valid() -> None:
     settings = MigrationDatabaseSettings(
+        _env_file=None,  # type: ignore[call-arg]
         migration_database_url=(
             "postgresql+psycopg://governed_admin:p%40ss%25word@db:5432/app"
         )
