@@ -1,5 +1,7 @@
 """Public contracts and ports for the governed analytics agent."""
 
+from typing import TYPE_CHECKING, Any
+
 from governed_analytics.agent.contracts import (
     ActionType,
     AgentAction,
@@ -45,7 +47,6 @@ from governed_analytics.agent.contracts import (
     ToolInvocation,
     TypedMetricPlan,
 )
-from governed_analytics.agent.graph import build_agent_graph, run_agent
 from governed_analytics.agent.ports import (
     AgentContext,
     AgentModel,
@@ -59,6 +60,18 @@ from governed_analytics.agent.ports import (
 )
 from governed_analytics.agent.state import AgentState, new_agent_state
 from governed_analytics.agent.tracing import InMemoryTraceRecorder
+
+if TYPE_CHECKING:
+    from governed_analytics.agent.graph import build_agent_graph, run_agent
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"build_agent_graph", "run_agent"}:
+        from governed_analytics.agent import graph
+
+        return getattr(graph, name)
+    raise AttributeError(name)
+
 
 __all__ = [
     "ActionType",
