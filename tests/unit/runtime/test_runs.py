@@ -1,0 +1,760 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from typing import Any, cast
+
+import pytest
+from pydantic import BaseModel
+
+from governed_analytics.agent.contracts import (
+    ActionType,
+    AgentRunResult,
+    EvidenceItem,
+    FinalAnswer,
+    FinalStatus,
+    GovernanceSnapshot,
+    JsonValue,
+    Observation,
+    ObservationValidation,
+    SafeTrace,
+    StopReason,
+    StructuredModelRequest,
+    StructuredModelResult,
+)
+from governed_analytics.agent.modeling import StructuredModelInvoker
+from governed_analytics.agent.ports import AgentContext
+from governed_analytics.agent.tracing import InMemoryTraceRecorder
+from governed_analytics.config import AgentRuntimeSettings
+from governed_analytics.pricing import ModelPricing
+from governed_analytics.runtime.budgets import BudgetLedger, BudgetLimits
+from governed_analytics.runtime.events import InMemoryEventStore
+from governed_analytics.runtime.events import RunNotFound as EventRunNotFound
+from governed_analytics.runtime.runs import (
+    AnalysisRunner,
+    InMemoryRunStore,
+    RunAlreadyExists,
+    RunCapacityExceeded,
+    RunnerShutdown,
+    RunNotFound,
+    RunStateConflict,
+)
+
+SENTINEL = "raw-row-secret-sentinel"
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.wall = datetime(2026, 9, 4, tzinfo=UTC)
+        self.monotonic_seconds = 0.0
+
+    def now(self) -> datetime:
+        return self.wall
+
+    def monotonic(self) -> float:
+        return self.monotonic_seconds
+
+    def advance(self, seconds: float) -> None:
+        self.wall += timedelta(seconds=seconds)
+        self.monotonic_seconds += seconds
+
+
+def completed_result(
+    run_id: str,
+    *,
+    governance: GovernanceSnapshot | None = None,
+    trace: SafeTrace | None = None,
+) -> AgentRunResult:
+    return AgentRunResult(
+        run_id=run_id,
+        behavior=None,
+        answer_contract=None,
+        observations=(),
+        observation_validations=(),
+        evidence=(),
+        evidence_gaps=(),
+        first_candidate=None,
+        repair_history=(),
+        governance=governance or GovernanceSnapshot(),
+        final_answer=FinalAnswer(
+            status=FinalStatus.COMPLETED,
+            stop_reason=StopReason.ANSWER_COMPLETE,
+            answer="分析完成。",
+        ),
+        safe_trace=trace or SafeTrace(),
+    )
+
+
+def result_with_raw_observation(run_id: str, payload: JsonValue) -> AgentRunResult:
+    query_id = "a" * 64
+    observation = Observation(
+        observation_id="observation-1",
+        tool_name=ActionType.EXECUTE_SQL,
+        purpose="contract-1",
+        ok=True,
+        hypothesis_id="hypothesis-1",
+        contract_id="contract-1",
+        query_id=query_id,
+        columns=("gmv",),
+        row_count=1,
+        payload=payload,
+    )
+    return AgentRunResult(
+        run_id=run_id,
+        behavior=None,
+        answer_contract=None,
+        observations=(observation,),
+        observation_validations=(
+            ObservationValidation(
+                observation_id="observation-1",
+                contract_id="contract-1",
+                validation_fingerprint="b" * 64,
+                valid=True,
+            ),
+        ),
+        evidence=(
+            EvidenceItem(
+                evidence_id="evidence-1",
+                observation_id="observation-1",
+                hypothesis_id="hypothesis-1",
+                contract_id="contract-1",
+                query_id=query_id,
+                claim_key="gmv",
+                stance="supports",
+                numeric_value=Decimal("125"),
+                unit="CNY",
+                verified=True,
+                limitations=("fixture only",),
+            ),
+        ),
+        evidence_gaps=("regional split unavailable",),
+        first_candidate=observation,
+        repair_history=(),
+        governance=GovernanceSnapshot(llm_calls=1),
+        final_answer=FinalAnswer(
+            status=FinalStatus.COMPLETED,
+            stop_reason=StopReason.ANSWER_COMPLETE,
+            answer="GMV 为 125 元。",
+            evidence_ids=("evidence-1",),
+            limitations=("fixture only",),
+        ),
+        safe_trace=SafeTrace(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_store_never_overwrites_and_evicts_only_expired_terminal_runs() -> None:
+    clock = FakeClock()
+    store = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+
+    await store.create("run-1", "query one")
+    await store.create("run-2", "query two")
+    with pytest.raises(RunCapacityExceeded):
+        await store.create("run-3", "query three")
+    with pytest.raises(RunAlreadyExists):
+        await store.create("run-1", "replacement")
+    await store.mark_running("run-1")
+    await store.complete("run-1", completed_result("run-1"))
+    clock.advance(3599)
+    assert await store.expired_terminal_ids() == ()
+    clock.advance(1)
+    assert await store.expired_terminal_ids() == ("run-1",)
+    assert (await store.get("run-1")).lifecycle_status == "terminal"
+    assert await store.delete_terminal("run-1") is True
+    assert (await store.get("run-2")).lifecycle_status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_store_enforces_strict_lifecycle_and_exact_deletion_states() -> None:
+    store = InMemoryRunStore(max_runs=4, retention_seconds=1, clock=FakeClock())
+    await store.create("queued", "q")
+    await store.create("running", "q")
+    await store.mark_running("running")
+
+    with pytest.raises(RunStateConflict):
+        await store.complete("queued", completed_result("queued"))
+    with pytest.raises(RunStateConflict):
+        await store.mark_running("running")
+    assert await store.delete_terminal("queued") is False
+    assert await store.delete_queued("running") is False
+    assert await store.delete_queued("queued") is True
+    with pytest.raises(RunNotFound):
+        await store.get("queued")
+
+
+@pytest.mark.asyncio
+async def test_complete_projects_agent_result_without_observation_payload() -> None:
+    store = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=FakeClock())
+    payload: dict[str, JsonValue] = {
+        "rows": ({"gmv": SENTINEL},),
+        "nested": {"raw": SENTINEL},
+    }
+    result = result_with_raw_observation("run-1", payload)
+    await store.create("run-1", "safe query")
+    await store.mark_running("run-1")
+
+    record = await store.complete("run-1", result)
+    object.__setattr__(result.final_answer, "answer", SENTINEL)
+    payload["later"] = SENTINEL
+
+    serialized = record.model_dump_json()
+    projected_for_api = json.dumps(record.model_dump(mode="json"), ensure_ascii=False)
+    assert SENTINEL not in serialized
+    assert SENTINEL not in projected_for_api
+    assert "payload" not in serialized
+    assert "rows" not in serialized
+    assert record.answer == "GMV 为 125 元。"
+    assert tuple(item.evidence_id for item in record.evidence) == ("evidence-1",)
+    assert all(item.verified for item in record.evidence)
+
+
+class ControlledTimeout:
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self.entered = asyncio.Event()
+        self._task: asyncio.Task[object] | None = None
+        self._triggered = False
+
+    async def __aenter__(self) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._task = cast(asyncio.Task[object], task)
+        self.entered.set()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        del exc, traceback
+        if self._triggered and exc_type is asyncio.CancelledError:
+            raise TimeoutError from None
+        return False
+
+    def trigger(self) -> None:
+        assert self._task is not None
+        self._triggered = True
+        self._task.cancel()
+
+
+class ControlledTimeoutFactory:
+    def __init__(self) -> None:
+        self.contexts: list[ControlledTimeout] = []
+
+    def __call__(self, seconds: float) -> ControlledTimeout:
+        context = ControlledTimeout(seconds)
+        self.contexts.append(context)
+        return context
+
+
+def settings(**overrides: object) -> AgentRuntimeSettings:
+    return AgentRuntimeSettings(  # type: ignore[call-arg]
+        _env_file=None,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def context_for(clock: FakeClock) -> AgentContext:
+    budget = BudgetLedger(
+        limits=BudgetLimits.from_settings(settings()),
+        pricing=pricing(),
+        monotonic=clock.monotonic,
+    )
+    recorder = InMemoryTraceRecorder()
+    return AgentContext(
+        model_invoker=cast(Any, object()),
+        tools=cast(Any, object()),
+        budget=budget,
+        events=cast(Any, object()),
+        trace_recorder=recorder,
+        clock=clock,
+    )
+
+
+class BlockingExecutor:
+    def __init__(self) -> None:
+        self.entered: dict[str, asyncio.Event] = {}
+        self.release: dict[str, asyncio.Event] = {}
+        self.calls: list[str] = []
+
+    async def __call__(self, *, run_id: str, query: str, context: AgentContext) -> AgentRunResult:
+        del query, context
+        self.calls.append(run_id)
+        self.entered.setdefault(run_id, asyncio.Event()).set()
+        await self.release.setdefault(run_id, asyncio.Event()).wait()
+        return completed_result(run_id)
+
+
+async def wait_until(predicate: Callable[[], bool]) -> None:
+    for _ in range(100):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition was not reached")
+
+
+@pytest.mark.asyncio
+async def test_concurrency_two_queue_time_excluded_and_controlled_timeout() -> None:
+    clock = FakeClock()
+    run_store = InMemoryRunStore(max_runs=10, retention_seconds=3600, clock=clock)
+    event_store = InMemoryEventStore(clock=clock.now)
+    executor = BlockingExecutor()
+    timeout_factory = ControlledTimeoutFactory()
+    context_created: list[tuple[str, float]] = []
+    ids = iter(("run-1", "run-2", "run-3"))
+
+    def make_context(run_id: str) -> AgentContext:
+        context_created.append((run_id, clock.monotonic()))
+        return context_for(clock)
+
+    runner = AnalysisRunner(
+        settings=settings(max_concurrent_runs=2),
+        runs=run_store,
+        events=event_store,
+        context_factory=make_context,
+        agent_executor=executor,
+        timeout_factory=timeout_factory,
+        id_factory=lambda: next(ids),
+    )
+    await runner.submit("one")
+    await runner.submit("two")
+    await runner.submit("three")
+    await wait_until(lambda: len(executor.calls) == 2)
+
+    assert (await run_store.get("run-3")).lifecycle_status == "queued"
+    assert [item[0] for item in context_created] == ["run-1", "run-2"]
+    assert len(timeout_factory.contexts) == 2
+    clock.advance(600)
+    assert (await run_store.get("run-3")).lifecycle_status == "queued"
+
+    executor.release["run-1"].set()
+    await runner.wait("run-1")
+    await wait_until(lambda: "run-3" in executor.calls)
+    assert context_created[-1] == ("run-3", 600.0)
+    assert len(timeout_factory.contexts) == 3
+    timeout_factory.contexts[2].trigger()
+
+    timed_out = await runner.wait("run-3")
+    assert timed_out.final_status is FinalStatus.EXECUTION_FAILED
+    assert timed_out.stop_reason is StopReason.TASK_TIMEOUT
+    executor.release["run-2"].set()
+    await runner.wait("run-2")
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_event_consumer_does_not_cancel_analysis() -> None:
+    clock = FakeClock()
+    run_store = InMemoryRunStore(max_runs=4, retention_seconds=3600, clock=clock)
+    event_store = InMemoryEventStore(clock=clock.now)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=run_store,
+        events=event_store,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+    await wait_until(lambda: "run-1" in executor.calls)
+
+    async def consume() -> None:
+        async for _event in event_store.stream("run-1", after_sequence=None):
+            await asyncio.Event().wait()
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    assert (await run_store.get("run-1")).lifecycle_status == "running"
+
+    executor.release["run-1"].set()
+    assert (await runner.wait("run-1")).final_status is FinalStatus.COMPLETED
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_does_not_cancel_analysis_task() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+    await wait_until(lambda: "run-1" in executor.calls)
+    waiter = asyncio.create_task(runner.wait("run-1"))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    executor.release["run-1"].set()
+    assert (await runner.wait("run-1")).final_status is FinalStatus.COMPLETED
+    await runner.shutdown()
+
+
+class FailingCreatedEventStore(InMemoryEventStore):
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+    ) -> Any:
+        if event_type == "run.created":
+            raise RuntimeError(f"do not expose {SENTINEL}")
+        return await super().emit(run_id, node, event_type, data)
+
+
+@pytest.mark.asyncio
+async def test_submit_rolls_back_both_stores_when_event_creation_fails() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = FailingCreatedEventStore(clock=clock.now)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "run-1",
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await runner.submit("private query")
+    assert SENTINEL not in str(raised.value)
+    with pytest.raises(RunNotFound):
+        await runs.get("run-1")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("run-1")
+    assert executor.calls == []
+
+
+class RecordingEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.created: list[str] = []
+
+    async def create_run(self, run_id: str) -> None:
+        self.created.append(run_id)
+        await super().create_run(run_id)
+
+
+@pytest.mark.asyncio
+async def test_capacity_failure_creates_no_event_or_task() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=1, retention_seconds=3600, clock=clock)
+    await runs.create("existing", "q")
+    events = RecordingEventStore(clock=clock.now)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(max_runs=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "new-run",
+    )
+
+    with pytest.raises(RunCapacityExceeded):
+        await runner.submit("query")
+    assert events.created == []
+    assert executor.calls == []
+
+
+async def add_terminal_pair(
+    runs: InMemoryRunStore,
+    events: InMemoryEventStore,
+    run_id: str,
+) -> None:
+    await runs.create(run_id, "old")
+    await events.create_run(run_id)
+    await events.emit(run_id, "runtime", "run.created", {"status": "queued"})
+    await runs.mark_running(run_id)
+    await events.emit(run_id, "runtime", "run.started", {"status": "running"})
+    result = completed_result(run_id)
+    await runs.complete(run_id, result)
+    await events.emit_terminal(
+        run_id,
+        {"final_status": "completed", "stop_reason": "answer_complete"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_prunes_full_capacity_of_expired_terminal_runs_before_create() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=1, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    await add_terminal_pair(runs, events, "old-1")
+    await add_terminal_pair(runs, events, "old-2")
+    clock.advance(1)
+    executor = BlockingExecutor()
+    runner = AnalysisRunner(
+        settings=settings(max_runs=2, run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: "new-run",
+    )
+
+    created = await runner.submit("new")
+    assert created.run_id == "new-run"
+    for old_id in ("old-1", "old-2"):
+        with pytest.raises(RunNotFound):
+            await runs.get(old_id)
+        with pytest.raises(EventRunNotFound):
+            await events.high_water_mark(old_id)
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prune_retains_both_stores_while_stream_is_active_then_deletes_both() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=10, retention_seconds=1, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    await add_terminal_pair(runs, events, "old")
+    clock.advance(1)
+    stream = events.stream("old", after_sequence=None)
+    assert (await anext(stream)).type == "run.created"
+    executor = BlockingExecutor()
+    ids = iter(("new-1", "new-2"))
+    runner = AnalysisRunner(
+        settings=settings(run_retention_seconds=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: next(ids),
+    )
+
+    await runner.submit("first")
+    assert (await runs.get("old")).lifecycle_status == "terminal"
+    assert await events.high_water_mark("old") == 3
+    await stream.aclose()
+    await runner.submit("second")
+    with pytest.raises(RunNotFound):
+        await runs.get("old")
+    with pytest.raises(EventRunNotFound):
+        await events.high_water_mark("old")
+    await runner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_work_without_writing_terminal_and_is_idempotent() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=4, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    executor = BlockingExecutor()
+    ids = iter(("running", "queued", "rejected"))
+    runner = AnalysisRunner(
+        settings=settings(max_concurrent_runs=1),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=executor,
+        id_factory=lambda: next(ids),
+    )
+    await runner.submit("one")
+    await runner.submit("two")
+    await wait_until(lambda: executor.calls == ["running"])
+
+    await runner.shutdown()
+    await runner.shutdown()
+
+    assert (await runs.get("running")).lifecycle_status == "running"
+    assert (await runs.get("queued")).lifecycle_status == "queued"
+    assert await events.has_terminal("running") is False
+    assert await events.has_terminal("queued") is False
+    with pytest.raises(RunnerShutdown):
+        await runner.submit("secret query")
+
+
+class BlockingTerminalEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.terminal_entered = asyncio.Event()
+        self.release_terminal = asyncio.Event()
+
+    async def emit_terminal(self, run_id: str, data: Any) -> Any:
+        self.terminal_entered.set()
+        await self.release_terminal.wait()
+        return await super().emit_terminal(run_id, data)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_started_terminal_write_before_resources_may_close() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = BlockingTerminalEventStore(clock=clock.now)
+
+    async def finish(*, run_id: str, query: str, context: AgentContext) -> AgentRunResult:
+        del query, context
+        return completed_result(run_id)
+
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=finish,
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+    await events.terminal_entered.wait()
+
+    shutdown = asyncio.create_task(runner.shutdown())
+    await asyncio.sleep(0)
+    assert shutdown.done() is False
+    events.release_terminal.set()
+    await shutdown
+
+    assert (await runs.get("run-1")).lifecycle_status == "terminal"
+    assert await events.has_terminal("run-1") is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_exception_becomes_one_deterministic_internal_terminal() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+
+    async def explode(*, run_id: str, query: str, context: AgentContext) -> AgentRunResult:
+        del run_id, query, context
+        raise RuntimeError(f"provider raw {SENTINEL}")
+
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=lambda _run_id: context_for(clock),
+        agent_executor=explode,
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+    record = await runner.wait("run-1")
+
+    assert record.final_status is FinalStatus.INTERNAL_ERROR
+    assert record.stop_reason is StopReason.INTERNAL_ERROR
+    serialized = record.model_dump_json()
+    assert SENTINEL not in serialized
+    terminal_events = [
+        event
+        async for event in events.stream("run-1", after_sequence=None)
+        if event.type == "run.terminal"
+    ]
+    assert len(terminal_events) == 1
+    await runner.shutdown()
+
+
+def pricing() -> ModelPricing:
+    return ModelPricing.model_validate(
+        {
+            "provider": "fixture",
+            "region": "local",
+            "requested_model": "fixture-agent",
+            "resolved_model": "fixture-agent",
+            "effective_date": date(2026, 9, 1),
+            "currency": "CNY",
+            "unit_tokens": 1000,
+            "input_token_upper_bound": 10000,
+            "input_price": "0.10",
+            "output_price": "0.20",
+            "pricing_basis": "test",
+            "source": "https://example.test/pricing",
+        }
+    )
+
+
+class NeverReturningModel:
+    model = "fixture-agent"
+
+    async def invoke[T: BaseModel](
+        self,
+        request: StructuredModelRequest,
+        output_type: type[T],
+    ) -> StructuredModelResult[T]:
+        del request, output_type
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_timeout_during_model_call_preserves_reserved_cost_counts_and_safe_trace() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    timeout_factory = ControlledTimeoutFactory()
+
+    def make_context(_run_id: str) -> AgentContext:
+        budget = BudgetLedger(
+            limits=BudgetLimits.from_settings(settings()),
+            pricing=pricing(),
+            monotonic=clock.monotonic,
+        )
+        recorder = InMemoryTraceRecorder()
+        return AgentContext(
+            model_invoker=StructuredModelInvoker(NeverReturningModel(), budget, recorder, clock),
+            tools=cast(Any, object()),
+            budget=budget,
+            events=cast(Any, object()),
+            trace_recorder=recorder,
+            clock=clock,
+        )
+
+    async def invoke_model(*, run_id: str, query: str, context: AgentContext) -> AgentRunResult:
+        del run_id, query
+        request = StructuredModelRequest(
+            purpose="behavior",
+            system_prompt="safe system prompt",
+            user_payload={"query": SENTINEL},
+            output_schema_name="FinalAnswer",
+            output_schema_summary={"title": "FinalAnswer", "type": "object"},
+            max_output_tokens=100,
+        )
+        await context.model_invoker.invoke(request, FinalAnswer)
+        raise AssertionError("unreachable")
+
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=make_context,
+        agent_executor=invoke_model,
+        timeout_factory=timeout_factory,
+        id_factory=lambda: "run-1",
+    )
+    await runner.submit("query")
+    await wait_until(lambda: len(timeout_factory.contexts) == 1)
+    await timeout_factory.contexts[0].entered.wait()
+    await wait_until(lambda: timeout_factory.contexts[0]._task is not None)
+    await asyncio.sleep(0)
+    timeout_factory.contexts[0].trigger()
+    record = await runner.wait("run-1")
+
+    assert record.final_status is FinalStatus.EXECUTION_FAILED
+    assert record.stop_reason is StopReason.TASK_TIMEOUT
+    assert record.governance.llm_calls == 1
+    assert record.governance.reserved_cost_cny == Decimal("0")
+    assert record.governance.committed_cost_cny > 0
+    assert len(record.safe_trace.model_calls) == 1
+    assert record.safe_trace.model_calls[0].outcome == "cancelled"
+    serialized = record.model_dump_json()
+    assert SENTINEL not in serialized
+    assert "prompt" not in serialized
+    assert "raw" not in serialized
+    await runner.shutdown()
