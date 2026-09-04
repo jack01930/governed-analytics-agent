@@ -443,10 +443,13 @@ async def _run_fixture(query: str, scripts: AgentScripts, run_id: str) -> AgentR
             trace_recorder=recorder,
             clock=clock,
         )
+        deadline = asyncio.timeout(_AGENT_DEADLINE_SECONDS)
         try:
-            async with asyncio.timeout(_AGENT_DEADLINE_SECONDS):
+            async with deadline:
                 return await run_agent(run_id=run_id, query=query, context=context)
         except TimeoutError:
+            if not deadline.expired():
+                raise
             raise AssertionError("agent integration exceeded deterministic test deadline") from None
     finally:
         await engine.dispose()

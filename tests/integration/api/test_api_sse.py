@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import re
 import threading
 import traceback
-from collections.abc import AsyncIterator, Awaitable, Iterator, Mapping
+import unicodedata
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import partial
-from typing import cast
+from typing import Protocol, cast
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -297,8 +300,17 @@ _CREDENTIAL_CANARY = "task11-fix1-credential-canary-never-expose"
 _SAFE_OUTPUT_ERROR = "serialized response violated safe-output contract"
 _SSE_DEADLINE_ERROR = "SSE response exceeded deterministic test deadline"
 _GATE_DEADLINE_ERROR = "SSE coordination gate exceeded deterministic test deadline"
+_CLEANUP_DEADLINE_ERROR = "SSE cleanup exceeded deterministic test deadline"
 _SSE_DEADLINE_SECONDS = 8.0
 _GATE_DEADLINE_SECONDS = 5.0
+_CLEANUP_DEADLINE_SECONDS = 0.25
+
+
+class _JsonResponse(Protocol):
+    @property
+    def text(self) -> str: ...
+
+    def json(self) -> object: ...
 
 
 def _action(contract_id: str, hypothesis_id: str, sql: str) -> dict[str, object]:
@@ -441,10 +453,13 @@ async def _await_with_deadline[T](
     seconds: float,
     failure_message: str,
 ) -> T:
+    deadline = asyncio.timeout(seconds)
     try:
-        async with asyncio.timeout(seconds):
+        async with deadline:
             return await operation
     except TimeoutError:
+        if not deadline.expired():
+            raise
         raise AssertionError(failure_message) from None
 
 
@@ -510,9 +525,11 @@ class _TrackedEventStream:
 
     async def aclose(self) -> None:
         close = getattr(self._delegate, "aclose", None)
-        if callable(close):
-            await close()
-        await self._release()
+        try:
+            if callable(close):
+                await close()
+        finally:
+            await self._release()
 
     async def _release(self) -> None:
         if self._released:
@@ -529,6 +546,22 @@ class _SpyEventStore:
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._delegate, name)
+
+    async def create_unstarted_run(self, run_id: str) -> None:
+        await self._delegate.create_run(run_id)
+        await self._delegate.emit(
+            run_id,
+            "runtime",
+            "run.created",
+            {"status": "queued"},
+        )
+
+    def reset_stream_gates(self) -> None:
+        self._probe.execution_gate = asyncio.Event()
+        self._probe.live_read_gate = asyncio.Event()
+        self._probe.open_high_water = 0
+        self._probe.open_nonterminal = False
+        self._probe.live_wait_started = False
 
     async def open_stream(
         self,
@@ -577,46 +610,97 @@ class _SpyRunner(AnalysisRunner):
         await super().shutdown()
 
 
-class _NeverTerminalLines:
-    def __init__(self) -> None:
-        self.release_gate = asyncio.Event()
-        self.closed = False
-        self.active_leases = 1
-
-    def __aiter__(self) -> _NeverTerminalLines:
+class _CloseRaisesStream:
+    def __aiter__(self) -> _CloseRaisesStream:
         return self
 
-    async def __anext__(self) -> str:
-        await self.release_gate.wait()
+    async def __anext__(self) -> RunEvent:
         raise StopAsyncIteration
 
     async def aclose(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        self.active_leases -= 1
-        self.release_gate.set()
+        raise RuntimeError("close failed")
 
 
-async def _deadline_cleanup_fault_probe() -> bool:
-    stream = _NeverTerminalLines()
+class _BlockingCloseLines:
+    def __init__(self) -> None:
+        self.close_gate = asyncio.Event()
+        self.cancellations = 0
+
+    def __aiter__(self) -> _BlockingCloseLines:
+        return self
+
+    async def __anext__(self) -> str:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        while True:
+            try:
+                await self.close_gate.wait()
+                return
+            except asyncio.CancelledError:
+                self.cancellations += 1
+                if self.cancellations >= 2:
+                    raise
+
+
+async def _tracked_close_failure_probe() -> int:
+    probe = _LifespanProbe(active_leases=1)
+    tracked = _TrackedEventStream(_CloseRaisesStream(), probe, open_high_water=0)
+    with contextlib.suppress(RuntimeError):
+        await tracked.aclose()
+    return probe.active_leases
+
+
+async def _blocking_cleanup_fault_probe() -> bool:
+    stream = _BlockingCloseLines()
     try:
-        await _await_with_deadline(
-            _collect_sse_lines(stream),
-            seconds=0.02,
-            failure_message=_SSE_DEADLINE_ERROR,
-        )
+        await _collect_sse_lines(stream, cleanup_seconds=0.02)
     except AssertionError as failure:
+        pending_cleanup = any(
+            task.get_name() == "sse-test-cleanup" and not task.done()
+            for task in asyncio.all_tasks()
+        )
         return (
-            str(failure) == _SSE_DEADLINE_ERROR
-            and stream.closed
-            and stream.release_gate.is_set()
-            and stream.active_leases == 0
+            str(failure) == _CLEANUP_DEADLINE_ERROR
+            and stream.cancellations == 2
+            and not pending_cleanup
         )
     return False
 
 
-async def _collect_sse_lines(lines: AsyncIterator[str]) -> tuple[str, ...]:
+async def _raise_operation_timeout() -> None:
+    raise TimeoutError("operation-owned-timeout")
+
+
+async def _close_with_deadline(
+    close: Callable[[], Awaitable[object]],
+    *,
+    seconds: float,
+) -> None:
+    cleanup = asyncio.ensure_future(close())
+    cleanup.set_name("sse-test-cleanup")
+    done, _ = await asyncio.wait({cleanup}, timeout=seconds)
+    if done:
+        await cleanup
+        return
+
+    cleanup.cancel()
+    done, _ = await asyncio.wait({cleanup}, timeout=seconds)
+    if not done:
+        cleanup.cancel()
+        done, _ = await asyncio.wait({cleanup}, timeout=seconds)
+    if not done:
+        cleanup.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+    else:
+        await asyncio.gather(cleanup, return_exceptions=True)
+    raise AssertionError(_CLEANUP_DEADLINE_ERROR)
+
+
+async def _collect_sse_lines(
+    lines: AsyncIterator[str],
+    *,
+    cleanup_seconds: float = _CLEANUP_DEADLINE_SECONDS,
+) -> tuple[str, ...]:
     collected: list[str] = []
     try:
         async for line in lines:
@@ -624,7 +708,10 @@ async def _collect_sse_lines(lines: AsyncIterator[str]) -> tuple[str, ...]:
     finally:
         close = getattr(lines, "aclose", None)
         if callable(close):
-            await close()
+            await _close_with_deadline(
+                cast(Callable[[], Awaitable[object]], close),
+                seconds=cleanup_seconds,
+            )
     return tuple(collected)
 
 
@@ -645,31 +732,136 @@ async def _consume_sse_with_deadline(
     app: FastAPI,
     events_url: str,
     probe: _LifespanProbe,
+    database: DatabaseSettings,
+    deadline_seconds: float = _SSE_DEADLINE_SECONDS,
 ) -> tuple[int, str, tuple[dict[str, object], ...]]:
     try:
         status_code, content_type, lines = await _await_with_deadline(
             _request_sse(app, events_url),
-            seconds=_SSE_DEADLINE_SECONDS,
+            seconds=deadline_seconds,
             failure_message=_SSE_DEADLINE_ERROR,
         )
-        return status_code, content_type, _sse_payloads(iter(lines))
+        return status_code, content_type, _sse_payloads(iter(lines), database)
     finally:
         for gate in (probe.execution_gate, probe.live_read_gate):
             if gate is not None:
                 gate.set()
 
 
-def _sse_payloads(lines: Iterator[str]) -> tuple[dict[str, object], ...]:
+async def _exercise_real_sse_timeout(
+    app: FastAPI,
+    event_store: _SpyEventStore,
+    probe: _LifespanProbe,
+    database: DatabaseSettings,
+) -> bool:
+    run_id = "integration-real-sse-timeout"
+    await event_store.create_unstarted_run(run_id)
+    current = asyncio.current_task()
+    pending_before = _pending_task_ids(current)
+    try:
+        await _consume_sse_with_deadline(
+            app,
+            f"/v1/analyses/{run_id}/events",
+            probe,
+            database,
+            0.05,
+        )
+    except AssertionError as failure:
+        _safe_output_require(str(failure) == _SSE_DEADLINE_ERROR)
+    else:
+        _safe_output_require(False)
+
+    pending_after: frozenset[int] = frozenset()
+    for _ in range(4):
+        pending_after = _pending_task_ids(current)
+        if pending_after == pending_before:
+            break
+        checkpoint = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(checkpoint.set_result, None)
+        await checkpoint
+    _safe_output_require(pending_after == pending_before)
+    shutdown_watchers = tuple(
+        task for task in asyncio.all_tasks() if not task.done() and _is_sse_shutdown_watcher(task)
+    )
+    _safe_output_require(len(shutdown_watchers) <= 1)
+    _safe_output_require(probe.open_nonterminal)
+    _safe_output_require(probe.live_wait_started)
+    _safe_output_require(probe.active_leases == 0)
+    execution_gate = probe.execution_gate
+    live_read_gate = probe.live_read_gate
+    _safe_output_require(
+        execution_gate is not None
+        and execution_gate.is_set()
+        and live_read_gate is not None
+        and live_read_gate.is_set()
+    )
+    deleted = await event_store.delete_run(run_id, allow_unstarted=True)
+    _safe_output_require(deleted)
+    event_store.reset_stream_gates()
+    return True
+
+
+def _is_sse_shutdown_watcher(task: asyncio.Task[object]) -> bool:
+    code = getattr(task.get_coro(), "cr_code", None)
+    return getattr(code, "co_name", None) == "_shutdown_watcher" and str(
+        getattr(code, "co_filename", "")
+    ).endswith("sse_starlette/sse.py")
+
+
+def _pending_task_ids(current: asyncio.Task[object] | None) -> frozenset[int]:
+    return frozenset(
+        id(task)
+        for task in asyncio.all_tasks()
+        if task is not current and not task.done() and not _is_sse_shutdown_watcher(task)
+    )
+
+
+def _sse_payloads(
+    lines: Iterator[str],
+    database: DatabaseSettings,
+) -> tuple[dict[str, object], ...]:
     payloads: list[dict[str, object]] = []
     protocol_id: str | None = None
     for line in lines:
         if line.startswith("id: "):
             protocol_id = line.removeprefix("id: ")
         elif line.startswith("data: "):
-            payload = cast(dict[str, object], json.loads(line.removeprefix("data: ")))
-            assert payload["event_id"] == protocol_id
+            serialized_payload = line.removeprefix("data: ")
+            try:
+                untrusted_payload = json.loads(serialized_payload)
+            except json.JSONDecodeError:
+                raise AssertionError(_SAFE_OUTPUT_ERROR) from None
+            _assert_safe_tree(untrusted_payload)
+            _assert_serialized_output_has_no_secrets_or_sql(
+                serialized_payload,
+                database,
+            )
+            payload = cast(
+                dict[str, object],
+                _assert_exact_keys(untrusted_payload, _EVENT_KEYS),
+            )
+            event_type = payload["type"]
+            _safe_output_require(isinstance(event_type, str))
+            event_type = cast(str, event_type)
+            _safe_output_require(event_type in _EVENT_DATA_KEYS)
+            _assert_exact_keys(payload["data"], _EVENT_DATA_KEYS[event_type])
+            _safe_output_require(payload["event_id"] == protocol_id)
             payloads.append(payload)
     return tuple(payloads)
+
+
+def _safe_response_json(
+    response: _JsonResponse,
+    database: DatabaseSettings,
+) -> Mapping[str, object]:
+    try:
+        untrusted_body = response.json()
+    except (json.JSONDecodeError, ValueError):
+        raise AssertionError(_SAFE_OUTPUT_ERROR) from None
+    _assert_safe_tree(untrusted_body)
+    _assert_serialized_output_has_no_secrets_or_sql(response.text, database)
+    _safe_output_require(isinstance(untrusted_body, dict))
+    return cast(Mapping[str, object], untrusted_body)
 
 
 def _safe_output_require(condition: bool) -> None:
@@ -680,7 +872,8 @@ def _safe_output_require(condition: bool) -> None:
 def _is_forbidden_field_name(value: object) -> bool:
     if not isinstance(value, str):
         return False
-    normalized = value.casefold().replace("-", "_")
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    normalized = re.sub(r"[\s\-]+", "_", normalized)
     return (
         normalized in _FORBIDDEN_KEYS
         or normalized.endswith("_sql")
@@ -688,23 +881,36 @@ def _is_forbidden_field_name(value: object) -> bool:
     )
 
 
-def _assert_safe_tree(value: object) -> None:
+def _assert_safe_tree(value: object, *, path: tuple[str, ...] = ()) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
+            _safe_output_require(isinstance(key, str))
             _safe_output_require(not _is_forbidden_field_name(key))
-            _assert_safe_tree(item)
+            key = cast(str, key)
+            normalized_key = unicodedata.normalize("NFKC", key).strip().casefold()
+            _assert_safe_tree(item, path=(*path, normalized_key))
     elif isinstance(value, (list, tuple)):
-        if len(value) == 2 and isinstance(value[0], str):
-            _safe_output_require(not _is_forbidden_field_name(value[0]))
+        if path and path[-1] == "safe_arguments":
+            for pair in value:
+                _safe_output_require(
+                    isinstance(pair, (list, tuple))
+                    and len(pair) == 2
+                    and isinstance(pair[0], str)
+                    and not _is_forbidden_field_name(pair[0])
+                )
+                typed_pair = cast(list[object] | tuple[object, ...], pair)
+                pair_name = cast(str, typed_pair[0])
+                _assert_safe_tree(typed_pair[1], path=(*path, pair_name))
+            return
         for item in value:
-            _assert_safe_tree(item)
+            _assert_safe_tree(item, path=(*path, "*"))
 
 
 def _assert_exact_keys(value: object, allowed: frozenset[str]) -> Mapping[str, object]:
     _safe_output_require(isinstance(value, dict))
-    assert isinstance(value, dict)
+    value = cast(dict[object, object], value)
     _safe_output_require(frozenset(map(str, value)) == allowed)
-    return value
+    return cast(Mapping[str, object], value)
 
 
 def _assert_wire_allowlists(
@@ -717,28 +923,43 @@ def _assert_wire_allowlists(
     for event in events:
         envelope = _assert_exact_keys(event, _EVENT_KEYS)
         event_type = envelope["type"]
-        assert isinstance(event_type, str)
-        assert event_type in _EVENT_DATA_KEYS
+        _safe_output_require(isinstance(event_type, str))
+        event_type = cast(str, event_type)
+        _safe_output_require(event_type in _EVENT_DATA_KEYS)
         _assert_exact_keys(envelope["data"], _EVENT_DATA_KEYS[event_type])
 
     status_mapping = _assert_exact_keys(status, _STATUS_KEYS)
     evidence = status_mapping["evidence"]
-    assert isinstance(evidence, list)
-    for item in evidence:
+    _safe_output_require(isinstance(evidence, list))
+    for item in cast(list[object], evidence):
         _assert_exact_keys(item, _EVIDENCE_KEYS)
 
     trace_mapping = _assert_exact_keys(trace, _TRACE_KEYS)
     nodes = trace_mapping["nodes"]
     model_calls = trace_mapping["model_calls"]
     tool_calls = trace_mapping["tool_calls"]
-    assert isinstance(nodes, list)
-    assert isinstance(model_calls, list)
-    assert isinstance(tool_calls, list)
-    for item in nodes:
+    _safe_output_require(isinstance(nodes, list))
+    _safe_output_require(isinstance(model_calls, list))
+    _safe_output_require(isinstance(tool_calls, list))
+    for item in cast(list[object], nodes):
         _assert_exact_keys(item, _NODE_TRACE_KEYS)
-    for item in model_calls:
-        _assert_exact_keys(item, _MODEL_TRACE_KEYS)
-    for item in tool_calls:
+    observed_model_purposes: list[object] = []
+    for item in cast(list[object], model_calls):
+        model_trace = _assert_exact_keys(item, _MODEL_TRACE_KEYS)
+        observed_model_purposes.append(model_trace["purpose"])
+        _safe_output_require(isinstance(model_trace["provider_model"], str))
+        _safe_output_require(model_trace["outcome"] == "completed")
+        _safe_output_require(model_trace["safe_error"] is None)
+        for counter_name in ("latency_ms", "input_tokens", "output_tokens"):
+            counter = model_trace[counter_name]
+            _safe_output_require(isinstance(counter, int) and counter >= 0)
+        _safe_output_require(isinstance(model_trace["output_truncated"], bool))
+    _safe_output_require(
+        tuple(observed_model_purposes)
+        == ("behavior", "plan", "action", "action", "action", "action", "synthesis")
+    )
+    observed_tools: list[tuple[object, object, tuple[tuple[object, object], ...]]] = []
+    for item in cast(list[object], tool_calls):
         tool_trace = _assert_exact_keys(item, _TOOL_TRACE_KEYS)
         tool_name = tool_trace["tool_name"]
         safe_arguments = tool_trace["safe_arguments"]
@@ -746,10 +967,26 @@ def _assert_wire_allowlists(
             isinstance(tool_name, str) and tool_name in _SAFE_ARGUMENT_NAMES_BY_TOOL
         )
         _safe_output_require(isinstance(safe_arguments, list))
-        assert isinstance(tool_name, str)
-        assert isinstance(safe_arguments, list)
+        tool_name = cast(str, tool_name)
+        safe_arguments = cast(list[object], safe_arguments)
+        query_id = tool_trace["query_id"]
+        columns = tool_trace["columns"]
+        row_count = tool_trace["row_count"]
+        _safe_output_require(isinstance(columns, list))
+        _safe_output_require(
+            all(isinstance(column, str) and column for column in cast(list[object], columns))
+        )
+        _safe_output_require(isinstance(tool_trace["possibly_truncated"], bool))
+        _safe_output_require(tool_trace["safe_error"] is None)
+        if tool_name == "execute_sql":
+            _safe_output_require(isinstance(query_id, str) and len(query_id) == 64)
+            _safe_output_require(isinstance(row_count, int) and row_count >= 0)
+        else:
+            _safe_output_require(query_id is None)
+            _safe_output_require(row_count is None)
         allowed_names = _SAFE_ARGUMENT_NAMES_BY_TOOL[tool_name]
         observed_names: list[str] = []
+        observed_arguments: list[tuple[object, object]] = []
         for pair in safe_arguments:
             _safe_output_require(
                 isinstance(pair, list)
@@ -757,11 +994,46 @@ def _assert_wire_allowlists(
                 and isinstance(pair[0], str)
                 and pair[0] in allowed_names
             )
-            assert isinstance(pair, list)
-            assert isinstance(pair[0], str)
-            observed_names.append(pair[0])
-            _assert_safe_tree(pair)
+            pair = cast(list[object], pair)
+            pair_name = cast(str, pair[0])
+            observed_names.append(pair_name)
+            observed_arguments.append((pair_name, pair[1]))
+            _assert_safe_tree(
+                {"safe_arguments": [pair]},
+            )
         _safe_output_require(len(observed_names) == len(set(observed_names)))
+        observed_tools.append((tool_name, tool_trace["purpose"], tuple(observed_arguments)))
+    expected_tools = (
+        ("metric_lookup", "metric_lookup", ()),
+        ("schema_lookup", "schema_lookup", ()),
+        (
+            "execute_sql",
+            "gmv_comparison",
+            (("contract_id", "gmv_comparison"), ("hypothesis_id", "confirm_decline")),
+        ),
+        (
+            "execute_sql",
+            "region_contribution",
+            (
+                ("contract_id", "region_contribution"),
+                ("hypothesis_id", "region_contribution"),
+            ),
+        ),
+        (
+            "execute_sql",
+            "sku_contribution",
+            (("contract_id", "sku_contribution"), ("hypothesis_id", "sku_contribution")),
+        ),
+        (
+            "execute_sql",
+            "segment_contribution",
+            (
+                ("contract_id", "segment_contribution"),
+                ("hypothesis_id", "segment_contribution"),
+            ),
+        ),
+    )
+    _safe_output_require(tuple(observed_tools) == expected_tools)
 
 
 def _assert_serialized_output_has_no_secrets_or_sql(
@@ -784,12 +1056,16 @@ def _assert_serialized_output_has_no_secrets_or_sql(
         wire_value = json.loads(wire_text)
     except json.JSONDecodeError:
         wire_value = wire_text
-    normalized_values = tuple(
-        " ".join(value.casefold().split()) for value in _string_leaves(wire_value)
+    _assert_safe_tree(wire_value)
+    string_values = tuple(_string_leaves(wire_value))
+    credential_assignment = re.compile(
+        r"(?i)(?:\b(?:authorization|api[\s_-]*key|password|access[\s_-]*token)"
+        r"\s*[:=]\s*\S+|\bbearer\s+\S+)"
     )
+    _safe_output_require(not any(credential_assignment.search(value) for value in string_values))
+    normalized_values = tuple(_normalize_sql_text(value) for value in string_values)
     normalized_sql_canaries = tuple(
-        " ".join(sql.casefold().split())
-        for sql in (_COMPARISON_SQL, _REGION_SQL, _SKU_SQL, _SEGMENT_SQL)
+        _normalize_sql_text(sql) for sql in (_COMPARISON_SQL, _REGION_SQL, _SKU_SQL, _SEGMENT_SQL)
     )
     _safe_output_require(
         not any(
@@ -798,6 +1074,25 @@ def _assert_serialized_output_has_no_secrets_or_sql(
             for value in normalized_values
         )
     )
+    partial_signatures = (
+        frozenset({"current_gmv", "previous_gmv", "change_rate", "order_items"}),
+        frozenset({"gmv_loss", "order_items", "region", "previous_start"}),
+        frozenset({"gmv_loss", "order_items", "products", "sku"}),
+        frozenset({"segment_gmv", "customers", "previous_gmv", "current_gmv"}),
+    )
+    _safe_output_require(
+        not any(
+            all(token in value for token in signature)
+            for value in normalized_values
+            for signature in partial_signatures
+        )
+    )
+
+
+def _normalize_sql_text(value: str) -> str:
+    without_comments = re.sub(r"/\*.*?\*/", " ", value, flags=re.DOTALL)
+    without_comments = re.sub(r"--[^\r\n]*", " ", without_comments)
+    return " ".join(without_comments.casefold().split())
 
 
 def _string_leaves(value: object) -> Iterator[str]:
@@ -835,7 +1130,13 @@ def test_post_sse_status_and_trace_share_one_lifespan_engine(
         ("secret_cte", "WITH\nsecret_cte AS (VALUES (1))"),
     )
     _assert_safe_tree({"result_summary": "contracted aggregate only"})
-    _assert_safe_tree([["query_id", "a" * 64]])
+    _assert_safe_tree({"query_id": "a" * 64})
+    _assert_safe_tree(
+        {
+            "dimensions": [["raw_sql", "verified dimension value"]],
+            "limitations": ["completed with limitations", "select the best evidence"],
+        }
+    )
 
     unsafe_pairs: tuple[tuple[str, object], ...] = (
         ("raw_sql", "DELETE FROM orders WHERE credential_canary = true"),
@@ -848,9 +1149,13 @@ def test_post_sse_status_and_trace_share_one_lifespan_engine(
         ("row", ["row-canary"]),
         ("result", "result-canary"),
         ("raw_result", "raw-result-canary"),
+        (" raw_sql ", "spaced-key-canary"),
+        ("\uff52\uff41\uff57\uff3f\uff53\uff51\uff4c", "fullwidth-key-canary"),
+        ("raw sql", "whitespace-key-canary"),
+        ("raw-sql", "hyphen-key-canary"),
     )
     for field_name, sensitive_value in unsafe_pairs:
-        candidate = [[field_name, sensitive_value]]
+        candidate = {"safe_arguments": [[field_name, sensitive_value]]}
         with pytest.raises(AssertionError) as pair_failure:
             _assert_safe_tree(candidate)
         candidate_wire = json.dumps(candidate)
@@ -906,6 +1211,30 @@ def test_post_sse_status_and_trace_share_one_lifespan_engine(
         sql_failure,
         (sql_variant, sql_wire, "SEGMENT_GMV"),
     )
+    commented_sql = _SEGMENT_SQL.replace("with segment_gmv", "WITH /*review*/ segment_gmv")
+    commented_sql_wire = json.dumps({"answer": commented_sql})
+    with pytest.raises(AssertionError) as commented_sql_failure:
+        _assert_serialized_output_has_no_secrets_or_sql(commented_sql_wire, database)
+    _assert_failure_is_redacted(
+        commented_sql_failure,
+        (commented_sql, commented_sql_wire, "/*review*/"),
+    )
+    partial_sql = "WITH segment_gmv AS (...) SELECT previous_gmv, current_gmv FROM customers"
+    partial_sql_wire = json.dumps({"answer": partial_sql})
+    with pytest.raises(AssertionError) as partial_sql_failure:
+        _assert_serialized_output_has_no_secrets_or_sql(partial_sql_wire, database)
+    _assert_failure_is_redacted(
+        partial_sql_failure,
+        (partial_sql, partial_sql_wire),
+    )
+    credential_label = "authorization: Bearer structured-credential-canary"
+    credential_label_wire = json.dumps({"answer": credential_label})
+    with pytest.raises(AssertionError) as credential_label_failure:
+        _assert_serialized_output_has_no_secrets_or_sql(credential_label_wire, database)
+    _assert_failure_is_redacted(
+        credential_label_failure,
+        (credential_label, credential_label_wire, "structured-credential-canary"),
+    )
     legal_wire = {
         "answer": "select the best evidence, completed with limitations",
         "evidence": {"limitations": ["completed with limitations"]},
@@ -914,6 +1243,20 @@ def test_post_sse_status_and_trace_share_one_lifespan_engine(
     _assert_serialized_output_has_no_secrets_or_sql(
         json.dumps(legal_wire),
         database,
+    )
+    order_canary = "task11-fix3-order-canary"
+    unsafe_order_response = httpx.Response(
+        200,
+        json={"api_key": order_canary, "semantic_field": "unexpected"},
+    )
+    semantic_assertion_reached = False
+    with pytest.raises(AssertionError) as order_failure:
+        _safe_response_json(unsafe_order_response, database)
+        semantic_assertion_reached = True
+    _safe_output_require(not semantic_assertion_reached)
+    _assert_failure_is_redacted(
+        order_failure,
+        (order_canary, unsafe_order_response.text),
     )
     model = ModelSettings(  # type: ignore[call-arg]
         _env_file=None,
@@ -932,52 +1275,93 @@ def test_post_sse_status_and_trace_share_one_lifespan_engine(
     with TestClient(app) as client:
         portal = client.portal
         assert portal is not None
-        assert portal.call(_deadline_cleanup_fault_probe) is True
+        with pytest.raises(TimeoutError, match="operation-owned-timeout"):
+            portal.call(
+                partial(
+                    _await_with_deadline,
+                    _raise_operation_timeout(),
+                    seconds=1.0,
+                    failure_message=_SSE_DEADLINE_ERROR,
+                )
+            )
+        _safe_output_require(portal.call(_tracked_close_failure_probe) == 0)
+        _safe_output_require(portal.call(_blocking_cleanup_fault_probe) is True)
+        event_store = probe.event_store
+        assert event_store is not None
+        ready = client.get("/readyz")
+        assert ready.status_code == 200
+        worker_threads_before = frozenset(
+            thread.ident for thread in threading.enumerate() if thread.is_alive()
+        )
+        _safe_output_require(
+            portal.call(
+                _exercise_real_sse_timeout,
+                app,
+                event_store,
+                probe,
+                database,
+            )
+            is True
+        )
+        worker_threads_after = frozenset(
+            thread.ident for thread in threading.enumerate() if thread.is_alive()
+        )
+        assert worker_threads_after == worker_threads_before
 
         created = client.post("/v1/analyses", json={"query": ATTRIBUTION_QUERY})
         assert created.status_code == 202
-        created_body = created.json()
+        created_body = _safe_response_json(created, database)
+        _assert_exact_keys(created_body, _CREATE_KEYS)
+        events_url = created_body["events_url"]
+        status_url = created_body["status_url"]
+        trace_url = created_body["trace_url"]
+        run_id = created_body["run_id"]
+        _safe_output_require(isinstance(events_url, str))
+        _safe_output_require(isinstance(status_url, str))
+        _safe_output_require(isinstance(trace_url, str))
+        _safe_output_require(isinstance(run_id, str))
         assert len(engines) == 1
         assert engines[0].dispose_calls == 0
 
         sse_status, content_type, events = portal.call(
             _consume_sse_with_deadline,
             app,
-            created_body["events_url"],
+            cast(str, events_url),
             probe,
+            database,
         )
-        assert sse_status == 200
-        assert content_type.startswith("text/event-stream")
+        _safe_output_require(sse_status == 200)
+        _safe_output_require(content_type.startswith("text/event-stream"))
 
-        status = client.get(created_body["status_url"])
-        trace = client.get(created_body["trace_url"])
+        status = client.get(cast(str, status_url))
+        trace = client.get(cast(str, trace_url))
         assert status.status_code == trace.status_code == 200
-        status_body = status.json()
-        trace_body = trace.json()
+        status_body = _safe_response_json(status, database)
+        trace_body = _safe_response_json(trace, database)
+        _assert_wire_allowlists(created_body, events, status_body, trace_body)
 
         sequences = tuple(cast(int, event["sequence"]) for event in events)
         terminal = tuple(event for event in events if event["type"] == "run.terminal")
-        assert sequences == tuple(range(1, len(events) + 1))
-        assert len(terminal) == 1
-        assert events[-1] == terminal[0]
-        assert status_body["lifecycle_status"] == "terminal"
-        assert status_body["final_status"] == "completed"
-        assert status_body["stop_reason"] == "answer_complete"
-        assert trace_body["snapshot_complete"] is True
-        assert trace_body["stop_reason"] == "answer_complete"
-        assert trace_body["tool_call_count"] == 6
-        assert sum(tool["tool_name"] == "execute_sql" for tool in trace_body["tool_calls"]) == 4
+        _safe_output_require(sequences == tuple(range(1, len(events) + 1)))
+        _safe_output_require(len(terminal) == 1)
+        _safe_output_require(events[-1] == terminal[0])
+        _safe_output_require(status_body["lifecycle_status"] == "terminal")
+        _safe_output_require(status_body["final_status"] == "completed")
+        _safe_output_require(status_body["stop_reason"] == "answer_complete")
+        _safe_output_require(trace_body["snapshot_complete"] is True)
+        _safe_output_require(trace_body["stop_reason"] == "answer_complete")
+        _safe_output_require(trace_body["tool_call_count"] == 6)
+        tool_calls = cast(list[Mapping[str, object]], trace_body["tool_calls"])
+        _safe_output_require(sum(tool["tool_name"] == "execute_sql" for tool in tool_calls) == 4)
         assert engines[0].connect_calls == 4
         assert engines[0].dispose_calls == 0
         assert probe.open_nonterminal is True
         assert probe.open_high_water >= 1
         assert probe.live_wait_started is True
-        assert any(sequence > probe.open_high_water for sequence in sequences)
-        assert probe.active_leases == 0
+        _safe_output_require(any(sequence > probe.open_high_water for sequence in sequences))
+        _safe_output_require(probe.active_leases == 0)
 
-        event_store = probe.event_store
-        assert event_store is not None
-        assert portal.call(event_store.delete_run, created_body["run_id"]) is True
+        _safe_output_require(portal.call(event_store.delete_run, cast(str, run_id)) is True)
 
         wire = {
             "created": created_body,
@@ -985,7 +1369,6 @@ def test_post_sse_status_and_trace_share_one_lifespan_engine(
             "status": status_body,
             "trace": trace_body,
         }
-        _assert_wire_allowlists(created_body, events, status_body, trace_body)
         _assert_safe_tree(wire)
         _assert_serialized_output_has_no_secrets_or_sql(
             json.dumps(wire, ensure_ascii=False, sort_keys=True),
