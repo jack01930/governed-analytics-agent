@@ -34,13 +34,18 @@ class _IntegerEnum(IntEnum):
 
 
 class SpySqlExecutionBackend:
-    def __init__(self, result: QueryResult | None = None) -> None:
+    def __init__(
+        self,
+        result: QueryResult | None = None,
+        error: BaseException | None = None,
+    ) -> None:
         self.result = result or QueryResult(
             query_id="a" * 64,
             columns=("value",),
             rows=((1,),),
             row_count=1,
         )
+        self.error = error
         self.calls = 0
         self.disposed = 0
         self.parameters: list[tuple[object, ...]] = []
@@ -52,6 +57,8 @@ class SpySqlExecutionBackend:
     ) -> QueryResult:
         self.calls += 1
         self.parameters.append(parameters)
+        if self.error is not None:
+            raise self.error
         return self.result
 
 
@@ -293,6 +300,88 @@ async def test_injected_backend_receives_typed_parameters_for_execute_and_profil
         datetime(2026, 6, 1, tzinfo=UTC),
     )
     assert backend.parameters[1] == ("paid",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sql_request", "expected_code"),
+    [
+        (ExecuteSqlRequest(sql="drop table orders"), ErrorCode.SQL_REJECTED),
+        (
+            ExecuteSqlRequest(
+                sql="select cast(:wanted as integer) as value",
+                parameters={"other": 1},
+            ),
+            ErrorCode.SQL_REJECTED,
+        ),
+        (
+            ExecuteSqlRequest(
+                sql="select cast(:value as integer) as value",
+                parameters={"value": True},
+            ),
+            ErrorCode.INVALID_REQUEST,
+        ),
+    ],
+)
+async def test_shared_and_default_rejections_are_equivalent_and_never_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    sql_request: ExecuteSqlRequest,
+    expected_code: ErrorCode,
+) -> None:
+    default_calls = 0
+
+    async def execute(_validated: ValidatedSql, _params: tuple[object, ...]) -> QueryResult:
+        nonlocal default_calls
+        default_calls += 1
+        raise AssertionError("rejected input must not execute")
+
+    monkeypatch.setattr("governed_analytics.tools.tools._execute", execute)
+    backend = SpySqlExecutionBackend()
+
+    default = await ExecuteSqlTool().run(sql_request)
+    shared = await ExecuteSqlTool(backend=backend).run(sql_request)
+
+    assert default.error is not None and shared.error is not None
+    assert (default.error.code, default.error.retryable) == (
+        shared.error.code,
+        shared.error.retryable,
+    ) == (expected_code, False)
+    assert default_calls == backend.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (TimeoutError("private timeout"), ErrorCode.QUERY_TIMEOUT),
+        (RuntimeError("private database error"), ErrorCode.EXECUTION_FAILED),
+    ],
+)
+async def test_shared_and_default_execution_errors_are_equivalent(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    expected_code: ErrorCode,
+) -> None:
+    default_calls = 0
+
+    async def execute(_validated: ValidatedSql, _params: tuple[object, ...]) -> QueryResult:
+        nonlocal default_calls
+        default_calls += 1
+        raise error
+
+    monkeypatch.setattr("governed_analytics.tools.tools._execute", execute)
+    backend = SpySqlExecutionBackend(error=error)
+    request = ExecuteSqlRequest(sql="select 1 as value")
+
+    default = await ExecuteSqlTool().run(request)
+    shared = await ExecuteSqlTool(backend=backend).run(request)
+
+    assert default.error is not None and shared.error is not None
+    assert (default.error.code, default.error.retryable) == (
+        shared.error.code,
+        shared.error.retryable,
+    ) == (expected_code, True)
+    assert default_calls == backend.calls == 1
 
 
 def test_schema_contract_has_keys_types_nullability_enums_and_foreign_keys() -> None:

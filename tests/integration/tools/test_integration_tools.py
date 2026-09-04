@@ -1,5 +1,9 @@
+import json
+
 import pytest
 
+from governed_analytics.agent.contracts import ActionType, AgentAction
+from governed_analytics.agent.tool_registry import ToolRegistry
 from governed_analytics.config import DatabaseSettings
 from governed_analytics.persistence.database import create_async_database_engine
 from governed_analytics.safety.sql_policy import ValidatedSql
@@ -37,6 +41,39 @@ async def test_shared_backend_matches_default_and_remains_owned_by_caller() -> N
     assert shared_second.ok and shared_second.data is not None
     assert default.ok and default.data is not None
     assert shared_first.data == shared_second.data == default.data
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_registry_real_database_invalid_alias_fails_closed_without_leak() -> None:
+    sentinel = "unsafe alias integration sentinel"
+    engine = create_async_database_engine(DatabaseSettings())  # type: ignore[call-arg]
+    backend = AsyncEngineSqlExecutionBackend(engine)
+    registry = ToolRegistry.default(
+        SchemaTool(),
+        MetricTool(),
+        ProfileTool(backend=backend),
+        ExecuteSqlTool(backend=backend),
+    )
+    action = AgentAction(
+        action_type=ActionType.EXECUTE_SQL,
+        purpose="unsafe alias integration purpose",
+        arguments={"sql": f'select 1 as "{sentinel}"'},
+        hypothesis_id="metric_value",
+        contract_id="metric_value",
+        expected_evidence="metric value",
+    )
+    try:
+        invocation = await registry.invoke(action, node="invoke_tool")
+    finally:
+        await engine.dispose()
+
+    assert not invocation.observation.ok
+    assert invocation.observation.safe_error == "output_shape_policy"
+    assert invocation.trace.safe_error == "output_shape_policy"
+    assert invocation.observation.payload is None
+    assert invocation.observation.columns == invocation.trace.columns == ()
+    assert sentinel not in json.dumps(invocation.model_dump())
 
 
 def test_static_tools_expose_full_ordered_contract() -> None:

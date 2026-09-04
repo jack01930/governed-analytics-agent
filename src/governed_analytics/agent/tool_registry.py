@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Literal, cast
 from uuid import uuid4
 
@@ -60,19 +61,21 @@ class SafeSqlDiagnostic(StrEnum):
     TOOL_NOT_ALLOWED_IN_NODE = "tool_not_allowed_in_node"
 
 
-SQL_DIAGNOSTICS: Mapping[SqlRejectionCode, SafeSqlDiagnostic] = {
-    SqlRejectionCode.EMPTY_SQL: SafeSqlDiagnostic.MALFORMED_SQL,
-    SqlRejectionCode.INVALID_SQL: SafeSqlDiagnostic.MALFORMED_SQL,
-    SqlRejectionCode.MULTIPLE_STATEMENTS: SafeSqlDiagnostic.READ_ONLY_POLICY,
-    SqlRejectionCode.NOT_READONLY_QUERY: SafeSqlDiagnostic.READ_ONLY_POLICY,
-    SqlRejectionCode.FORBIDDEN_STATEMENT: SafeSqlDiagnostic.READ_ONLY_POLICY,
-    SqlRejectionCode.FORBIDDEN_RELATION: SafeSqlDiagnostic.FORBIDDEN_RELATION,
-    SqlRejectionCode.FORBIDDEN_FUNCTION: SafeSqlDiagnostic.FORBIDDEN_FUNCTION,
-    SqlRejectionCode.NONDETERMINISTIC_FUNCTION: SafeSqlDiagnostic.NONDETERMINISTIC_QUERY,
-    SqlRejectionCode.SELECT_STAR: SafeSqlDiagnostic.OUTPUT_SHAPE_POLICY,
-    SqlRejectionCode.SENSITIVE_RAW_OUTPUT: SafeSqlDiagnostic.SENSITIVE_OUTPUT,
-    SqlRejectionCode.WITH_TIES: SafeSqlDiagnostic.OUTPUT_SHAPE_POLICY,
-}
+SQL_DIAGNOSTICS: Mapping[SqlRejectionCode, SafeSqlDiagnostic] = MappingProxyType(
+    {
+        SqlRejectionCode.EMPTY_SQL: SafeSqlDiagnostic.MALFORMED_SQL,
+        SqlRejectionCode.INVALID_SQL: SafeSqlDiagnostic.MALFORMED_SQL,
+        SqlRejectionCode.MULTIPLE_STATEMENTS: SafeSqlDiagnostic.READ_ONLY_POLICY,
+        SqlRejectionCode.NOT_READONLY_QUERY: SafeSqlDiagnostic.READ_ONLY_POLICY,
+        SqlRejectionCode.FORBIDDEN_STATEMENT: SafeSqlDiagnostic.READ_ONLY_POLICY,
+        SqlRejectionCode.FORBIDDEN_RELATION: SafeSqlDiagnostic.FORBIDDEN_RELATION,
+        SqlRejectionCode.FORBIDDEN_FUNCTION: SafeSqlDiagnostic.FORBIDDEN_FUNCTION,
+        SqlRejectionCode.NONDETERMINISTIC_FUNCTION: SafeSqlDiagnostic.NONDETERMINISTIC_QUERY,
+        SqlRejectionCode.SELECT_STAR: SafeSqlDiagnostic.OUTPUT_SHAPE_POLICY,
+        SqlRejectionCode.SENSITIVE_RAW_OUTPUT: SafeSqlDiagnostic.SENSITIVE_OUTPUT,
+        SqlRejectionCode.WITH_TIES: SafeSqlDiagnostic.OUTPUT_SHAPE_POLICY,
+    }
+)
 
 _TOOL_DIAGNOSTICS: Mapping[ErrorCode, SafeSqlDiagnostic] = {
     ErrorCode.INVALID_REQUEST: SafeSqlDiagnostic.INVALID_REQUEST,
@@ -190,7 +193,11 @@ def _execute_adapter(arguments: Mapping[str, JsonValue]) -> ExecuteSqlRequest:
     try:
         validate_sql(sql)
     except SqlPolicyError as error:
-        raise _RegistryDiagnostic(SQL_DIAGNOSTICS[error.code]) from None
+        diagnostic = SQL_DIAGNOSTICS.get(
+            error.code,
+            SafeSqlDiagnostic.READ_ONLY_POLICY,
+        )
+        raise _RegistryDiagnostic(diagnostic) from None
     except ValueError:
         raise _RegistryDiagnostic(SafeSqlDiagnostic.MALFORMED_SQL) from None
     return ExecuteSqlRequest.model_validate(dict(arguments))
@@ -392,13 +399,20 @@ class ToolRegistry:
             return self._failure(action, diagnostic, request=request)
         try:
             payload = definition.result_sanitizer(response.data)
-        except (TypeError, ValueError):
+            invocation = self._success(
+                action,
+                request=request,
+                result=response.data,
+                payload=payload,
+            )
+            _ = invocation.observation.safe_summary
+            return invocation
+        except (TypeError, ValueError, ValidationError):
             return self._failure(
                 action,
-                SafeSqlDiagnostic.DATABASE_ERROR,
+                SafeSqlDiagnostic.OUTPUT_SHAPE_POLICY,
                 request=request,
             )
-        return self._success(action, request=request, result=response.data, payload=payload)
 
     def _success(
         self,

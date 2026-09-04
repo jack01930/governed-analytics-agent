@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import fields
 from datetime import UTC, datetime
+from types import MappingProxyType
 
 import pytest
 
@@ -217,6 +218,29 @@ def test_registry_definitions_and_sql_diagnostics_are_closed_and_auditable() -> 
         SqlRejectionCode.SENSITIVE_RAW_OUTPUT: SafeSqlDiagnostic.SENSITIVE_OUTPUT,
         SqlRejectionCode.WITH_TIES: SafeSqlDiagnostic.OUTPUT_SHAPE_POLICY,
     }
+    assert set(SQL_DIAGNOSTICS) == set(SqlRejectionCode)
+    with pytest.raises(TypeError):
+        SQL_DIAGNOSTICS[SqlRejectionCode.EMPTY_SQL] = (  # type: ignore[index]
+            SafeSqlDiagnostic.READ_ONLY_POLICY
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_preflight_mapping_gap_fails_closed_without_backend_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from governed_analytics.agent import tool_registry
+
+    backend = SpySqlExecutionBackend()
+    registry = default_registry(backend=backend)
+    monkeypatch.setattr(tool_registry, "SQL_DIAGNOSTICS", MappingProxyType({}))
+
+    invocation = await registry.invoke(
+        execute_action("drop table orders"), node="invoke_tool"
+    )
+
+    assert invocation.observation.safe_error == "read_only_policy"
+    assert backend.calls == 0
 
 
 @pytest.mark.asyncio
@@ -358,6 +382,34 @@ async def test_database_exception_is_reduced_to_stable_metadata() -> None:
     rendered = json.dumps(invocation.model_dump())
     assert invocation.observation.safe_error == "database_error"
     assert raw_error not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("column", ["unsafe alias sentinel", "?column?"])
+async def test_invalid_result_columns_fail_closed_without_leaking_alias(column: str) -> None:
+    backend = SpySqlExecutionBackend(
+        result=QueryResult(
+            query_id="d" * 64,
+            columns=(column,),
+            rows=((1,),),
+            row_count=1,
+        )
+    )
+
+    invocation = await default_registry(backend=backend).invoke(
+        execute_action('select 1 as "unsafe alias sentinel"'),
+        node="invoke_tool",
+    )
+
+    assert not invocation.observation.ok
+    assert invocation.observation.safe_error == "output_shape_policy"
+    assert invocation.trace.safe_error == "output_shape_policy"
+    assert invocation.observation.payload is None
+    assert invocation.observation.columns == invocation.trace.columns == ()
+    assert backend.calls == 1
+    rendered = json.dumps(invocation.model_dump())
+    assert column not in rendered
+    assert "unsafe alias sentinel" not in rendered
 
 
 def test_tool_data_to_json_recursively_normalizes_models_sequences_and_mappings() -> None:
