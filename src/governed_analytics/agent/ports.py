@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from governed_analytics.agent.contracts import (
     ActionType,
     AgentAction,
+    AgentFinishReason,
     GovernanceSnapshot,
     JsonValue,
     ModelCallTrace,
@@ -27,6 +28,32 @@ from governed_analytics.agent.contracts import (
     ToolCallTrace,
     ToolInvocation,
 )
+
+
+class AgentModelError(ValueError):
+    """Stable Agent-model failure carrying only safe call-accounting metadata."""
+
+    def __init__(
+        self,
+        category: str,
+        *,
+        provider_model: str | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        latency_ms: int = 0,
+        finish_reason: AgentFinishReason | None = None,
+        output_truncated: bool = False,
+    ) -> None:
+        if not category.strip():
+            raise ValueError("category must not be blank")
+        self.category = category
+        self.provider_model = provider_model
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.latency_ms = latency_ms
+        self.finish_reason = finish_reason
+        self.output_truncated = output_truncated
+        super().__init__(category)
 
 
 class AgentModel(Protocol):
@@ -170,6 +197,7 @@ class AgentContext:
 __all__ = [
     "AgentContext",
     "AgentModel",
+    "AgentModelError",
     "AgentTools",
     "BudgetPort",
     "Clock",
