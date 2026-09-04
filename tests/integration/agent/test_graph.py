@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from time import monotonic
 from typing import cast
-from urllib.parse import unquote, urlsplit
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from governed_analytics.agent import (
     ActionType,
@@ -321,9 +323,7 @@ SIMPLE_SCRIPTS = cast(
                     "null_policy": "preserve",
                     "zero_denominator_policy": "return_null",
                     "fill_policy": "none",
-                    "hypotheses": (
-                        {"hypothesis_id": "metric_value", "kind": "metric_value"},
-                    ),
+                    "hypotheses": ({"hypothesis_id": "metric_value", "kind": "metric_value"},),
                 },
             ),
             "action": (
@@ -413,9 +413,9 @@ PREMISE_NOT_MET_SCRIPTS = _attribution_scripts(
 
 async def _run_fixture(query: str, scripts: AgentScripts, run_id: str) -> AgentRunResult:
     database = DatabaseSettings()  # type: ignore[call-arg]
-    assert unquote(urlsplit(database.database_url).username or "") == "analytics_readonly"
     engine = create_async_database_engine(database)
     try:
+        await _assert_readonly_database_identity(engine)
         backend = AsyncEngineSqlExecutionBackend(engine)
         registry = ToolRegistry.default(
             SchemaTool(),
@@ -446,15 +446,51 @@ async def _run_fixture(query: str, scripts: AgentScripts, run_id: str) -> AgentR
         await engine.dispose()
 
 
+async def _assert_readonly_database_identity(engine: AsyncEngine) -> None:
+    async with engine.connect() as connection, connection.begin():
+        await connection.execute(text("set transaction isolation level repeatable read, read only"))
+        proof = await connection.execute(
+            text(
+                """
+                select current_user, current_setting('transaction_read_only'),
+                  has_table_privilege(current_user, 'public.orders', 'SELECT'),
+                  has_table_privilege(current_user, 'public.orders', 'INSERT'),
+                  has_table_privilege(current_user, 'public.orders', 'UPDATE'),
+                  has_table_privilege(current_user, 'public.orders', 'DELETE'),
+                  has_schema_privilege(current_user, 'public', 'CREATE')
+                """
+            )
+        )
+        assert proof.one() == (
+            "analytics_readonly",
+            "on",
+            True,
+            False,
+            False,
+            False,
+            False,
+        )
+
+
 async def run_metric_fixture(metric_id: str) -> AgentRunResult:
     assert metric_id == "gmv"
     return await _run_fixture(SIMPLE_GMV_QUERY, SIMPLE_SCRIPTS, "integration-simple-gmv")
 
 
 def _execute_observations(result: AgentRunResult) -> tuple[Observation, ...]:
-    return tuple(
-        item for item in result.observations if item.tool_name is ActionType.EXECUTE_SQL
-    )
+    return tuple(item for item in result.observations if item.tool_name is ActionType.EXECUTE_SQL)
+
+
+def _result_decimal(observation: Observation, column: str) -> Decimal:
+    payload = observation.payload
+    assert isinstance(payload, Mapping)
+    columns = payload["columns"]
+    rows = payload["rows"]
+    assert isinstance(columns, tuple)
+    assert isinstance(rows, tuple) and len(rows) == 1
+    row = rows[0]
+    assert isinstance(row, tuple)
+    return Decimal(str(row[columns.index(column)]))
 
 
 @pytest.mark.integration
@@ -469,6 +505,9 @@ async def test_gmv_runs_through_agent_registry_and_real_backend() -> None:
     assert observation.contract_id == "metric_value_contract"
     assert observation.query_id is not None and len(observation.query_id) == 64
     assert not observation.possibly_truncated
+    assert observation.columns == ("gmv",)
+    assert observation.row_count == 1
+    assert _result_decimal(observation, "gmv") == Decimal("94636.23")
     assert result.observation_validations[0].valid
     assert result.evidence
     assert {item.query_id for item in result.evidence} == {observation.query_id}
@@ -510,6 +549,9 @@ async def test_gmv_attribution_runs_comparison_region_sku_and_segment() -> None:
             for evidence in result.evidence
         )
     assert result.governance.execute_calls == result.governance.action_loops == 4
+    comparison = execute[0]
+    assert _result_decimal(comparison, "current_gmv") == Decimal("17893.50")
+    assert _result_decimal(comparison, "previous_gmv") == Decimal("50873.80")
 
 
 @pytest.mark.integration
@@ -528,6 +570,8 @@ async def test_current_at_least_previous_stops_after_comparison() -> None:
     assert result.final_answer.stop_reason is StopReason.PREMISE_NOT_MET
     assert tuple(item.contract_id for item in execute) == ("gmv_comparison",)
     assert result.governance.execute_calls == result.governance.action_loops == 1
+    assert _result_decimal(execute[0], "current_gmv") == Decimal("15473.88")
+    assert _result_decimal(execute[0], "previous_gmv") == Decimal("9497.32")
     comparison_evidence = tuple(
         item for item in result.evidence if item.contract_id == "gmv_comparison"
     )
