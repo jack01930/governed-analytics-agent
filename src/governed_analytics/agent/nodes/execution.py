@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from datetime import datetime
 from uuid import uuid4
 
 from langgraph.runtime import Runtime
@@ -43,6 +44,38 @@ from governed_analytics.agent.validation import (
 from governed_analytics.runtime.budgets import BudgetExceeded
 
 _SAFE_COLUMN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_TOOL_ERRORS = frozenset(
+    {
+        "malformed_sql",
+        "read_only_policy",
+        "forbidden_relation",
+        "forbidden_function",
+        "nondeterministic_query",
+        "output_shape_policy",
+        "sensitive_output",
+        "invalid_request",
+        "not_found",
+        "sql_timeout",
+        "database_error",
+        "tool_not_allowed_in_node",
+        "internal_tool_error",
+    }
+)
+_PROFILE_OPERATIONS = frozenset(
+    {"time_range", "numeric_summary", "null_summary", "distinct_values", "top_values"}
+)
+_PROFILE_ARGUMENTS = frozenset(
+    {
+        "table_name",
+        "column_name",
+        "operation",
+        "filters",
+        "time_column",
+        "start_at",
+        "end_at",
+        "limit",
+    }
+)
 
 
 def tool_started_data(action: AgentAction) -> Mapping[str, JsonValue]:
@@ -199,7 +232,31 @@ def _valid_action_target(state: AgentState, action: AnalysisAction, pending: str
     if action.hypothesis_id != pending:
         return False
     if action.action_type is ActionType.PROFILE:
-        return action.contract_id is None
+        metadata = _profile_safe_arguments(action)
+        if action.contract_id is not None or metadata is None:
+            return False
+        arguments = action.arguments
+        table_name = arguments.get("table_name")
+        column_name = arguments.get("column_name")
+        time_column = arguments.get("time_column")
+        raw_filters = arguments.get("filters", ())
+        identifiers = [table_name, column_name]
+        if time_column is not None:
+            identifiers.append(time_column)
+        if isinstance(raw_filters, tuple):
+            identifiers.extend(
+                item.get("column_name") for item in raw_filters if isinstance(item, Mapping)
+            )
+        if any(not isinstance(item, str) or sensitive_identifier(item) for item in identifiers):
+            return False
+        table = next(
+            (item for item in state["schema_context"] if item.name == table_name),
+            None,
+        )
+        if table is None:
+            return False
+        columns = {item.name for item in table.columns}
+        return all(item in columns for item in identifiers[1:])
     contract = state["answer_contract"]
     if contract is None or action.contract_id is None:
         return False
@@ -365,7 +422,7 @@ def _safe_failure_invocation(
     safe_error: str = "internal_tool_error",
 ) -> ToolInvocation:
     purpose = _event_purpose(action)
-    safe_arguments: tuple[tuple[str, JsonValue], ...] = ()
+    safe_arguments: tuple[tuple[str, JsonValue], ...]
     if action.action_type is ActionType.EXECUTE_SQL:
         safe_arguments = tuple(
             (name, value)
@@ -375,6 +432,10 @@ def _safe_failure_invocation(
             )
             if value is not None
         )
+    elif action.action_type is ActionType.PROFILE:
+        safe_arguments = _profile_safe_arguments(action) or ()
+    else:
+        safe_arguments = ()
     observation = Observation(
         observation_id=uuid4().hex,
         tool_name=action.action_type,
@@ -393,6 +454,78 @@ def _safe_failure_invocation(
     return ToolInvocation(observation=observation, trace=trace)
 
 
+def _profile_safe_arguments(action: AgentAction) -> tuple[tuple[str, JsonValue], ...] | None:
+    arguments = action.arguments
+    if not set(arguments).issubset(_PROFILE_ARGUMENTS):
+        return None
+    table_name = arguments.get("table_name")
+    column_name = arguments.get("column_name")
+    operation = arguments.get("operation", "distinct_values")
+    limit = arguments.get("limit", 50)
+    raw_filters = arguments.get("filters", ())
+    if (
+        not isinstance(table_name, str)
+        or not isinstance(column_name, str)
+        or operation not in _PROFILE_OPERATIONS
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or not 1 <= limit <= 50
+        or not isinstance(raw_filters, tuple)
+    ):
+        return None
+    filter_columns: list[str] = []
+    for item in raw_filters:
+        if not isinstance(item, Mapping):
+            return None
+        filter_column = item.get("column_name")
+        value = item.get("value")
+        if (
+            set(item) != {"column_name", "value"}
+            or not isinstance(filter_column, str)
+            or type(value) not in {str, int, float, bool}
+            or filter_column in filter_columns
+        ):
+            return None
+        filter_columns.append(filter_column)
+    start_at = arguments.get("start_at")
+    end_at = arguments.get("end_at")
+    time_column = arguments.get("time_column")
+    has_window = start_at is not None or end_at is not None
+    if has_window:
+        if (
+            not isinstance(start_at, str)
+            or not isinstance(end_at, str)
+            or not isinstance(time_column, str)
+        ):
+            return None
+        try:
+            start = datetime.fromisoformat(start_at)
+            end = datetime.fromisoformat(end_at)
+        except ValueError:
+            return None
+        if (
+            start.tzinfo is None
+            or start.utcoffset() is None
+            or end.tzinfo is None
+            or end.utcoffset() is None
+            or start >= end
+        ):
+            return None
+    elif time_column is not None:
+        return None
+    values: dict[str, JsonValue] = {
+        "table_name": table_name,
+        "column_name": column_name,
+        "operation": operation,
+        "filter_columns": tuple(filter_columns),
+        "has_time_window": has_window,
+        "limit": limit,
+    }
+    if isinstance(time_column, str):
+        values["time_column"] = time_column
+    return tuple(sorted(values.items()))
+
+
 def _invocation_matches_action(action: AgentAction, invocation: ToolInvocation) -> bool:
     observation = invocation.observation
     trace = invocation.trace
@@ -403,6 +536,12 @@ def _invocation_matches_action(action: AgentAction, invocation: ToolInvocation) 
         or trace.purpose != _event_purpose(action)
         or observation.contract_id != action.contract_id
         or observation.hypothesis_id != action.hypothesis_id
+        or observation.safe_error != trace.safe_error
+        or observation.query_id != trace.query_id
+        or observation.columns != trace.columns
+        or observation.row_count != trace.row_count
+        or observation.possibly_truncated != trace.possibly_truncated
+        or (observation.safe_error is not None and observation.safe_error not in _SAFE_TOOL_ERRORS)
     ):
         return False
     if action.action_type is ActionType.EXECUTE_SQL:
@@ -415,7 +554,26 @@ def _invocation_matches_action(action: AgentAction, invocation: ToolInvocation) 
             if value is not None
         )
         return trace.safe_arguments == expected_arguments
-    return True
+    profile_arguments = _profile_safe_arguments(action)
+    if observation.safe_error == "invalid_request":
+        return trace.safe_arguments == () or (
+            profile_arguments is not None and trace.safe_arguments == profile_arguments
+        )
+    if profile_arguments is None or trace.safe_arguments != profile_arguments:
+        return False
+    if not observation.ok:
+        return True
+    operation = dict(profile_arguments)["operation"]
+    if not isinstance(operation, str):
+        return False
+    expected_columns = {
+        "distinct_values": ("value",),
+        "top_values": ("value", "value_count"),
+        "null_summary": ("null_count", "row_count"),
+        "numeric_summary": ("min_value", "max_value", "avg_value"),
+        "time_range": ("min_value", "max_value"),
+    }[operation]
+    return observation.columns == expected_columns
 
 
 async def invoke_tool(
@@ -522,6 +680,26 @@ def _consume_pending_loop(state: AgentState, context: AgentContext) -> dict[str,
     return {"action_loop_pending": False, "governance": governance}
 
 
+def _pending_result_repair(state: AgentState) -> bool:
+    if (
+        state["action_loop_pending"]
+        or len(state["observations"]) < 2
+        or not state["observation_validations"]
+        or state["governance"].repair_count != len(state["repair_history"]) + 1
+    ):
+        return False
+    previous_validation = state["observation_validations"][-1]
+    previous_observation = state["observations"][-2]
+    action = state["next_action"]
+    return (
+        not previous_validation.valid
+        and previous_validation.observation_id == previous_observation.observation_id
+        and action is not None
+        and action.action_type is ActionType.EXECUTE_SQL
+        and action.contract_id == previous_validation.contract_id
+    )
+
+
 async def validate_profile(
     state: AgentState,
     runtime: Runtime[AgentContext],
@@ -565,6 +743,15 @@ async def validate_observation_node(
 ) -> dict[str, object]:
     context = runtime.context
     started_at = context.clock.monotonic()
+    loop_consumed = False
+
+    def consume_loop_once() -> dict[str, object]:
+        nonlocal loop_consumed
+        if loop_consumed or not state["action_loop_pending"]:
+            return {}
+        loop_consumed = True
+        return _consume_pending_loop(state, context)
+
     try:
         action = state["next_action"]
         observation = state["observations"][-1]
@@ -574,7 +761,7 @@ async def validate_observation_node(
         if not observation.ok:
             failed_delta = {
                 "stop_reason": safe_error_stop_reason(observation.safe_error),
-                **_consume_pending_loop(state, context),
+                **consume_loop_once(),
             }
             if not await emit_domain_event(
                 context,
@@ -600,6 +787,7 @@ async def validate_observation_node(
             raise ValueError("missing answer contract")
         contract = answer_contract.contract(action.contract_id)
         validation = validate_observation(action, observation, contract)
+        pending_repair = _pending_result_repair(state)
         if not await emit_domain_event(
             context,
             node="validate_observation",
@@ -616,8 +804,39 @@ async def validate_observation_node(
             "observation_validations": (validation,),
             "stop_reason": None,
         }
+        if pending_repair:
+            previous = state["observations"][-2]
+            previous_validation = state["observation_validations"][-1]
+            record = _result_repair_record(
+                original=previous,
+                action=action,
+                error_code=previous_validation.error_code or "answer_contract_unmet",
+                outcome="success" if validation.valid else "failed",
+                repaired=observation if validation.valid else None,
+            )
+            if not await emit_domain_event(
+                context,
+                node="validate_observation",
+                event_type="repair.completed",
+                data=repair_event_data(
+                    repair_count=context.budget.snapshot.repair_count,
+                    error_code=previous_validation.error_code or "answer_contract_unmet",
+                    success=validation.valid,
+                ),
+            ):
+                raise SafeDependencyError("event_sink_failed")
+            delta["repair_history"] = (record,)
+            if not validation.valid:
+                delta["stop_reason"] = StopReason.REPAIR_FAILED
+            return finish_node(
+                context=context,
+                node="validate_observation",
+                started_at=started_at,
+                outcome="completed" if validation.valid else "failed",
+                delta=delta,
+            )
         if not validation.valid:
-            delta.update(_consume_pending_loop(state, context))
+            delta.update(consume_loop_once())
             decision = repair_decision(
                 validation,
                 state["repair_history"],
@@ -644,7 +863,7 @@ async def validate_observation_node(
     except Exception as error:
         delta = failure_delta(error, context)
         try:
-            delta.update(_consume_pending_loop(state, context))
+            delta.update(consume_loop_once())
         except Exception:
             delta["governance"] = context.budget.snapshot
         return finish_node(
@@ -797,6 +1016,8 @@ async def repair(
     invocation = None
     tool_invocation = None
     tool_trace_recorded = False
+    started_emitted = False
+    completion_attempted = False
     try:
         if context.budget.snapshot.soft_cap_reached:
             raise BudgetExceeded(StopReason.COST_SOFT_CAP)
@@ -812,6 +1033,7 @@ async def repair(
             ),
         ):
             raise SafeDependencyError("event_sink_failed")
+        started_emitted = True
         request = StructuredModelRequest.for_output(
             purpose="repair",
             system_prompt=("Repair the result contract once. Return one execute_sql action only."),
@@ -861,54 +1083,44 @@ async def repair(
             observation=tool_invocation.observation,
         ):
             raise SafeDependencyError("event_sink_failed")
-        answer_contract = state["answer_contract"]
-        if answer_contract is None or repaired_action.contract_id is None:
-            raise ValueError("repair contract is missing")
-        contract = answer_contract.contract(repaired_action.contract_id)
-        repaired_validation = validate_observation(
-            repaired_action,
-            tool_invocation.observation,
-            contract,
-        )
-        success = tool_invocation.observation.ok and repaired_validation.valid
-        record = _result_repair_record(
-            original=original,
-            action=action,
-            error_code=error_code,
-            outcome="success" if success else "failed",
-            repaired=tool_invocation.observation if success else None,
-        )
-        if not await emit_domain_event(
-            context,
-            node="repair",
-            event_type="repair.completed",
-            data=repair_event_data(
-                repair_count=context.budget.snapshot.repair_count,
-                error_code=error_code,
-                success=success,
-            ),
-        ):
-            raise SafeDependencyError("event_sink_failed")
         delta: dict[str, object] = {
             "next_action": repaired_action,
             "observations": (tool_invocation.observation,),
             "tool_call_traces": (tool_invocation.trace,),
             "model_call_traces": invocation.traces,
-            "repair_history": (record,),
             "governance": context.budget.snapshot,
-            "stop_reason": (
-                None
-                if tool_invocation.observation.ok
-                else StopReason.REPAIR_FAILED
+            "stop_reason": None,
+        }
+        if not tool_invocation.observation.ok:
+            record = _result_repair_record(
+                original=original,
+                action=action,
+                error_code=error_code,
+                outcome="failed",
+            )
+            completion_attempted = True
+            if not await emit_domain_event(
+                context,
+                node="repair",
+                event_type="repair.completed",
+                data=repair_event_data(
+                    repair_count=context.budget.snapshot.repair_count,
+                    error_code=error_code,
+                    success=False,
+                ),
+            ):
+                raise SafeDependencyError("event_sink_failed")
+            delta["repair_history"] = (record,)
+            delta["stop_reason"] = (
+                StopReason.REPAIR_FAILED
                 if tool_invocation.observation.safe_error == "internal_tool_error"
                 else safe_error_stop_reason(tool_invocation.observation.safe_error)
-            ),
-        }
+            )
         return finish_node(
             context=context,
             node="repair",
             started_at=started_at,
-            outcome="completed" if success else "failed",
+            outcome="completed" if tool_invocation.observation.ok else "failed",
             delta=delta,
         )
     except Exception as error:
@@ -927,31 +1139,34 @@ async def repair(
             if isinstance(error, SafeDependencyError)
             else StopReason.REPAIR_FAILED
         )
-        record = _result_repair_record(
-            original=original,
-            action=action,
-            error_code=error_code,
-            outcome="failed",
-        )
-        delta["repair_history"] = (record,)
         if isinstance(error, StructuredInvocationError):
             delta["model_call_traces"] = error.traces
             delta["governance"] = error.governance
-        if not await emit_domain_event(
-            context,
-            node="repair",
-            event_type="repair.completed",
-            data=repair_event_data(
-                repair_count=context.budget.snapshot.repair_count,
+        if started_emitted and not completion_attempted:
+            record = _result_repair_record(
+                original=original,
+                action=action,
                 error_code=error_code,
-                success=False,
-            ),
-        ):
-            delta["stop_reason"] = StopReason.INTERNAL_ERROR
+                outcome="failed",
+            )
+            if await emit_domain_event(
+                context,
+                node="repair",
+                event_type="repair.completed",
+                data=repair_event_data(
+                    repair_count=context.budget.snapshot.repair_count,
+                    error_code=error_code,
+                    success=False,
+                ),
+            ):
+                delta["repair_history"] = (record,)
+            else:
+                delta["stop_reason"] = StopReason.INTERNAL_ERROR
         if isinstance(error, BudgetExceeded) and not await emit_budget_warning(
             context,
             node="repair",
             reason=error.reason,
+            force=True,
         ):
             delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(

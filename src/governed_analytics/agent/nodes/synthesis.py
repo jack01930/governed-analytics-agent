@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
-from decimal import Decimal, InvalidOperation
 
 from langgraph.runtime import Runtime
 
@@ -28,37 +26,6 @@ from governed_analytics.agent.ports import AgentContext, StructuredInvocationErr
 from governed_analytics.agent.state import AgentState
 from governed_analytics.agent.validation import assess_evidence
 from governed_analytics.runtime.budgets import BudgetExceeded
-
-_SENSITIVE_TOKENS = frozenset(
-    {
-        "apikey",
-        "alter",
-        "arguments",
-        "authorization",
-        "bearer",
-        "create",
-        "delete",
-        "drop",
-        "endpoint",
-        "filter",
-        "filters",
-        "insert",
-        "password",
-        "payload",
-        "prompt",
-        "raw",
-        "row",
-        "rows",
-        "secret",
-        "select",
-        "sql",
-        "token",
-        "truncate",
-        "update",
-        "url",
-    }
-)
-_NUMBER = re.compile(r"(?<![A-Za-z0-9_.])[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![A-Za-z0-9_.])")
 
 
 def _assessment(state: AgentState) -> EvidenceAssessment | None:
@@ -85,50 +52,20 @@ def _safe_evidence_payload(state: AgentState) -> tuple[Mapping[str, JsonValue], 
     )
 
 
-def _unsafe_string(value: str) -> bool:
-    lowered = value.casefold()
-    tokens = tuple(re.findall(r"[a-z0-9]+", lowered))
-    compact = "".join(tokens)
-    return (
-        any(token in _SENSITIVE_TOKENS for token in tokens)
-        or "apikey" in compact
-        or re.search(r"(?:sk|pk)-[a-z0-9]", lowered) is not None
-        or "http://" in lowered
-        or "https://" in lowered
-    )
-
-
-def _contains_unsafe_string(value: object) -> bool:
-    if isinstance(value, str):
-        return _unsafe_string(value)
-    if isinstance(value, Mapping):
-        return any(
-            _contains_unsafe_string(key) or _contains_unsafe_string(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, (tuple, list)):
-        return any(_contains_unsafe_string(item) for item in value)
-    return False
-
-
-def _safe_summary_string(value: str) -> str:
-    return "redacted" if _unsafe_string(value) else value
-
-
 def _result_summary(state: AgentState) -> Mapping[str, JsonValue]:
     return {
         "evidence": tuple(
             {
                 "evidence_id": item.evidence_id,
-                "claim_key": _safe_summary_string(item.claim_key),
+                "claim_key": item.claim_key,
                 "numeric_value": (
                     str(item.numeric_value) if item.numeric_value is not None else None
                 ),
-                "unit": (_safe_summary_string(item.unit) if item.unit is not None else None),
+                "unit": item.unit,
                 "dimensions": tuple(
                     {
-                        "name": _safe_summary_string(name),
-                        "value": _safe_summary_string(value),
+                        "name": name,
+                        "value": value,
                     }
                     for name, value in item.dimensions
                 ),
@@ -139,27 +76,7 @@ def _result_summary(state: AgentState) -> Mapping[str, JsonValue]:
     }
 
 
-def _answer_numbers_are_evidenced(state: AgentState, answer: FinalAnswer) -> bool:
-    referenced = {
-        item.evidence_id: item
-        for item in state["evidence"]
-        if item.verified and item.evidence_id in set(answer.evidence_ids)
-    }
-    allowed = {item.numeric_value for item in referenced.values() if item.numeric_value is not None}
-    text = " ".join((answer.answer, *answer.limitations))
-    for token in _NUMBER.findall(text):
-        try:
-            value = Decimal(token)
-        except InvalidOperation:
-            return False
-        if value not in allowed:
-            return False
-    return True
-
-
 def _valid_synthesis(state: AgentState, answer: FinalAnswer) -> bool:
-    if _contains_unsafe_string((answer.answer, answer.limitations, answer.result_summary)):
-        return False
     verified = tuple(item.evidence_id for item in state["evidence"] if item.verified)
     if set(answer.evidence_ids) != set(verified) or len(answer.evidence_ids) != len(verified):
         return False
@@ -169,8 +86,6 @@ def _valid_synthesis(state: AgentState, answer: FinalAnswer) -> bool:
     if (
         answer.completed_dimensions != assessment.resolved_hypotheses
         or answer.missing_dimensions != assessment.gaps
-        or not _answer_numbers_are_evidenced(state, answer)
-        or (answer.result_summary is not None and answer.result_summary != _result_summary(state))
     ):
         return False
     if assessment.complete:
@@ -183,7 +98,11 @@ def _valid_synthesis(state: AgentState, answer: FinalAnswer) -> bool:
             answer.status is FinalStatus.COMPLETED
             and answer.stop_reason is StopReason.PREMISE_NOT_MET
         )
-    return answer.status is FinalStatus.PARTIAL
+    return (
+        answer.status is FinalStatus.PARTIAL
+        and answer.stop_reason is StopReason.EVIDENCE_PARTIAL
+        and assessment.stop_reason is StopReason.EVIDENCE_PARTIAL
+    )
 
 
 async def synthesize(
@@ -211,14 +130,7 @@ async def synthesize(
         answer = invocation.result.output
         valid = _valid_synthesis(state, answer)
         if valid:
-            answer = answer.model_copy(
-                update={
-                    "evidence_ids": tuple(
-                        item.evidence_id for item in state["evidence"] if item.verified
-                    ),
-                    "result_summary": _result_summary(state),
-                }
-            )
+            answer = _deterministic_answer(state)
         delta: dict[str, object] = {
             "governance": invocation.governance,
             "model_call_traces": invocation.traces,

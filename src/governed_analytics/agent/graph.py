@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Literal, cast
 
+from langgraph.errors import NodeCancelledError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -214,8 +216,20 @@ async def run_agent(
             final_answer=final_answer,
             safe_trace=safe_trace,
         )
+    except NodeCancelledError:
+        raise asyncio.CancelledError from None
     except Exception:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError from None
         return _internal_fallback(run_id=run_id, context=context, state=state)
+
+
+def _prefer_live_history[T](state_items: tuple[T, ...], live_items: tuple[T, ...]) -> tuple[T, ...]:
+    common = min(len(state_items), len(live_items))
+    if state_items[:common] == live_items[:common]:
+        return state_items if len(state_items) > len(live_items) else live_items
+    return live_items
 
 
 def _internal_fallback(
@@ -224,22 +238,29 @@ def _internal_fallback(
     context: AgentContext,
     state: AgentState | None,
 ) -> AgentRunResult:
-    if state is not None:
-        fallback_trace = SafeTrace(
+    state_trace = (
+        SafeTrace(
             nodes=state["node_traces"],
             model_calls=state["model_call_traces"],
             tool_calls=state["tool_call_traces"],
         )
-        governance = state["governance"]
+        if state is not None
+        else SafeTrace()
+    )
+    try:
+        live_trace = context.trace_recorder.snapshot()
+    except Exception:
+        fallback_trace = state_trace
     else:
-        try:
-            fallback_trace = context.trace_recorder.snapshot()
-        except Exception:
-            fallback_trace = SafeTrace()
-        try:
-            governance = context.budget.snapshot
-        except Exception:
-            governance = GovernanceSnapshot()
+        fallback_trace = SafeTrace(
+            nodes=_prefer_live_history(state_trace.nodes, live_trace.nodes),
+            model_calls=_prefer_live_history(state_trace.model_calls, live_trace.model_calls),
+            tool_calls=_prefer_live_history(state_trace.tool_calls, live_trace.tool_calls),
+        )
+    try:
+        governance = context.budget.snapshot
+    except Exception:
+        governance = state["governance"] if state is not None else GovernanceSnapshot()
     answer = FinalAnswer(
         status=FinalStatus.INTERNAL_ERROR,
         stop_reason=StopReason.INTERNAL_ERROR,

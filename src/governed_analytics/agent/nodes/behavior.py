@@ -42,6 +42,15 @@ _BUDGET_STOP_REASONS = frozenset(
         StopReason.TASK_TIMEOUT,
     }
 )
+_GOVERNED_MISSING_FIELDS = frozenset(
+    {
+        "metric",
+        "time_window",
+        "previous_window",
+        "current_window",
+        "comparison_window",
+    }
+)
 _SENSITIVE_IDENTIFIER = re.compile(
     r"(?:^|[_.:-])(?:api[_-]?key|apikey|secret|password|token|authorization|bearer|"
     r"prompt|payload|endpoint)(?:$|[_.:-])|^(?:sk|pk)-",
@@ -196,8 +205,9 @@ async def emit_budget_warning(
     *,
     node: str,
     reason: StopReason,
+    force: bool = False,
 ) -> bool:
-    if reason not in _BUDGET_STOP_REASONS:
+    if not force and reason not in _BUDGET_STOP_REASONS:
         return True
     return await emit_domain_event(
         context,
@@ -262,6 +272,21 @@ async def decide_behavior(
         )
         invocation = await context.model_invoker.invoke(request, BehaviorDecision)
         decision = invocation.result.output
+        if not set(decision.missing_fields).issubset(_GOVERNED_MISSING_FIELDS):
+            invalid_delta: dict[str, object] = {
+                "stop_reason": StopReason.STRUCTURED_OUTPUT_INVALID,
+                "governance": invocation.governance,
+                "model_call_traces": invocation.traces,
+            }
+            if invocation.repair_record is not None:
+                invalid_delta["repair_history"] = (invocation.repair_record,)
+            return finish_node(
+                context=context,
+                node="decide_behavior",
+                started_at=started_at,
+                outcome="failed",
+                delta=invalid_delta,
+            )
         if not await emit_domain_event(
             context,
             node="decide_behavior",
