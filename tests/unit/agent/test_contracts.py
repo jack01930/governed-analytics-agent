@@ -15,6 +15,9 @@ from governed_analytics.agent.contracts import (
     BehaviorDecision,
     BehaviorReasonCode,
     ColumnContract,
+    ContextBundle,
+    FinalAnswer,
+    FinalStatus,
     GovernanceSnapshot,
     JsonValue,
     ModelUsage,
@@ -22,9 +25,12 @@ from governed_analytics.agent.contracts import (
     ObservationContract,
     ObservationValidation,
     ResultShape,
+    StopReason,
     StructuredModelRequest,
     StructuredModelResult,
     TimeWindow,
+    ToolCallTrace,
+    ToolInvocation,
 )
 
 
@@ -67,6 +73,24 @@ def test_answer_contract_has_distinct_subcontracts_for_attribution() -> None:
             answer_contract_id="bad",
             required_hypotheses=("confirm_decline",),
             observation_contracts=(comparison, comparison),
+        )
+
+
+def test_answer_contract_covers_every_required_hypothesis() -> None:
+    comparison = ObservationContract(
+        contract_id="gmv_comparison",
+        hypothesis_id="confirm_decline",
+        columns=(ColumnContract(name="current_gmv", data_type="decimal", role="metric"),),
+        shape=ResultShape.SCALAR,
+        min_rows=1,
+        max_rows=1,
+    )
+
+    with pytest.raises(ValidationError):
+        AnswerContract(
+            answer_contract_id="gmv_attribution",
+            required_hypotheses=("confirm_decline", "channel_contribution"),
+            observation_contracts=(comparison,),
         )
 
 
@@ -212,6 +236,42 @@ def test_structured_request_repair_preserves_bound_schema() -> None:
     assert repair.user_payload["failure_category"] == "schema_validation"
 
 
+def test_structured_request_rejects_schema_name_summary_mismatch() -> None:
+    with pytest.raises(ValidationError):
+        StructuredModelRequest(
+            purpose="behavior",
+            system_prompt="Return a decision.",
+            user_payload={"query": "GMV"},
+            output_schema_name="BehaviorDecision",
+            output_schema_summary={"title": "DifferentOutput", "type": "object"},
+            max_output_tokens=128,
+        )
+
+
+@pytest.mark.parametrize("forbidden_key", ["oracle", "expected_rows", "scorer_output"])
+def test_structured_request_rejects_evaluation_only_payload_keys(forbidden_key: str) -> None:
+    with pytest.raises(ValidationError):
+        StructuredModelRequest.for_output(
+            purpose="behavior",
+            system_prompt="Return a decision.",
+            user_payload={forbidden_key: "hidden"},
+            output_type=BehaviorDecision,
+            max_output_tokens=128,
+        )
+
+
+def test_structured_request_allows_forbidden_words_inside_user_query_text() -> None:
+    request = StructuredModelRequest.for_output(
+        purpose="behavior",
+        system_prompt="Return a decision.",
+        user_payload={"query": "Explain expected rows without using an Oracle scorer."},
+        output_type=BehaviorDecision,
+        max_output_tokens=128,
+    )
+
+    assert "Oracle scorer" in cast(str, request.user_payload["query"])
+
+
 def test_counters_and_money_are_non_negative() -> None:
     with pytest.raises(ValidationError):
         GovernanceSnapshot(llm_calls=-1)
@@ -262,3 +322,133 @@ def test_observation_validation_state_combinations_are_strict() -> None:
             contract_id="metric_value_contract",
             valid=False,
         )
+
+
+@pytest.mark.parametrize(
+    "unsafe_key",
+    [
+        "statement",
+        "params",
+        "raw_error",
+        "result_rows",
+        "api_key",
+        "access_token",
+        "service_url",
+        "prompt",
+        "sql",
+        "oracle",
+        "expected_rows",
+        "scorer_output",
+    ],
+)
+def test_final_answer_result_summary_rejects_sensitive_aliases(unsafe_key: str) -> None:
+    with pytest.raises(ValidationError):
+        FinalAnswer(
+            status=FinalStatus.COMPLETED,
+            stop_reason=StopReason.ANSWER_COMPLETE,
+            answer="done",
+            result_summary={"metrics": {unsafe_key: "hidden"}},
+        )
+
+
+def _context_observation(*, tool_name: ActionType, ok: bool) -> Observation:
+    return Observation(
+        observation_id=f"{tool_name.value}-observation",
+        tool_name=tool_name,
+        purpose="retrieve context",
+        ok=ok,
+        safe_error=None if ok else "lookup_failed",
+    )
+
+
+def test_context_bundle_requires_canonical_success_order() -> None:
+    metric = _context_observation(tool_name=ActionType.METRIC_LOOKUP, ok=True)
+    schema = _context_observation(tool_name=ActionType.SCHEMA_LOOKUP, ok=True)
+
+    with pytest.raises(ValidationError):
+        ContextBundle(ok=True, metrics=(), tables=(), observations=(schema, metric))
+
+
+def test_context_bundle_failure_stops_at_first_failed_observation() -> None:
+    metric_success = _context_observation(tool_name=ActionType.METRIC_LOOKUP, ok=True)
+    metric_failure = _context_observation(tool_name=ActionType.METRIC_LOOKUP, ok=False)
+    schema_failure = _context_observation(tool_name=ActionType.SCHEMA_LOOKUP, ok=False)
+
+    with pytest.raises(ValidationError):
+        ContextBundle(ok=False, metrics=(), tables=(), observations=(metric_success,))
+    with pytest.raises(ValidationError):
+        ContextBundle(
+            ok=False,
+            metrics=(),
+            tables=(),
+            observations=(metric_failure, schema_failure),
+        )
+
+
+def test_context_bundle_accepts_only_complete_or_first_failure_histories() -> None:
+    metric_success = _context_observation(tool_name=ActionType.METRIC_LOOKUP, ok=True)
+    metric_failure = _context_observation(tool_name=ActionType.METRIC_LOOKUP, ok=False)
+    schema_success = _context_observation(tool_name=ActionType.SCHEMA_LOOKUP, ok=True)
+    schema_failure = _context_observation(tool_name=ActionType.SCHEMA_LOOKUP, ok=False)
+
+    assert ContextBundle(
+        ok=True,
+        metrics=(),
+        tables=(),
+        observations=(metric_success, schema_success),
+    ).ok
+    assert not ContextBundle(
+        ok=False,
+        metrics=(),
+        tables=(),
+        observations=(metric_failure,),
+    ).ok
+    assert not ContextBundle(
+        ok=False,
+        metrics=(),
+        tables=(),
+        observations=(metric_success, schema_failure),
+    ).ok
+
+
+def test_tool_invocation_requires_all_observation_and_trace_metadata_to_match() -> None:
+    observation = Observation(
+        observation_id="observation-1",
+        tool_name=ActionType.EXECUTE_SQL,
+        purpose="calculate metric",
+        ok=True,
+        hypothesis_id="metric_value",
+        contract_id="metric_value_contract",
+        query_id="a" * 64,
+        columns=("gmv",),
+        row_count=1,
+        payload={"rows": ((125,),)},
+    )
+    matching_trace = ToolCallTrace(
+        tool_name=ActionType.EXECUTE_SQL,
+        purpose="calculate metric",
+        safe_arguments=(("contract_id", "metric_value_contract"),),
+        query_id="a" * 64,
+        columns=("gmv",),
+        row_count=1,
+    )
+
+    assert ToolInvocation(observation=observation, trace=matching_trace).observation is observation
+    mismatches: tuple[dict[str, object], ...] = (
+        {"tool_name": ActionType.PROFILE, "safe_arguments": ()},
+        {"purpose": "different purpose"},
+        {"query_id": "b" * 64},
+        {"columns": ("net_gmv",)},
+        {"row_count": 2},
+        {"possibly_truncated": True},
+        {
+            "query_id": None,
+            "columns": (),
+            "row_count": None,
+            "safe_error": "unexpected_error",
+        },
+    )
+    for updates in mismatches:
+        mismatched_trace = matching_trace.model_copy(update=updates)
+        with pytest.raises(ValidationError, match="metadata must match"):
+            ToolInvocation(observation=observation, trace=mismatched_trace)

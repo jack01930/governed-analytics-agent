@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum, StrEnum
@@ -202,33 +203,72 @@ def _thaw_json(value: JsonValue) -> JsonScalar | list[object] | dict[str, object
     return value
 
 
-_TRACE_FORBIDDEN_KEYS = frozenset(
+def _key_tokens(key: str) -> tuple[str, ...]:
+    snake_case = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", snake_case).strip("_").lower()
+    return tuple(token for token in normalized.split("_") if token)
+
+
+def _is_evaluation_only_key(key: str) -> bool:
+    tokens = _key_tokens(key)
+    return any(token in {"oracle", "expected", "scorer"} for token in tokens)
+
+
+_FINAL_SUMMARY_FORBIDDEN_TOKENS = frozenset(
     {
+        "apikey",
+        "authorization",
+        "binding",
+        "bindings",
+        "credential",
         "credentials",
         "endpoint",
-        "expected_rows",
-        "expected_sql",
-        "oracle",
+        "exception",
+        "param",
+        "parameter",
         "parameters",
+        "params",
+        "password",
         "payload",
         "prompt",
-        "provider_raw",
-        "raw_db_error",
+        "raw",
+        "record",
+        "records",
+        "row",
         "rows",
-        "scorer_output",
+        "secret",
         "sql",
+        "statement",
+        "token",
+        "traceback",
+        "uri",
+        "url",
     }
 )
 
 
-def _trace_json_has_forbidden_key(value: JsonValue) -> bool:
+def _is_final_summary_forbidden_key(key: str) -> bool:
+    tokens = _key_tokens(key)
+    compact = "".join(tokens)
+    return (
+        _is_evaluation_only_key(key)
+        or compact in {"apikey", "baseurl", "rawerror", "databaseerror"}
+        or any(token in _FINAL_SUMMARY_FORBIDDEN_TOKENS for token in tokens)
+    )
+
+
+def _json_has_forbidden_key(
+    value: JsonValue,
+    *,
+    predicate: Callable[[str], bool],
+) -> bool:
     if isinstance(value, Mapping):
         return any(
-            key.lower() in _TRACE_FORBIDDEN_KEYS or _trace_json_has_forbidden_key(item)
+            predicate(key) or _json_has_forbidden_key(item, predicate=predicate)
             for key, item in value.items()
         )
     if isinstance(value, tuple):
-        return any(_trace_json_has_forbidden_key(item) for item in value)
+        return any(_json_has_forbidden_key(item, predicate=predicate) for item in value)
     return False
 
 
@@ -436,6 +476,10 @@ class AnswerContract(_FrozenModel):
             self.required_hypotheses
         ):
             raise ValueError("observation contracts must reference required hypotheses")
+        if {item.hypothesis_id for item in self.observation_contracts} != set(
+            self.required_hypotheses
+        ):
+            raise ValueError("every required hypothesis must have an observation contract")
         return self
 
     def contract(self, contract_id: str) -> ObservationContract:
@@ -688,6 +732,14 @@ class StructuredModelRequest(_FrozenModel):
     def _validate_system_prompt(cls, value: str) -> str:
         return _require_nonblank(value)
 
+    @model_validator(mode="after")
+    def _validate_safe_payload_and_schema(self) -> StructuredModelRequest:
+        if _json_has_forbidden_key(self.user_payload, predicate=_is_evaluation_only_key):
+            raise ValueError("user payload cannot contain evaluation-only fields")
+        if self.output_schema_summary.get("title") != self.output_schema_name:
+            raise ValueError("output schema title must match output_schema_name")
+        return self
+
     @classmethod
     def for_output[T: BaseModel](
         cls,
@@ -822,6 +874,11 @@ class FinalAnswer(_FrozenModel):
                 raise ValueError("final-answer sequences must be unique")
         if set(self.completed_dimensions) & set(self.missing_dimensions):
             raise ValueError("completed and missing dimensions must be disjoint")
+        if self.result_summary is not None and _json_has_forbidden_key(
+            self.result_summary,
+            predicate=_is_final_summary_forbidden_key,
+        ):
+            raise ValueError("result summary contains unsafe or evaluation-only fields")
         allowed: dict[FinalStatus, set[StopReason]] = {
             FinalStatus.COMPLETED: {StopReason.ANSWER_COMPLETE, StopReason.PREMISE_NOT_MET},
             FinalStatus.PARTIAL: {StopReason.EVIDENCE_PARTIAL, StopReason.RESULT_TRUNCATED},
@@ -914,11 +971,7 @@ class ToolCallTrace(_FrozenModel):
         names = tuple(name for name, _ in self.safe_arguments)
         if len(names) != len(set(names)):
             raise ValueError("safe argument names must be unique")
-        if any(
-            name.lower() in _TRACE_FORBIDDEN_KEYS or _trace_json_has_forbidden_key(value)
-            for name, value in self.safe_arguments
-        ):
-            raise ValueError("safe arguments cannot contain sensitive or result payload fields")
+        self._validate_safe_argument_allowlist()
         if len(self.columns) != len(set(self.columns)):
             raise ValueError("trace columns must be unique")
         if self.query_id is not None and (
@@ -935,6 +988,67 @@ class ToolCallTrace(_FrozenModel):
             raise ValueError("failed tool traces cannot claim result metadata")
         return self
 
+    def _validate_safe_argument_allowlist(self) -> None:
+        allowed_keys: dict[ActionType, frozenset[str]] = {
+            ActionType.METRIC_LOOKUP: frozenset(),
+            ActionType.SCHEMA_LOOKUP: frozenset(),
+            ActionType.PROFILE: frozenset(
+                {
+                    "column_name",
+                    "filter_columns",
+                    "has_time_window",
+                    "limit",
+                    "operation",
+                    "table_name",
+                    "time_column",
+                }
+            ),
+            ActionType.EXECUTE_SQL: frozenset({"contract_id", "hypothesis_id"}),
+        }
+        values = dict(self.safe_arguments)
+        if not set(values).issubset(allowed_keys[self.tool_name]):
+            raise ValueError("safe arguments contain unknown keys for this tool")
+        if self.tool_name in {ActionType.METRIC_LOOKUP, ActionType.SCHEMA_LOOKUP}:
+            return
+        if self.tool_name is ActionType.EXECUTE_SQL:
+            if any(
+                type(value) is not str or re.fullmatch(_IDENTIFIER_PATTERN, value) is None
+                for value in values.values()
+            ):
+                raise ValueError("execute trace arguments must be identifiers")
+            return
+
+        identifier_keys = {"table_name", "column_name", "time_column"}
+        for name in identifier_keys & values.keys():
+            value = values[name]
+            if type(value) is not str or re.fullmatch(_IDENTIFIER_PATTERN, value) is None:
+                raise ValueError("profile trace identifiers must be bounded")
+        if "operation" in values:
+            operation = values["operation"]
+            if type(operation) is not str or operation not in {
+                "time_range",
+                "numeric_summary",
+                "null_summary",
+                "distinct_values",
+                "top_values",
+            }:
+                raise ValueError("profile trace operation is invalid")
+        if "has_time_window" in values and type(values["has_time_window"]) is not bool:
+            raise ValueError("profile has_time_window must be boolean")
+        if "limit" in values and (
+            type(values["limit"]) is not int or not 1 <= values["limit"] <= 50
+        ):
+            raise ValueError("profile limit must be between 1 and 50")
+        if "filter_columns" in values:
+            filter_columns = values["filter_columns"]
+            if not isinstance(filter_columns, tuple) or any(
+                type(value) is not str or re.fullmatch(_IDENTIFIER_PATTERN, value) is None
+                for value in filter_columns
+            ):
+                raise ValueError("profile filter_columns must contain identifiers")
+            if len(filter_columns) != len(set(filter_columns)):
+                raise ValueError("profile filter_columns must be unique")
+
 
 class SafeTrace(_FrozenModel):
     nodes: tuple[NodeTrace, ...] = ()
@@ -948,8 +1062,16 @@ class ToolInvocation(_FrozenModel):
 
     @model_validator(mode="after")
     def _validate_pair(self) -> ToolInvocation:
-        if self.observation.tool_name is not self.trace.tool_name:
-            raise ValueError("tool invocation observation and trace must match")
+        if (
+            self.observation.tool_name is not self.trace.tool_name
+            or self.observation.purpose != self.trace.purpose
+            or self.observation.query_id != self.trace.query_id
+            or self.observation.columns != self.trace.columns
+            or self.observation.row_count != self.trace.row_count
+            or self.observation.possibly_truncated != self.trace.possibly_truncated
+            or self.observation.safe_error != self.trace.safe_error
+        ):
+            raise ValueError("tool invocation observation and trace metadata must match")
         return self
 
 
@@ -976,16 +1098,21 @@ class ContextBundle(_FrozenModel):
 
     @model_validator(mode="after")
     def _validate_context(self) -> ContextBundle:
+        expected_order = (ActionType.METRIC_LOOKUP, ActionType.SCHEMA_LOOKUP)
+        actual_order = tuple(item.tool_name for item in self.observations)
         if self.ok:
-            if len(self.observations) != 2 or {item.tool_name for item in self.observations} != {
-                ActionType.METRIC_LOOKUP,
-                ActionType.SCHEMA_LOOKUP,
-            }:
+            if actual_order != expected_order:
                 raise ValueError("successful context requires metric and schema observations")
             if not all(item.ok for item in self.observations):
                 raise ValueError("successful context cannot contain failed observations")
-        elif len(self.observations) > 2:
-            raise ValueError("failed context can only preserve attempted observations")
+        elif (
+            not self.observations
+            or len(self.observations) > 2
+            or actual_order != expected_order[: len(actual_order)]
+            or self.observations[-1].ok
+            or not all(item.ok for item in self.observations[:-1])
+        ):
+            raise ValueError("failed context must stop after its first failed lookup")
         return self
 
 
@@ -1008,11 +1135,51 @@ class AgentRunResult(_FrozenModel):
         observation_ids = tuple(item.observation_id for item in self.observations)
         if len(observation_ids) != len(set(observation_ids)):
             raise ValueError("observation identifiers must be unique")
+        observations_by_id = {item.observation_id: item for item in self.observations}
         validation_ids = tuple(item.observation_id for item in self.observation_validations)
         if len(validation_ids) != len(set(validation_ids)) or not set(validation_ids).issubset(
             observation_ids
         ):
             raise ValueError("validations must uniquely reference observations")
+        for validation in self.observation_validations:
+            observation = observations_by_id[validation.observation_id]
+            if (
+                observation.tool_name is not ActionType.EXECUTE_SQL
+                or not observation.ok
+                or observation.contract_id != validation.contract_id
+            ):
+                raise ValueError(
+                    "validations must target successful execute observations "
+                    "with matching contracts"
+                )
+        validations_by_observation = {
+            item.observation_id: item for item in self.observation_validations
+        }
+        evidence_ids = tuple(item.evidence_id for item in self.evidence)
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("evidence identifiers must be unique")
+        for evidence in self.evidence:
+            if not evidence.verified:
+                continue
+            evidence_observation = observations_by_id.get(evidence.observation_id)
+            evidence_validation = validations_by_observation.get(evidence.observation_id)
+            if (
+                evidence_observation is None
+                or evidence_observation.tool_name is not ActionType.EXECUTE_SQL
+                or not evidence_observation.ok
+                or evidence_validation is None
+                or not evidence_validation.valid
+                or evidence_observation.contract_id != evidence.contract_id
+                or evidence_validation.contract_id != evidence.contract_id
+                or evidence_observation.hypothesis_id != evidence.hypothesis_id
+                or evidence_observation.query_id != evidence.query_id
+            ):
+                raise ValueError(
+                    "verified evidence must match a valid execute observation and validation"
+                )
+        verified_evidence_ids = {item.evidence_id for item in self.evidence if item.verified}
+        if not set(self.final_answer.evidence_ids).issubset(verified_evidence_ids):
+            raise ValueError("final answer can only reference verified evidence")
         if self.first_candidate is not None and self.first_candidate.observation_id not in set(
             observation_ids
         ):
