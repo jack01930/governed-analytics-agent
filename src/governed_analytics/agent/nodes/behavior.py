@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Literal
 
@@ -29,6 +30,28 @@ from governed_analytics.safety.sql_policy import SqlPolicyError
 
 MAX_QUERY_LENGTH = 4096
 
+_BUDGET_STOP_REASONS = frozenset(
+    {
+        StopReason.COST_SOFT_CAP,
+        StopReason.COST_HARD_CAP,
+        StopReason.LLM_CALL_LIMIT,
+        StopReason.TOOL_CALL_LIMIT,
+        StopReason.EXECUTE_LIMIT,
+        StopReason.PROFILE_LIMIT,
+        StopReason.ANALYSIS_LOOP_LIMIT,
+        StopReason.TASK_TIMEOUT,
+    }
+)
+_SENSITIVE_IDENTIFIER = re.compile(
+    r"(?:^|[_.:-])(?:api[_-]?key|apikey|secret|password|token|authorization|bearer|"
+    r"prompt|payload|endpoint)(?:$|[_.:-])|^(?:sk|pk)-",
+    re.IGNORECASE,
+)
+
+
+class SafeDependencyError(RuntimeError):
+    """A dependency failed after raw details were intentionally discarded."""
+
 
 def map_agent_failure(error: Exception) -> StopReason:
     """Reduce every graph-visible failure to the stable public reason set."""
@@ -37,8 +60,6 @@ def map_agent_failure(error: Exception) -> StopReason:
         return error.reason
     if isinstance(error, SqlPolicyError):
         return StopReason.SQL_POLICY_REJECTED
-    if isinstance(error, TimeoutError):
-        return StopReason.SQL_TIMEOUT
     if isinstance(error, StructuredInvocationError):
         return error.stop_reason
     if isinstance(error, AgentModelError):
@@ -71,7 +92,7 @@ def safe_error_stop_reason(safe_error: str | None) -> StopReason:
         "forbidden_function": StopReason.SQL_POLICY_REJECTED,
         "nondeterministic_query": StopReason.SQL_POLICY_REJECTED,
         "tool_not_allowed_in_node": StopReason.PLAN_INVALID,
-        "output_shape_policy": StopReason.ANSWER_CONTRACT_UNMET,
+        "output_shape_policy": StopReason.SQL_POLICY_REJECTED,
         "invalid_request": StopReason.PLAN_INVALID,
         "not_found": StopReason.PLAN_INVALID,
     }
@@ -100,15 +121,51 @@ def finish_node(
     started_at: float,
     outcome: Literal["completed", "failed", "skipped"],
     delta: dict[str, object],
+    consume_action_loop_on_failure: bool = False,
 ) -> dict[str, object]:
     trace = NodeTrace(
         node=node,
         duration_ms=max(0, round((context.clock.monotonic() - started_at) * 1000)),
         outcome=outcome,
     )
-    context.trace_recorder.append_node(trace)
+    try:
+        context.trace_recorder.append_node(trace)
+    except Exception:
+        delta.pop("node_traces", None)
+        delta["stop_reason"] = StopReason.INTERNAL_ERROR
+        delta["final_answer"] = None
+        delta["next_action"] = None
+        delta["action_loop_pending"] = False
+        if consume_action_loop_on_failure:
+            try:
+                delta["governance"] = context.budget.consume_action_loop()
+            except Exception:
+                delta["governance"] = context.budget.snapshot
+        else:
+            delta["governance"] = context.budget.snapshot
+        return delta
     delta["node_traces"] = (trace,)
     return delta
+
+
+async def emit_domain_event(
+    context: AgentContext,
+    *,
+    node: str,
+    event_type: str,
+    data: Mapping[str, JsonValue],
+) -> bool:
+    """Emit one safe domain event without exposing sink failures."""
+
+    try:
+        await context.events.emit(node, event_type, data)
+    except Exception:
+        return False
+    return True
+
+
+def sensitive_identifier(value: str) -> bool:
+    return _SENSITIVE_IDENTIFIER.search(value) is not None
 
 
 def behavior_event_data(decision: BehaviorDecision) -> Mapping[str, JsonValue]:
@@ -139,11 +196,14 @@ async def emit_budget_warning(
     *,
     node: str,
     reason: StopReason,
-) -> None:
-    await context.events.emit(
-        node,
-        "budget.warning",
-        budget_warning_data(reason, context.budget.snapshot),
+) -> bool:
+    if reason not in _BUDGET_STOP_REASONS:
+        return True
+    return await emit_domain_event(
+        context,
+        node=node,
+        event_type="budget.warning",
+        data=budget_warning_data(reason, context.budget.snapshot),
     )
 
 
@@ -202,11 +262,13 @@ async def decide_behavior(
         )
         invocation = await context.model_invoker.invoke(request, BehaviorDecision)
         decision = invocation.result.output
-        await context.events.emit(
-            "decide_behavior",
-            "behavior.decided",
-            behavior_event_data(decision),
-        )
+        if not await emit_domain_event(
+            context,
+            node="decide_behavior",
+            event_type="behavior.decided",
+            data=behavior_event_data(decision),
+        ):
+            raise SafeDependencyError("event_sink_failed")
         delta: dict[str, object] = {
             "behavior": decision,
             "stop_reason": behavior_stop_reason(decision),
@@ -216,11 +278,12 @@ async def decide_behavior(
         if invocation.repair_record is not None:
             delta["repair_history"] = (invocation.repair_record,)
         if invocation.governance.soft_cap_reached:
-            await emit_budget_warning(
+            if not await emit_budget_warning(
                 context,
                 node="decide_behavior",
                 reason=StopReason.COST_SOFT_CAP,
-            )
+            ):
+                raise SafeDependencyError("event_sink_failed")
             delta["stop_reason"] = StopReason.COST_SOFT_CAP
         return finish_node(
             context=context,
@@ -236,12 +299,14 @@ async def decide_behavior(
             delta["governance"] = invocation.governance
             if invocation.repair_record is not None:
                 delta["repair_history"] = (invocation.repair_record,)
-        if isinstance(error, (BudgetExceeded, StructuredInvocationError)):
-            await emit_budget_warning(
-                context,
-                node="decide_behavior",
-                reason=cast_stop_reason(delta["stop_reason"]),
-            )
+        if isinstance(
+            error, (BudgetExceeded, StructuredInvocationError)
+        ) and not await emit_budget_warning(
+            context,
+            node="decide_behavior",
+            reason=cast_stop_reason(delta["stop_reason"]),
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(
             context=context,
             node="decide_behavior",
@@ -256,13 +321,16 @@ def cast_stop_reason(value: object) -> StopReason:
 
 
 __all__ = [
+    "SafeDependencyError",
     "budget_warning_data",
     "cast_stop_reason",
     "decide_behavior",
     "emit_budget_warning",
+    "emit_domain_event",
     "failure_delta",
     "finish_node",
     "intake",
     "map_agent_failure",
     "safe_error_stop_reason",
+    "sensitive_identifier",
 ]

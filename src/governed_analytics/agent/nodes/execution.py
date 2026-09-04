@@ -18,14 +18,19 @@ from governed_analytics.agent.contracts import (
     RepairRecord,
     StopReason,
     StructuredModelRequest,
+    ToolCallTrace,
+    ToolInvocation,
     TypedMetricPlan,
 )
 from governed_analytics.agent.nodes.behavior import (
+    SafeDependencyError,
     cast_stop_reason,
     emit_budget_warning,
+    emit_domain_event,
     failure_delta,
     finish_node,
     safe_error_stop_reason,
+    sensitive_identifier,
 )
 from governed_analytics.agent.ports import AgentContext, StructuredInvocationError
 from governed_analytics.agent.state import AgentState
@@ -75,11 +80,12 @@ def _safe_event_columns(
 
 def tool_completed_data(
     state: AgentState,
+    action: AgentAction,
     observation: Observation,
 ) -> Mapping[str, JsonValue]:
     return {
-        "tool_name": observation.tool_name.value,
-        "purpose": observation.purpose,
+        "tool_name": action.action_type.value,
+        "purpose": _event_purpose(action),
         "query_id": observation.query_id,
         "columns": _safe_event_columns(state, observation),
         "row_count": observation.row_count,
@@ -87,10 +93,10 @@ def tool_completed_data(
     }
 
 
-def tool_failed_data(observation: Observation) -> Mapping[str, JsonValue]:
+def tool_failed_data(action: AgentAction, observation: Observation) -> Mapping[str, JsonValue]:
     return {
-        "tool_name": observation.tool_name.value,
-        "purpose": observation.purpose,
+        "tool_name": action.action_type.value,
+        "purpose": _event_purpose(action),
         "safe_error": observation.safe_error,
     }
 
@@ -188,6 +194,8 @@ def _action_prompt(state: AgentState, hypothesis_id: str) -> Mapping[str, object
 
 
 def _valid_action_target(state: AgentState, action: AnalysisAction, pending: str) -> bool:
+    if sensitive_identifier(action.purpose):
+        return False
     if action.hypothesis_id != pending:
         return False
     if action.action_type is ActionType.PROFILE:
@@ -211,11 +219,12 @@ async def route_action(
     invocation = None
     try:
         if context.budget.snapshot.soft_cap_reached:
-            await emit_budget_warning(
+            if not await emit_budget_warning(
                 context,
                 node="route_action",
                 reason=StopReason.COST_SOFT_CAP,
-            )
+            ):
+                raise SafeDependencyError("event_sink_failed")
             return finish_node(
                 context=context,
                 node="route_action",
@@ -264,11 +273,12 @@ async def route_action(
             context.budget.ensure_action_loop_available()
             pending_loop = True
         elif context.budget.snapshot.soft_cap_reached:
-            await emit_budget_warning(
+            if not await emit_budget_warning(
                 context,
                 node="route_action",
                 reason=StopReason.COST_SOFT_CAP,
-            )
+            ):
+                raise SafeDependencyError("event_sink_failed")
             soft_delta: dict[str, object] = {
                 "next_action": None,
                 "stop_reason": StopReason.COST_SOFT_CAP,
@@ -308,12 +318,15 @@ async def route_action(
             if invocation.repair_record is not None:
                 delta["repair_history"] = (invocation.repair_record,)
         delta["next_action"] = None
-        if isinstance(error, (BudgetExceeded, StructuredInvocationError)):
-            await emit_budget_warning(
-                context,
-                node="route_action",
-                reason=cast_stop_reason(delta["stop_reason"]),
-            )
+        delta["action_loop_pending"] = False
+        if isinstance(
+            error, (BudgetExceeded, StructuredInvocationError)
+        ) and not await emit_budget_warning(
+            context,
+            node="route_action",
+            reason=cast_stop_reason(delta["stop_reason"]),
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(
             context=context,
             node="route_action",
@@ -328,16 +341,81 @@ async def _emit_tool_result(
     *,
     node: str,
     state: AgentState,
+    action: AgentAction,
     observation: Observation,
-) -> None:
+) -> bool:
     if observation.ok:
-        await context.events.emit(
-            node,
-            "tool.completed",
-            tool_completed_data(state, observation),
+        return await emit_domain_event(
+            context,
+            node=node,
+            event_type="tool.completed",
+            data=tool_completed_data(state, action, observation),
         )
-    else:
-        await context.events.emit(node, "tool.failed", tool_failed_data(observation))
+    return await emit_domain_event(
+        context,
+        node=node,
+        event_type="tool.failed",
+        data=tool_failed_data(action, observation),
+    )
+
+
+def _safe_failure_invocation(
+    action: AgentAction,
+    *,
+    safe_error: str = "internal_tool_error",
+) -> ToolInvocation:
+    purpose = _event_purpose(action)
+    safe_arguments: tuple[tuple[str, JsonValue], ...] = ()
+    if action.action_type is ActionType.EXECUTE_SQL:
+        safe_arguments = tuple(
+            (name, value)
+            for name, value in (
+                ("contract_id", action.contract_id),
+                ("hypothesis_id", action.hypothesis_id),
+            )
+            if value is not None
+        )
+    observation = Observation(
+        observation_id=uuid4().hex,
+        tool_name=action.action_type,
+        purpose=purpose,
+        ok=False,
+        safe_error=safe_error,
+        hypothesis_id=action.hypothesis_id,
+        contract_id=action.contract_id,
+    )
+    trace = ToolCallTrace(
+        tool_name=action.action_type,
+        purpose=purpose,
+        safe_arguments=safe_arguments,
+        safe_error=safe_error,
+    )
+    return ToolInvocation(observation=observation, trace=trace)
+
+
+def _invocation_matches_action(action: AgentAction, invocation: ToolInvocation) -> bool:
+    observation = invocation.observation
+    trace = invocation.trace
+    if (
+        observation.tool_name is not action.action_type
+        or trace.tool_name is not action.action_type
+        or observation.purpose != _event_purpose(action)
+        or trace.purpose != _event_purpose(action)
+        or observation.contract_id != action.contract_id
+        or observation.hypothesis_id != action.hypothesis_id
+    ):
+        return False
+    if action.action_type is ActionType.EXECUTE_SQL:
+        expected_arguments = tuple(
+            (name, value)
+            for name, value in (
+                ("contract_id", action.contract_id),
+                ("hypothesis_id", action.hypothesis_id),
+            )
+            if value is not None
+        )
+        return trace.safe_arguments == expected_arguments
+    return True
 
 
 async def invoke_tool(
@@ -347,26 +425,39 @@ async def invoke_tool(
     context = runtime.context
     started_at = context.clock.monotonic()
     invocation = None
+    action = state["next_action"]
+    budget_consumed = False
+    trace_recorded = False
     try:
-        action = state["next_action"]
         if action is None:
             raise ValueError("missing next action")
         if action.action_type is ActionType.PROFILE and context.budget.snapshot.soft_cap_reached:
             raise BudgetExceeded(StopReason.COST_SOFT_CAP)
         context.budget.consume_tool(action.action_type)
-        await context.events.emit(
-            "invoke_tool",
-            "tool.started",
-            tool_started_data(action),
-        )
-        invocation = await context.tools.invoke(action, node="invoke_tool")
+        budget_consumed = True
+        if not await emit_domain_event(
+            context,
+            node="invoke_tool",
+            event_type="tool.started",
+            data=tool_started_data(action),
+        ):
+            raise SafeDependencyError("event_sink_failed")
+        try:
+            invocation = await context.tools.invoke(action, node="invoke_tool")
+        except Exception:
+            invocation = _safe_failure_invocation(action)
+        if not _invocation_matches_action(action, invocation):
+            invocation = _safe_failure_invocation(action)
         context.trace_recorder.append_tool(invocation.trace)
-        await _emit_tool_result(
+        trace_recorded = True
+        if not await _emit_tool_result(
             context,
             node="invoke_tool",
             state=state,
+            action=action,
             observation=invocation.observation,
-        )
+        ):
+            raise SafeDependencyError("event_sink_failed")
         delta: dict[str, object] = {
             "observations": (invocation.observation,),
             "tool_call_traces": (invocation.trace,),
@@ -381,23 +472,40 @@ async def invoke_tool(
             started_at=started_at,
             outcome="completed" if invocation.observation.ok else "failed",
             delta=delta,
+            consume_action_loop_on_failure=(
+                budget_consumed
+                and action.action_type is ActionType.EXECUTE_SQL
+                and state["action_loop_pending"]
+            ),
         )
     except Exception as error:
         delta = failure_delta(error, context)
         if invocation is not None:
             delta["observations"] = (invocation.observation,)
-            delta["tool_call_traces"] = (invocation.trace,)
+            if trace_recorded:
+                delta["tool_call_traces"] = (invocation.trace,)
             if (
                 invocation.observation.tool_name is ActionType.EXECUTE_SQL
                 and state["first_candidate"] is None
             ):
                 delta["first_candidate"] = invocation.observation
-        if isinstance(error, BudgetExceeded):
-            await emit_budget_warning(
-                context,
-                node="invoke_tool",
-                reason=error.reason,
-            )
+        delta["action_loop_pending"] = False
+        if (
+            budget_consumed
+            and action is not None
+            and action.action_type is ActionType.EXECUTE_SQL
+            and state["action_loop_pending"]
+        ):
+            try:
+                delta["governance"] = context.budget.consume_action_loop()
+            except Exception:
+                delta["governance"] = context.budget.snapshot
+        if isinstance(error, BudgetExceeded) and not await emit_budget_warning(
+            context,
+            node="invoke_tool",
+            reason=error.reason,
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(
             context=context,
             node="invoke_tool",
@@ -468,16 +576,18 @@ async def validate_observation_node(
                 "stop_reason": safe_error_stop_reason(observation.safe_error),
                 **_consume_pending_loop(state, context),
             }
-            await context.events.emit(
-                "validate_observation",
-                "observation.validated",
-                observation_event_data(
+            if not await emit_domain_event(
+                context,
+                node="validate_observation",
+                event_type="observation.validated",
+                data=observation_event_data(
                     contract_id=contract_id,
                     valid=False,
                     error_code=observation.safe_error,
                     repairable=False,
                 ),
-            )
+            ):
+                raise SafeDependencyError("event_sink_failed")
             return finish_node(
                 context=context,
                 node="validate_observation",
@@ -490,16 +600,18 @@ async def validate_observation_node(
             raise ValueError("missing answer contract")
         contract = answer_contract.contract(action.contract_id)
         validation = validate_observation(action, observation, contract)
-        await context.events.emit(
-            "validate_observation",
-            "observation.validated",
-            observation_event_data(
+        if not await emit_domain_event(
+            context,
+            node="validate_observation",
+            event_type="observation.validated",
+            data=observation_event_data(
                 contract_id=validation.contract_id,
                 valid=validation.valid,
                 error_code=validation.error_code,
                 repairable=validation.repairable,
             ),
-        )
+        ):
+            raise SafeDependencyError("event_sink_failed")
         delta: dict[str, object] = {
             "observation_validations": (validation,),
             "stop_reason": None,
@@ -512,12 +624,14 @@ async def validate_observation_node(
                 context.budget.snapshot,
             )
             if context.budget.snapshot.soft_cap_reached:
-                await emit_budget_warning(
+                if not await emit_budget_warning(
                     context,
                     node="validate_observation",
                     reason=StopReason.COST_SOFT_CAP,
-                )
-                delta["stop_reason"] = StopReason.COST_SOFT_CAP
+                ):
+                    delta["stop_reason"] = StopReason.INTERNAL_ERROR
+                else:
+                    delta["stop_reason"] = StopReason.COST_SOFT_CAP
             elif not decision.allowed:
                 delta["stop_reason"] = decision.stop_reason
         return finish_node(
@@ -583,16 +697,20 @@ async def judge_evidence(
         )
         updated_plan = _updated_plan(_current_plan(state), contract.hypothesis_id, stance)
         assessment = assess_evidence(updated_plan, all_evidence)
-        await context.events.emit(
-            "judge_evidence",
-            "hypothesis.updated",
-            hypothesis_event_data(contract.hypothesis_id, stance),
-        )
-        await context.events.emit(
-            "judge_evidence",
-            "evidence.assessed",
-            evidence_event_data(assessment),
-        )
+        if not await emit_domain_event(
+            context,
+            node="judge_evidence",
+            event_type="hypothesis.updated",
+            data=hypothesis_event_data(contract.hypothesis_id, stance),
+        ):
+            raise SafeDependencyError("event_sink_failed")
+        if not await emit_domain_event(
+            context,
+            node="judge_evidence",
+            event_type="evidence.assessed",
+            data=evidence_event_data(assessment),
+        ):
+            raise SafeDependencyError("event_sink_failed")
         delta: dict[str, object] = {
             "evidence": new_evidence,
             "evidence_gaps": assessment.gaps,
@@ -606,11 +724,12 @@ async def judge_evidence(
             **_consume_pending_loop(state, context),
         }
         if context.budget.snapshot.soft_cap_reached:
-            await emit_budget_warning(
+            if not await emit_budget_warning(
                 context,
                 node="judge_evidence",
                 reason=StopReason.COST_SOFT_CAP,
-            )
+            ):
+                delta["stop_reason"] = StopReason.INTERNAL_ERROR
             delta["governance"] = context.budget.snapshot
         return finish_node(
             context=context,
@@ -677,19 +796,22 @@ async def repair(
     error_code = validation.error_code or "answer_contract_unmet"
     invocation = None
     tool_invocation = None
+    tool_trace_recorded = False
     try:
         if context.budget.snapshot.soft_cap_reached:
             raise BudgetExceeded(StopReason.COST_SOFT_CAP)
         governance = context.budget.consume_repair()
-        await context.events.emit(
-            "repair",
-            "repair.started",
-            repair_event_data(
+        if not await emit_domain_event(
+            context,
+            node="repair",
+            event_type="repair.started",
+            data=repair_event_data(
                 repair_count=governance.repair_count,
                 error_code=error_code,
                 success=False,
             ),
-        )
+        ):
+            raise SafeDependencyError("event_sink_failed")
         request = StructuredModelRequest.for_output(
             purpose="repair",
             system_prompt=("Repair the result contract once. Return one execute_sql action only."),
@@ -712,23 +834,43 @@ async def repair(
             repaired_action.action_type is not ActionType.EXECUTE_SQL
             or repaired_action.contract_id != action.contract_id
             or repaired_action.hypothesis_id != action.hypothesis_id
+            or sensitive_identifier(repaired_action.purpose)
         ):
             raise ValueError("repair action changed its governed target")
         context.budget.consume_tool(ActionType.EXECUTE_SQL)
-        await context.events.emit(
-            "repair",
-            "tool.started",
-            tool_started_data(repaired_action),
-        )
-        tool_invocation = await context.tools.invoke(repaired_action, node="repair")
+        if not await emit_domain_event(
+            context,
+            node="repair",
+            event_type="tool.started",
+            data=tool_started_data(repaired_action),
+        ):
+            raise SafeDependencyError("event_sink_failed")
+        try:
+            tool_invocation = await context.tools.invoke(repaired_action, node="repair")
+        except Exception:
+            tool_invocation = _safe_failure_invocation(repaired_action)
+        if not _invocation_matches_action(repaired_action, tool_invocation):
+            tool_invocation = _safe_failure_invocation(repaired_action)
         context.trace_recorder.append_tool(tool_invocation.trace)
-        await _emit_tool_result(
+        tool_trace_recorded = True
+        if not await _emit_tool_result(
             context,
             node="repair",
             state=state,
+            action=repaired_action,
             observation=tool_invocation.observation,
+        ):
+            raise SafeDependencyError("event_sink_failed")
+        answer_contract = state["answer_contract"]
+        if answer_contract is None or repaired_action.contract_id is None:
+            raise ValueError("repair contract is missing")
+        contract = answer_contract.contract(repaired_action.contract_id)
+        repaired_validation = validate_observation(
+            repaired_action,
+            tool_invocation.observation,
+            contract,
         )
-        success = tool_invocation.observation.ok
+        success = tool_invocation.observation.ok and repaired_validation.valid
         record = _result_repair_record(
             original=original,
             action=action,
@@ -736,15 +878,17 @@ async def repair(
             outcome="success" if success else "failed",
             repaired=tool_invocation.observation if success else None,
         )
-        await context.events.emit(
-            "repair",
-            "repair.completed",
-            repair_event_data(
+        if not await emit_domain_event(
+            context,
+            node="repair",
+            event_type="repair.completed",
+            data=repair_event_data(
                 repair_count=context.budget.snapshot.repair_count,
                 error_code=error_code,
                 success=success,
             ),
-        )
+        ):
+            raise SafeDependencyError("event_sink_failed")
         delta: dict[str, object] = {
             "next_action": repaired_action,
             "observations": (tool_invocation.observation,),
@@ -752,9 +896,13 @@ async def repair(
             "model_call_traces": invocation.traces,
             "repair_history": (record,),
             "governance": context.budget.snapshot,
-            "stop_reason": None
-            if success
-            else safe_error_stop_reason(tool_invocation.observation.safe_error),
+            "stop_reason": (
+                None
+                if tool_invocation.observation.ok
+                else StopReason.REPAIR_FAILED
+                if tool_invocation.observation.safe_error == "internal_tool_error"
+                else safe_error_stop_reason(tool_invocation.observation.safe_error)
+            ),
         }
         return finish_node(
             context=context,
@@ -770,9 +918,14 @@ async def repair(
             delta["governance"] = context.budget.snapshot
         if tool_invocation is not None:
             delta["observations"] = (tool_invocation.observation,)
-            delta["tool_call_traces"] = (tool_invocation.trace,)
+            if tool_trace_recorded:
+                delta["tool_call_traces"] = (tool_invocation.trace,)
         delta["stop_reason"] = (
-            error.reason if isinstance(error, BudgetExceeded) else StopReason.REPAIR_FAILED
+            error.reason
+            if isinstance(error, BudgetExceeded)
+            else StopReason.INTERNAL_ERROR
+            if isinstance(error, SafeDependencyError)
+            else StopReason.REPAIR_FAILED
         )
         record = _result_repair_record(
             original=original,
@@ -784,17 +937,23 @@ async def repair(
         if isinstance(error, StructuredInvocationError):
             delta["model_call_traces"] = error.traces
             delta["governance"] = error.governance
-        await context.events.emit(
-            "repair",
-            "repair.completed",
-            repair_event_data(
+        if not await emit_domain_event(
+            context,
+            node="repair",
+            event_type="repair.completed",
+            data=repair_event_data(
                 repair_count=context.budget.snapshot.repair_count,
                 error_code=error_code,
                 success=False,
             ),
-        )
-        if isinstance(error, BudgetExceeded):
-            await emit_budget_warning(context, node="repair", reason=error.reason)
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
+        if isinstance(error, BudgetExceeded) and not await emit_budget_warning(
+            context,
+            node="repair",
+            reason=error.reason,
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(
             context=context,
             node="repair",

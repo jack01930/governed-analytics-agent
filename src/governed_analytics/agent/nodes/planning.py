@@ -23,11 +23,14 @@ from governed_analytics.agent.contracts import (
     TypedMetricPlan,
 )
 from governed_analytics.agent.nodes.behavior import (
+    SafeDependencyError,
     cast_stop_reason,
     emit_budget_warning,
+    emit_domain_event,
     failure_delta,
     finish_node,
     safe_error_stop_reason,
+    sensitive_identifier,
 )
 from governed_analytics.agent.ports import AgentContext, StructuredInvocationError
 from governed_analytics.agent.state import AgentState
@@ -310,8 +313,8 @@ async def retrieve_context(
         context.budget.consume_tool(ActionType.METRIC_LOOKUP)
         metric_invocation = await context.tools.lookup_metrics(node="retrieve_context")
         observations.append(metric_invocation.observation)
-        traces.append(metric_invocation.trace)
         context.trace_recorder.append_tool(metric_invocation.trace)
+        traces.append(metric_invocation.trace)
         if not metric_invocation.observation.ok:
             bundle = ContextBundle(
                 ok=False,
@@ -320,11 +323,13 @@ async def retrieve_context(
                 observations=tuple(observations),
             )
             context_event_attempted = True
-            await context.events.emit(
-                "retrieve_context",
-                "context.retrieved",
-                context_event_data(bundle),
-            )
+            if not await emit_domain_event(
+                context,
+                node="retrieve_context",
+                event_type="context.retrieved",
+                data=context_event_data(bundle),
+            ):
+                raise SafeDependencyError("event_sink_failed")
             return finish_node(
                 context=context,
                 node="retrieve_context",
@@ -342,8 +347,8 @@ async def retrieve_context(
         context.budget.consume_tool(ActionType.SCHEMA_LOOKUP)
         schema_invocation = await context.tools.lookup_schema(node="retrieve_context")
         observations.append(schema_invocation.observation)
-        traces.append(schema_invocation.trace)
         context.trace_recorder.append_tool(schema_invocation.trace)
+        traces.append(schema_invocation.trace)
         if schema_invocation.observation.ok:
             tables = _payload_models(schema_invocation.observation.payload, TableInfo)
         bundle = ContextBundle(
@@ -353,11 +358,13 @@ async def retrieve_context(
             observations=tuple(observations),
         )
         context_event_attempted = True
-        await context.events.emit(
-            "retrieve_context",
-            "context.retrieved",
-            context_event_data(bundle),
-        )
+        if not await emit_domain_event(
+            context,
+            node="retrieve_context",
+            event_type="context.retrieved",
+            data=context_event_data(bundle),
+        ):
+            raise SafeDependencyError("event_sink_failed")
         delta: dict[str, object] = {
             "observations": tuple(observations),
             "tool_call_traces": tuple(traces),
@@ -393,23 +400,31 @@ async def retrieve_context(
             else None
         )
         if failed_lookup_bundle is not None and not context_event_attempted:
-            await context.events.emit(
-                "retrieve_context",
-                "context.retrieved",
-                context_event_data(failed_lookup_bundle),
-            )
-        elif not context_event_attempted:
-            await context.events.emit(
-                "retrieve_context",
-                "context.retrieved",
-                interrupted_context_event_data(metrics, tables),
-            )
-        if isinstance(error, (BudgetExceeded, StructuredInvocationError)):
-            await emit_budget_warning(
+            event_ok = await emit_domain_event(
                 context,
                 node="retrieve_context",
-                reason=cast_stop_reason(delta["stop_reason"]),
+                event_type="context.retrieved",
+                data=context_event_data(failed_lookup_bundle),
             )
+        elif not context_event_attempted:
+            event_ok = await emit_domain_event(
+                context,
+                node="retrieve_context",
+                event_type="context.retrieved",
+                data=interrupted_context_event_data(metrics, tables),
+            )
+        else:
+            event_ok = True
+        if not event_ok:
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
+        if isinstance(
+            error, (BudgetExceeded, StructuredInvocationError)
+        ) and not await emit_budget_warning(
+            context,
+            node="retrieve_context",
+            reason=cast_stop_reason(delta["stop_reason"]),
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(
             context=context,
             node="retrieve_context",
@@ -436,6 +451,36 @@ def _table_prompt(table: TableInfo) -> Mapping[str, JsonValue]:
     }
 
 
+_SIMPLE_HYPOTHESIS_SHAPE = (("metric_value", "metric_value", None),)
+_ATTRIBUTION_HYPOTHESIS_SHAPE = (
+    ("confirm_decline", "confirm_decline", None),
+    ("region_contribution", "dimension_contribution", "region"),
+    ("sku_contribution", "dimension_contribution", "product"),
+    ("segment_contribution", "dimension_contribution", "segment"),
+)
+
+
+def _valid_plan_identity(state: AgentState, plan: TypedMetricPlan) -> bool:
+    metric_matches = tuple(
+        item
+        for item in state["metric_context"]
+        if item.metric_id == plan.metric_id and item.version == plan.metric_version
+    )
+    if len(metric_matches) != 1 or sensitive_identifier(plan.plan_id):
+        return False
+    hypotheses = tuple((item.hypothesis_id, item.kind, item.dimension) for item in plan.hypotheses)
+    if any(sensitive_identifier(item.hypothesis_id) for item in plan.hypotheses):
+        return False
+    expected = (
+        _SIMPLE_HYPOTHESIS_SHAPE
+        if plan.analysis_type is AnalysisType.SIMPLE
+        else _ATTRIBUTION_HYPOTHESIS_SHAPE
+        if plan.analysis_type is AnalysisType.ATTRIBUTION
+        else ()
+    )
+    return hypotheses == expected
+
+
 async def build_plan(
     state: AgentState,
     runtime: Runtime[AgentContext],
@@ -457,7 +502,28 @@ async def build_plan(
         )
         invocation = await context.model_invoker.invoke(request, TypedMetricPlan)
         plan = invocation.result.output
-        await context.events.emit("build_plan", "plan.created", plan_event_data(plan))
+        if not _valid_plan_identity(state, plan):
+            invalid_delta: dict[str, object] = {
+                "governance": invocation.governance,
+                "model_call_traces": invocation.traces,
+                "stop_reason": StopReason.PLAN_INVALID,
+            }
+            if invocation.repair_record is not None:
+                invalid_delta["repair_history"] = (invocation.repair_record,)
+            return finish_node(
+                context=context,
+                node="build_plan",
+                started_at=started_at,
+                outcome="failed",
+                delta=invalid_delta,
+            )
+        if not await emit_domain_event(
+            context,
+            node="build_plan",
+            event_type="plan.created",
+            data=plan_event_data(plan),
+        ):
+            raise SafeDependencyError("event_sink_failed")
         delta: dict[str, object] = {
             "plan_revisions": (plan,),
             "governance": invocation.governance,
@@ -467,11 +533,12 @@ async def build_plan(
         if invocation.repair_record is not None:
             delta["repair_history"] = (invocation.repair_record,)
         if invocation.governance.soft_cap_reached:
-            await emit_budget_warning(
+            if not await emit_budget_warning(
                 context,
                 node="build_plan",
                 reason=StopReason.COST_SOFT_CAP,
-            )
+            ):
+                raise SafeDependencyError("event_sink_failed")
             delta["stop_reason"] = StopReason.COST_SOFT_CAP
         return finish_node(
             context=context,
@@ -487,12 +554,14 @@ async def build_plan(
             delta["governance"] = invocation.governance
             if invocation.repair_record is not None:
                 delta["repair_history"] = (invocation.repair_record,)
-        if isinstance(error, (BudgetExceeded, StructuredInvocationError)):
-            await emit_budget_warning(
-                context,
-                node="build_plan",
-                reason=cast_stop_reason(delta["stop_reason"]),
-            )
+        if isinstance(
+            error, (BudgetExceeded, StructuredInvocationError)
+        ) and not await emit_budget_warning(
+            context,
+            node="build_plan",
+            reason=cast_stop_reason(delta["stop_reason"]),
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(
             context=context,
             node="build_plan",
@@ -558,12 +627,14 @@ async def replan(
     if pending is None:
         delta["stop_reason"] = StopReason.ANSWER_CONTRACT_UNMET
     elif context.budget.snapshot.soft_cap_reached:
-        await emit_budget_warning(
+        if not await emit_budget_warning(
             context,
             node="replan",
             reason=StopReason.COST_SOFT_CAP,
-        )
-        delta["stop_reason"] = StopReason.COST_SOFT_CAP
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
+        else:
+            delta["stop_reason"] = StopReason.COST_SOFT_CAP
         delta["governance"] = context.budget.snapshot
     else:
         delta["stop_reason"] = None

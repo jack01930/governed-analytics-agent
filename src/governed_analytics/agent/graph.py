@@ -10,6 +10,10 @@ from langgraph.graph.state import CompiledStateGraph
 from governed_analytics.agent.contracts import (
     ActionType,
     AgentRunResult,
+    FinalAnswer,
+    FinalStatus,
+    GovernanceSnapshot,
+    SafeTrace,
     StopReason,
 )
 from governed_analytics.agent.nodes.behavior import decide_behavior, intake
@@ -179,34 +183,81 @@ async def run_agent(
     context: AgentContext,
 ) -> AgentRunResult:
     graph = build_agent_graph()
-    raw_state = await graph.ainvoke(
-        new_agent_state(run_id=run_id, query=query),
-        context=context,
+    state: AgentState | None = None
+    try:
+        raw_state = await graph.ainvoke(
+            new_agent_state(run_id=run_id, query=query),
+            context=context,
+        )
+        state = cast(AgentState, raw_state)
+        final_answer = state["final_answer"]
+        if final_answer is None:
+            raise RuntimeError("agent graph did not finalize")
+        safe_trace = context.trace_recorder.snapshot()
+        if (
+            safe_trace.nodes != state["node_traces"]
+            or safe_trace.model_calls != state["model_call_traces"]
+            or safe_trace.tool_calls != state["tool_call_traces"]
+        ):
+            raise RuntimeError("agent trace histories diverged")
+        return AgentRunResult(
+            run_id=state["run_id"],
+            behavior=state["behavior"],
+            answer_contract=state["answer_contract"],
+            observations=state["observations"],
+            observation_validations=state["observation_validations"],
+            evidence=state["evidence"],
+            evidence_gaps=state["evidence_gaps"],
+            first_candidate=state["first_candidate"],
+            repair_history=state["repair_history"],
+            governance=state["governance"],
+            final_answer=final_answer,
+            safe_trace=safe_trace,
+        )
+    except Exception:
+        return _internal_fallback(run_id=run_id, context=context, state=state)
+
+
+def _internal_fallback(
+    *,
+    run_id: str,
+    context: AgentContext,
+    state: AgentState | None,
+) -> AgentRunResult:
+    if state is not None:
+        fallback_trace = SafeTrace(
+            nodes=state["node_traces"],
+            model_calls=state["model_call_traces"],
+            tool_calls=state["tool_call_traces"],
+        )
+        governance = state["governance"]
+    else:
+        try:
+            fallback_trace = context.trace_recorder.snapshot()
+        except Exception:
+            fallback_trace = SafeTrace()
+        try:
+            governance = context.budget.snapshot
+        except Exception:
+            governance = GovernanceSnapshot()
+    answer = FinalAnswer(
+        status=FinalStatus.INTERNAL_ERROR,
+        stop_reason=StopReason.INTERNAL_ERROR,
+        answer="分析因内部受控错误终止。",
     )
-    state = cast(AgentState, raw_state)
-    final_answer = state["final_answer"]
-    if final_answer is None:
-        raise RuntimeError("agent graph did not finalize")
-    safe_trace = context.trace_recorder.snapshot()
-    if (
-        safe_trace.nodes != state["node_traces"]
-        or safe_trace.model_calls != state["model_call_traces"]
-        or safe_trace.tool_calls != state["tool_call_traces"]
-    ):
-        raise RuntimeError("agent trace histories diverged")
     return AgentRunResult(
-        run_id=state["run_id"],
-        behavior=state["behavior"],
-        answer_contract=state["answer_contract"],
-        observations=state["observations"],
-        observation_validations=state["observation_validations"],
-        evidence=state["evidence"],
-        evidence_gaps=state["evidence_gaps"],
-        first_candidate=state["first_candidate"],
-        repair_history=state["repair_history"],
-        governance=state["governance"],
-        final_answer=final_answer,
-        safe_trace=safe_trace,
+        run_id=run_id,
+        behavior=None,
+        answer_contract=None,
+        observations=(),
+        observation_validations=(),
+        evidence=(),
+        evidence_gaps=(),
+        first_candidate=None,
+        repair_history=(),
+        governance=governance,
+        final_answer=answer,
+        safe_trace=fallback_trace,
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 
 from langgraph.runtime import Runtime
 
@@ -28,12 +29,36 @@ from governed_analytics.agent.state import AgentState
 from governed_analytics.agent.validation import assess_evidence
 from governed_analytics.runtime.budgets import BudgetExceeded
 
-_UNSAFE_FINAL_TEXT = re.compile(
-    r"(?:\bselect\s|\binsert\s|\bupdate\s|\bdelete\s|\bdrop\s|\balter\s|"
-    r"\bcreate\s|\btruncate\s|\bparameters?\b|\braw[_ -]?rows?\b|"
-    r"(?:sk|pk)-[a-z0-9]|bearer\s|https?://|\bendpoint\b)",
-    re.IGNORECASE,
+_SENSITIVE_TOKENS = frozenset(
+    {
+        "apikey",
+        "alter",
+        "arguments",
+        "authorization",
+        "bearer",
+        "create",
+        "delete",
+        "drop",
+        "endpoint",
+        "filter",
+        "filters",
+        "insert",
+        "password",
+        "payload",
+        "prompt",
+        "raw",
+        "row",
+        "rows",
+        "secret",
+        "select",
+        "sql",
+        "token",
+        "truncate",
+        "update",
+        "url",
+    }
 )
+_NUMBER = re.compile(r"(?<![A-Za-z0-9_.])[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![A-Za-z0-9_.])")
 
 
 def _assessment(state: AgentState) -> EvidenceAssessment | None:
@@ -60,14 +85,93 @@ def _safe_evidence_payload(state: AgentState) -> tuple[Mapping[str, JsonValue], 
     )
 
 
+def _unsafe_string(value: str) -> bool:
+    lowered = value.casefold()
+    tokens = tuple(re.findall(r"[a-z0-9]+", lowered))
+    compact = "".join(tokens)
+    return (
+        any(token in _SENSITIVE_TOKENS for token in tokens)
+        or "apikey" in compact
+        or re.search(r"(?:sk|pk)-[a-z0-9]", lowered) is not None
+        or "http://" in lowered
+        or "https://" in lowered
+    )
+
+
+def _contains_unsafe_string(value: object) -> bool:
+    if isinstance(value, str):
+        return _unsafe_string(value)
+    if isinstance(value, Mapping):
+        return any(
+            _contains_unsafe_string(key) or _contains_unsafe_string(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (tuple, list)):
+        return any(_contains_unsafe_string(item) for item in value)
+    return False
+
+
+def _safe_summary_string(value: str) -> str:
+    return "redacted" if _unsafe_string(value) else value
+
+
+def _result_summary(state: AgentState) -> Mapping[str, JsonValue]:
+    return {
+        "evidence": tuple(
+            {
+                "evidence_id": item.evidence_id,
+                "claim_key": _safe_summary_string(item.claim_key),
+                "numeric_value": (
+                    str(item.numeric_value) if item.numeric_value is not None else None
+                ),
+                "unit": (_safe_summary_string(item.unit) if item.unit is not None else None),
+                "dimensions": tuple(
+                    {
+                        "name": _safe_summary_string(name),
+                        "value": _safe_summary_string(value),
+                    }
+                    for name, value in item.dimensions
+                ),
+            }
+            for item in state["evidence"]
+            if item.verified
+        )
+    }
+
+
+def _answer_numbers_are_evidenced(state: AgentState, answer: FinalAnswer) -> bool:
+    referenced = {
+        item.evidence_id: item
+        for item in state["evidence"]
+        if item.verified and item.evidence_id in set(answer.evidence_ids)
+    }
+    allowed = {item.numeric_value for item in referenced.values() if item.numeric_value is not None}
+    text = " ".join((answer.answer, *answer.limitations))
+    for token in _NUMBER.findall(text):
+        try:
+            value = Decimal(token)
+        except InvalidOperation:
+            return False
+        if value not in allowed:
+            return False
+    return True
+
+
 def _valid_synthesis(state: AgentState, answer: FinalAnswer) -> bool:
-    if _UNSAFE_FINAL_TEXT.search(answer.model_dump_json()) is not None:
+    if _contains_unsafe_string((answer.answer, answer.limitations, answer.result_summary)):
         return False
-    verified = {item.evidence_id for item in state["evidence"] if item.verified}
-    if not set(answer.evidence_ids).issubset(verified):
+    verified = tuple(item.evidence_id for item in state["evidence"] if item.verified)
+    if set(answer.evidence_ids) != set(verified) or len(answer.evidence_ids) != len(verified):
         return False
     assessment = _assessment(state)
     if assessment is None:
+        return False
+    if (
+        answer.completed_dimensions != assessment.resolved_hypotheses
+        or answer.missing_dimensions != assessment.gaps
+        or not _answer_numbers_are_evidenced(state, answer)
+        or (answer.result_summary is not None and answer.result_summary != _result_summary(state))
+    ):
         return False
     if assessment.complete:
         return (
@@ -105,12 +209,14 @@ async def synthesize(
         )
         invocation = await context.model_invoker.invoke(request, FinalAnswer)
         answer = invocation.result.output
-        if not answer.evidence_ids:
+        valid = _valid_synthesis(state, answer)
+        if valid:
             answer = answer.model_copy(
                 update={
                     "evidence_ids": tuple(
                         item.evidence_id for item in state["evidence"] if item.verified
-                    )
+                    ),
+                    "result_summary": _result_summary(state),
                 }
             )
         delta: dict[str, object] = {
@@ -119,7 +225,7 @@ async def synthesize(
         }
         if invocation.repair_record is not None:
             delta["repair_history"] = (invocation.repair_record,)
-        if _valid_synthesis(state, answer):
+        if valid:
             delta["final_answer"] = answer
             delta["stop_reason"] = answer.stop_reason
         else:
@@ -129,7 +235,7 @@ async def synthesize(
             context=context,
             node="synthesize",
             started_at=started_at,
-            outcome="completed" if _valid_synthesis(state, answer) else "failed",
+            outcome="completed" if valid else "failed",
             delta=delta,
         )
     except Exception as error:
@@ -140,12 +246,14 @@ async def synthesize(
             if invocation.repair_record is not None:
                 delta["repair_history"] = (invocation.repair_record,)
         delta["final_answer"] = None
-        if isinstance(error, (BudgetExceeded, StructuredInvocationError)):
-            await emit_budget_warning(
-                context,
-                node="synthesize",
-                reason=cast_stop_reason(delta["stop_reason"]),
-            )
+        if isinstance(
+            error, (BudgetExceeded, StructuredInvocationError)
+        ) and not await emit_budget_warning(
+            context,
+            node="synthesize",
+            reason=cast_stop_reason(delta["stop_reason"]),
+        ):
+            delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(
             context=context,
             node="synthesize",
@@ -175,6 +283,8 @@ def _status_for_reason(reason: StopReason) -> FinalStatus:
         return FinalStatus.BUDGET_EXHAUSTED
     if reason in {StopReason.SQL_POLICY_REJECTED, StopReason.SENSITIVE_RESULT_BLOCKED}:
         return FinalStatus.POLICY_BLOCKED
+    if reason is StopReason.RESULT_TRUNCATED:
+        return FinalStatus.PARTIAL
     if reason is StopReason.MODEL_UNAVAILABLE:
         return FinalStatus.MODEL_UNAVAILABLE
     if reason is StopReason.INTERNAL_ERROR:
@@ -187,6 +297,17 @@ def _deterministic_answer(state: AgentState) -> FinalAnswer:
     assessment = _assessment(state)
     completed = assessment.resolved_hypotheses if assessment is not None else ()
     gaps = assessment.gaps if assessment is not None else state["evidence_gaps"]
+    if state["stop_reason"] is StopReason.RESULT_TRUNCATED:
+        return FinalAnswer(
+            status=FinalStatus.PARTIAL,
+            stop_reason=StopReason.RESULT_TRUNCATED,
+            answer="结果达到受治理行数边界, 当前证据可能不完整。",
+            evidence_ids=tuple(item.evidence_id for item in verified),
+            completed_dimensions=completed,
+            missing_dimensions=gaps,
+            limitations=("result_truncated",),
+            result_summary=_result_summary(state),
+        )
     if assessment is not None and assessment.complete:
         return FinalAnswer(
             status=FinalStatus.COMPLETED,
@@ -194,6 +315,7 @@ def _deterministic_answer(state: AgentState) -> FinalAnswer:
             answer="已基于受治理且验证通过的证据完成分析。",
             evidence_ids=tuple(item.evidence_id for item in verified),
             completed_dimensions=completed,
+            result_summary=_result_summary(state),
         )
     if assessment is not None and assessment.premise_not_met:
         return FinalAnswer(
@@ -202,6 +324,7 @@ def _deterministic_answer(state: AgentState) -> FinalAnswer:
             answer="受治理证据表明分析前提不成立。",
             evidence_ids=tuple(item.evidence_id for item in verified),
             completed_dimensions=completed,
+            result_summary=_result_summary(state),
         )
     if verified:
         limitation_reason = state["stop_reason"] or StopReason.EVIDENCE_PARTIAL
@@ -213,6 +336,7 @@ def _deterministic_answer(state: AgentState) -> FinalAnswer:
             completed_dimensions=completed,
             missing_dimensions=gaps,
             limitations=(f"stopped:{limitation_reason.value}",),
+            result_summary=_result_summary(state),
         )
     reason = state["stop_reason"] or StopReason.ANSWER_CONTRACT_UNMET
     behavior = state["behavior"]
@@ -234,6 +358,7 @@ def _deterministic_answer(state: AgentState) -> FinalAnswer:
         stop_reason=reason,
         answer=answer_text,
         missing_dimensions=gaps,
+        result_summary=_result_summary(state),
     )
 
 

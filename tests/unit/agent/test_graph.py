@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import cast
@@ -13,21 +13,32 @@ from governed_analytics.agent import (
     ActionType,
     AgentAction,
     AgentContext,
+    AgentState,
+    FinalAnswer,
     FinalStatus,
     GovernanceSnapshot,
     JsonValue,
     ModelPurpose,
+    ModelUsage,
+    Observation,
+    SafeTrace,
     StopReason,
     StructuredModelRequest,
+    StructuredModelResult,
+    ToolCallTrace,
+    ToolInvocation,
     TypedMetricPlan,
     build_agent_graph,
     new_agent_state,
     run_agent,
 )
+from governed_analytics.agent.contracts import AgentModelErrorCategory
 from governed_analytics.agent.modeling import StructuredModelInvoker
 from governed_analytics.agent.nodes.behavior import map_agent_failure
 from governed_analytics.agent.nodes.execution import route_action
 from governed_analytics.agent.nodes.planning import compile_answer_contract
+from governed_analytics.agent.nodes.synthesis import finalize
+from governed_analytics.agent.ports import AgentModelError
 from governed_analytics.agent.tool_registry import ToolRegistry
 from governed_analytics.agent.tracing import InMemoryTraceRecorder
 from governed_analytics.models.agent_fixtures import AgentScripts, ScriptedAgentModel
@@ -56,6 +67,7 @@ QUERY = "2026年6月GMV是多少？"  # noqa: RUF001
 ATTRIBUTION_QUERY = "为什么2026年6月第二周GMV比第一周下降？"  # noqa: RUF001
 CLARIFY_QUERY = "GMV怎么样？"  # noqa: RUF001
 QUERY_ID = "a" * 64
+SynthesisFactory = Callable[[StructuredModelRequest], Mapping[str, object]]
 
 
 class FrozenClock:
@@ -77,6 +89,61 @@ class RecordingEvents:
         data: Mapping[str, JsonValue],
     ) -> None:
         self.items.append((node, event_type, dict(data)))
+
+
+class FailingEvents(RecordingEvents):
+    async def emit(
+        self,
+        node: str,
+        event_type: str,
+        data: Mapping[str, JsonValue],
+    ) -> None:
+        del node, event_type, data
+        raise RuntimeError("raw event sink sentinel")
+
+
+class FailOneEvent(RecordingEvents):
+    def __init__(self, event_type: str) -> None:
+        super().__init__()
+        self.event_type = event_type
+
+    async def emit(
+        self,
+        node: str,
+        event_type: str,
+        data: Mapping[str, JsonValue],
+    ) -> None:
+        if event_type == self.event_type:
+            raise RuntimeError("raw selected event sentinel")
+        await super().emit(node, event_type, data)
+
+
+class FailingTraceRecorder(InMemoryTraceRecorder):
+    def __init__(self, failure: str) -> None:
+        super().__init__()
+        self.failure = failure
+
+    def append_node(self, trace):  # type: ignore[no-untyped-def]
+        if self.failure == "append_node" or (
+            self.failure == "append_node_invoke_tool" and trace.node == "invoke_tool"
+        ):
+            raise RuntimeError("raw append node sentinel")
+        return super().append_node(trace)
+
+    def append_model(self, traces):  # type: ignore[no-untyped-def]
+        if self.failure == "append_model":
+            raise RuntimeError("raw append model sentinel")
+        return super().append_model(traces)
+
+    def append_tool(self, trace):  # type: ignore[no-untyped-def]
+        if self.failure == "append_tool" and trace.tool_name is ActionType.EXECUTE_SQL:
+            raise RuntimeError("raw append tool sentinel")
+        return super().append_tool(trace)
+
+    def snapshot(self) -> SafeTrace:
+        if self.failure == "snapshot":
+            raise RuntimeError("raw snapshot sentinel")
+        return super().snapshot()
 
 
 class SequenceBackend:
@@ -145,6 +212,43 @@ class RecordingModel:
     async def invoke(self, request, output_type):  # type: ignore[no-untyped-def]
         self.calls.append(request)
         return await self.delegate.invoke(request, output_type)
+
+
+class DynamicSynthesisModel(RecordingModel):
+    def __init__(
+        self,
+        scripts: AgentScripts,
+        synthesis_factory: SynthesisFactory,
+    ) -> None:
+        super().__init__(scripts)
+        self.synthesis_factory = synthesis_factory
+
+    async def invoke(self, request, output_type):  # type: ignore[no-untyped-def]
+        self.calls.append(request)
+        if request.purpose != "synthesis":
+            return await self.delegate.invoke(request, output_type)
+        output = output_type.model_validate(self.synthesis_factory(request))
+        return StructuredModelResult(
+            output=output,
+            provider_model=self.model,
+            usage=ModelUsage(input_tokens=0, output_tokens=0),
+            latency_ms=0,
+        )
+
+
+class FailingModel:
+    def __init__(self, category: AgentModelErrorCategory) -> None:
+        self.category = category
+        self.calls = 0
+
+    @property
+    def model(self) -> str:
+        return "fixture-agent"
+
+    async def invoke(self, request, output_type):  # type: ignore[no-untyped-def]
+        del request, output_type
+        self.calls += 1
+        raise AgentModelError(self.category, provider_model=self.model)
 
 
 class SoftAfterExecuteBudget:
@@ -379,12 +483,14 @@ def query_result(
     rows: tuple[tuple[object, ...], ...] = (("125.00",),),
     *,
     query_id: str = QUERY_ID,
+    possibly_truncated: bool = False,
 ) -> QueryResult:
     return QueryResult(
         query_id=query_id,
         columns=columns,
         rows=rows,
         row_count=len(rows),
+        possibly_truncated=possibly_truncated,
     )
 
 
@@ -424,6 +530,41 @@ def context_for(
         clock=clock,
     )
     return context, tools, model, events, backend
+
+
+def replace_context(
+    context: AgentContext,
+    *,
+    model: object | None = None,
+    tools: object | None = None,
+    events: object | None = None,
+    recorder: InMemoryTraceRecorder | None = None,
+) -> AgentContext:
+    effective_recorder = recorder or cast(InMemoryTraceRecorder, context.trace_recorder)
+    invoker = context.model_invoker
+    if model is not None:
+        invoker = StructuredModelInvoker(
+            model,  # type: ignore[arg-type]
+            context.budget,
+            effective_recorder,
+            context.clock,
+        )
+    return AgentContext(
+        model_invoker=invoker,
+        tools=tools or context.tools,  # type: ignore[arg-type]
+        budget=context.budget,
+        events=events or context.events,  # type: ignore[arg-type]
+        trace_recorder=effective_recorder,
+        clock=context.clock,
+    )
+
+
+def evidence_ids_from_request(request: StructuredModelRequest) -> tuple[str, ...]:
+    raw_evidence = request.user_payload["evidence"]
+    assert isinstance(raw_evidence, tuple)
+    return tuple(
+        cast(str, item["evidence_id"]) for item in raw_evidence if isinstance(item, Mapping)
+    )
 
 
 @pytest.mark.asyncio
@@ -879,9 +1020,7 @@ async def test_context_budget_failure_after_metric_does_not_fabricate_schema() -
     result = await run_agent(run_id="context-budget", query=QUERY, context=context)
 
     assert tools.calls == [ActionType.METRIC_LOOKUP]
-    assert tuple(item.tool_name for item in result.observations) == (
-        ActionType.METRIC_LOOKUP,
-    )
+    assert tuple(item.tool_name for item in result.observations) == (ActionType.METRIC_LOOKUP,)
     assert [call.purpose for call in model.calls] == ["behavior"]
     assert result.final_answer.status is FinalStatus.BUDGET_EXHAUSTED
     assert result.final_answer.stop_reason is StopReason.TOOL_CALL_LIMIT
@@ -1006,8 +1145,7 @@ async def test_forged_synthesis_evidence_reference_fails_closed() -> None:
 @pytest.mark.asyncio
 async def test_synthesis_final_answer_rejects_sql_secret_endpoint_and_raw_row_text() -> None:
     unsafe_answer = (
-        "select private_row_sentinel from orders; "
-        "sk-private-key https://private-endpoint.invalid"
+        "select private_row_sentinel from orders; sk-private-key https://private-endpoint.invalid"
     )
     unsafe_synthesis = synthesis()
     unsafe_synthesis["answer"] = unsafe_answer
@@ -1090,5 +1228,701 @@ def test_central_failure_mapper_uses_stable_policy_timeout_and_unknown_reasons()
     assert map_agent_failure(SqlPolicyError(SqlRejectionCode.NOT_READONLY_QUERY)) is (
         StopReason.SQL_POLICY_REJECTED
     )
-    assert map_agent_failure(TimeoutError("raw timeout sentinel")) is StopReason.SQL_TIMEOUT
+    assert map_agent_failure(TimeoutError("raw timeout sentinel")) is StopReason.INTERNAL_ERROR
     assert map_agent_failure(RuntimeError("raw exception sentinel")) is StopReason.INTERNAL_ERROR
+
+
+@pytest.mark.asyncio
+async def test_500_row_truncated_result_returns_legal_partial_terminal() -> None:
+    rows = tuple((str(index),) for index in range(500))
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(),),
+    )
+    context, _, _, _, backend = context_for(
+        scripts,
+        (query_result(rows=rows, possibly_truncated=True),),
+    )
+
+    result = await run_agent(run_id="truncated-500", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.PARTIAL
+    assert result.final_answer.stop_reason is StopReason.RESULT_TRUNCATED
+    assert result.final_answer.evidence_ids == ()
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+    assert backend.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_result_truncated_preserves_reason_with_existing_verified_evidence() -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(),),
+        synthesis_output=synthesis(),
+    )
+    context, _, _, _, _ = context_for(scripts, (query_result(),))
+    graph = build_agent_graph()
+    state = cast(
+        AgentState,
+        await graph.ainvoke(
+            new_agent_state(run_id="truncated-with-evidence", query=QUERY),
+            context=context,
+        ),
+    )
+    state["final_answer"] = None
+    state["stop_reason"] = StopReason.RESULT_TRUNCATED
+
+    delta = await finalize(state, Runtime(context=context))
+
+    answer = delta["final_answer"]
+    assert isinstance(answer, FinalAnswer)
+    assert answer.status is FinalStatus.PARTIAL
+    assert answer.stop_reason is StopReason.RESULT_TRUNCATED
+    assert answer.evidence_ids == tuple(item.evidence_id for item in state["evidence"])
+
+
+@pytest.mark.asyncio
+async def test_select_star_is_output_policy_blocked_before_backend() -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(sql="select * from orders"),),
+    )
+    context, _, _, events, backend = context_for(scripts, ())
+
+    result = await run_agent(run_id="select-star", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.POLICY_BLOCKED
+    assert result.final_answer.stop_reason is StopReason.SQL_POLICY_REJECTED
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+    assert backend.calls == 0
+    failed = next(item for item in events.items if item[1] == "tool.failed")
+    assert failed[2]["safe_error"] == "output_shape_policy"
+
+
+@pytest.mark.asyncio
+async def test_nonfinite_result_projection_is_output_policy_blocked() -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(),),
+    )
+    context, _, _, events, backend = context_for(
+        scripts,
+        (cast(QueryResult, object()),),
+    )
+
+    result = await run_agent(run_id="projection-policy", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.POLICY_BLOCKED
+    assert result.final_answer.stop_reason is StopReason.SQL_POLICY_REJECTED
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+    assert backend.calls == 1
+    assert (
+        next(item for item in events.items if item[1] == "tool.failed")[2]["safe_error"]
+        == "output_shape_policy"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compiler_timeout_is_internal_not_sql_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timeout(*_args: object) -> object:
+        raise TimeoutError("raw compiler timeout sentinel")
+
+    monkeypatch.setattr(
+        "governed_analytics.agent.nodes.planning.compile_answer_contract",
+        timeout,
+    )
+    context, _, _, _, _ = context_for(scripts_for(QUERY, plan=simple_plan()), ())
+
+    result = await run_agent(run_id="compiler-timeout", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.final_answer.stop_reason is StopReason.INTERNAL_ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("behavior", "expected_status", "expected_reason"),
+    [
+        (
+            {
+                "action": "refuse",
+                "reason_code": "unsafe_request",
+                "missing_fields": [],
+                "user_message": "拒绝。",
+            },
+            FinalStatus.REFUSED,
+            StopReason.UNSAFE_REQUEST,
+        ),
+        (
+            {
+                "action": "unsupported",
+                "reason_code": "unsupported_analysis",
+                "missing_fields": [],
+                "user_message": "不支持。",
+            },
+            FinalStatus.UNSUPPORTED,
+            StopReason.UNSUPPORTED_ANALYSIS,
+        ),
+    ],
+)
+async def test_refuse_and_unsupported_never_call_tools(
+    behavior: dict[str, object],
+    expected_status: FinalStatus,
+    expected_reason: StopReason,
+) -> None:
+    context, tools, model, _, _ = context_for(
+        scripts_for(QUERY, behavior=behavior),
+        (),
+    )
+
+    result = await run_agent(run_id="behavior-short", query=QUERY, context=context)
+
+    assert result.final_answer.status is expected_status
+    assert result.final_answer.stop_reason is expected_reason
+    assert tools.calls == []
+    assert [call.purpose for call in model.calls] == ["behavior"]
+
+
+@pytest.mark.asyncio
+async def test_premise_not_met_has_completed_terminal_and_stops_at_comparison() -> None:
+    scripts = scripts_for(
+        ATTRIBUTION_QUERY,
+        plan=attribution_plan(),
+        actions=(
+            execute_action(
+                "gmv_comparison",
+                "confirm_decline",
+                sql=(
+                    "select 100::numeric as current_gmv, 80::numeric as previous_gmv, "
+                    "0.25::numeric as change_rate"
+                ),
+            ),
+        ),
+        synthesis_output={
+            "status": "completed",
+            "stop_reason": "premise_not_met",
+            "answer": "前提不成立。",
+            "evidence_ids": [],
+            "completed_dimensions": ["confirm_decline"],
+        },
+    )
+    context, tools, _, events, _ = context_for(
+        scripts,
+        (
+            query_result(
+                ("current_gmv", "previous_gmv", "change_rate"),
+                (("100", "80", "0.25"),),
+            ),
+        ),
+    )
+
+    result = await run_agent(run_id="premise-not-met", query=ATTRIBUTION_QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.COMPLETED
+    assert result.final_answer.stop_reason is StopReason.PREMISE_NOT_MET
+    assert result.final_answer.completed_dimensions == ("confirm_decline",)
+    assert tools.calls.count(ActionType.EXECUTE_SQL) == 1
+    assert [item[1] for item in events.items][-2:] == [
+        "hypothesis.updated",
+        "evidence.assessed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_second_invalid_repair_records_and_emits_failure() -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(sql="select 125::numeric as value"),),
+        repairs=(execute_action(sql="select 125::numeric as still_wrong"),),
+    )
+    context, _, _, events, _ = context_for(
+        scripts,
+        (
+            query_result(("value",), (("125",),), query_id="c" * 64),
+            query_result(("still_wrong",), (("125",),), query_id="d" * 64),
+        ),
+    )
+
+    result = await run_agent(run_id="repair-audit-failed", query=QUERY, context=context)
+
+    assert result.final_answer.stop_reason is StopReason.REPAIR_FAILED
+    assert result.repair_history[-1].outcome == "failed"
+    assert result.repair_history[-1].repaired_observation_id is None
+    repair_events = [item for item in events.items if item[1].startswith("repair.")]
+    assert [item[2]["success"] for item in repair_events] == [False, False]
+    assert [item[1] for item in events.items] == [
+        "behavior.decided",
+        "context.retrieved",
+        "plan.created",
+        "tool.started",
+        "tool.completed",
+        "observation.validated",
+        "repair.started",
+        "tool.started",
+        "tool.completed",
+        "repair.completed",
+        "observation.validated",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_repair_records_and_emits_success() -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(sql="select 125::numeric as value"),),
+        repairs=(execute_action(),),
+        synthesis_output=synthesis(),
+    )
+    context, _, _, events, _ = context_for(
+        scripts,
+        (
+            query_result(("value",), (("125",),), query_id="c" * 64),
+            query_result(query_id="d" * 64),
+        ),
+    )
+
+    result = await run_agent(run_id="repair-audit-success", query=QUERY, context=context)
+
+    assert result.repair_history[-1].outcome == "success"
+    assert result.repair_history[-1].repaired_observation_id is not None
+    repair_events = [item for item in events.items if item[1].startswith("repair.")]
+    assert [item[2]["success"] for item in repair_events] == [False, True]
+    assert [item[1] for item in events.items] == [
+        "behavior.decided",
+        "context.retrieved",
+        "plan.created",
+        "tool.started",
+        "tool.completed",
+        "observation.validated",
+        "repair.started",
+        "tool.started",
+        "tool.completed",
+        "repair.completed",
+        "observation.validated",
+        "hypothesis.updated",
+        "evidence.assessed",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "category",
+    [
+        AgentModelErrorCategory.PROVIDER_CALL_FAILED,
+        AgentModelErrorCategory.INVALID_STRUCTURE,
+    ],
+)
+async def test_model_failures_do_not_emit_budget_warning(
+    category: AgentModelErrorCategory,
+) -> None:
+    context, _, _, events, _ = context_for({}, ())
+    failing = FailingModel(category)
+    context = replace_context(context, model=failing)
+
+    result = await run_agent(run_id="model-failure", query=QUERY, context=context)
+
+    assert result.final_answer.stop_reason in {
+        StopReason.MODEL_UNAVAILABLE,
+        StopReason.REPAIR_FAILED,
+    }
+    assert not any(item[1] == "budget.warning" for item in events.items)
+
+
+@pytest.mark.asyncio
+async def test_tool_port_exception_becomes_safe_failed_observation_and_consumes_loop() -> None:
+    raw_sentinel = "raw tool port secret sentinel"
+
+    class ExplodingInvokeTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            del action, node
+            raise RuntimeError(raw_sentinel)
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, ())
+    context = replace_context(
+        context,
+        tools=ExplodingInvokeTools(tools.registry),
+    )
+
+    result = await run_agent(run_id="tool-port-failure", query=QUERY, context=context)
+
+    failed = result.observations[-1]
+    assert failed.tool_name is ActionType.EXECUTE_SQL
+    assert failed.purpose == "metric_value_contract"
+    assert failed.safe_error == "internal_tool_error"
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+    assert result.safe_trace.tool_calls[-1].safe_error == "internal_tool_error"
+    rendered = json.dumps(
+        {
+            "answer": result.final_answer.model_dump(mode="json"),
+            "trace": result.safe_trace.model_dump(mode="json"),
+            "events": events.items,
+        }
+    )
+    assert raw_sentinel not in rendered
+
+
+@pytest.mark.asyncio
+async def test_repair_tool_port_exception_is_safe_failed_repair() -> None:
+    raw_sentinel = "raw repair port secret sentinel"
+
+    class ExplodingRepairTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            if node == "repair":
+                raise RuntimeError(raw_sentinel)
+            return await super().invoke(action, node=node)
+
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(sql="select 125::numeric as value"),),
+        repairs=(execute_action(),),
+    )
+    context, tools, _, events, _ = context_for(
+        scripts,
+        (query_result(("value",), (("125",),)),),
+    )
+    context = replace_context(context, tools=ExplodingRepairTools(tools.registry))
+
+    result = await run_agent(run_id="repair-port-failure", query=QUERY, context=context)
+
+    assert result.final_answer.stop_reason is StopReason.REPAIR_FAILED
+    assert result.repair_history[-1].outcome == "failed"
+    assert result.repair_history[-1].repaired_observation_id is None
+    assert result.observations[-1].safe_error == "internal_tool_error"
+    assert result.governance.action_loops == 1
+    assert raw_sentinel not in json.dumps(
+        {
+            "answer": result.final_answer.model_dump(mode="json"),
+            "trace": result.safe_trace.model_dump(mode="json"),
+            "events": events.items,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_injected_tool_metadata_mismatch_is_replaced_with_safe_failure() -> None:
+    malicious_purpose = "api_key_prompt_payload"
+
+    class MismatchedTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            del action, node
+            observation = Observation(
+                observation_id="malicious-observation",
+                tool_name=ActionType.EXECUTE_SQL,
+                purpose=malicious_purpose,
+                ok=False,
+                safe_error="database_error",
+                hypothesis_id="metric_value",
+                contract_id="metric_value_contract",
+            )
+            trace = ToolCallTrace(
+                tool_name=ActionType.EXECUTE_SQL,
+                purpose=malicious_purpose,
+                safe_arguments=(
+                    ("contract_id", "metric_value_contract"),
+                    ("hypothesis_id", "metric_value"),
+                ),
+                safe_error="database_error",
+            )
+            return ToolInvocation(observation=observation, trace=trace)
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, ())
+    context = replace_context(context, tools=MismatchedTools(tools.registry))
+
+    result = await run_agent(run_id="mismatched-tool", query=QUERY, context=context)
+
+    assert result.observations[-1].purpose == "metric_value_contract"
+    assert result.observations[-1].safe_error == "internal_tool_error"
+    assert result.safe_trace.tool_calls[-1].purpose == "metric_value_contract"
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+    assert malicious_purpose not in json.dumps(
+        {
+            "answer": result.final_answer.model_dump(mode="json"),
+            "trace": result.safe_trace.model_dump(mode="json"),
+            "events": events.items,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_started_event_failure_clears_and_consumes_pending_loop() -> None:
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, _, _, _, _ = context_for(scripts, ())
+    context = replace_context(context, events=FailOneEvent("tool.started"))
+
+    result = await run_agent(run_id="tool-event-failure", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+    assert not any(item.tool_name is ActionType.EXECUTE_SQL for item in result.observations)
+
+
+@pytest.mark.asyncio
+async def test_preinvoke_tool_budget_rejection_clears_pending_without_consuming_loop() -> None:
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, _, _, _, _ = context_for(scripts, (), budget=ledger(max_tool_calls=2))
+    graph = build_agent_graph()
+
+    state = await graph.ainvoke(
+        new_agent_state(run_id="preinvoke-budget", query=QUERY),
+        context=context,
+    )
+
+    assert state["stop_reason"] is StopReason.TOOL_CALL_LIMIT
+    assert state["action_loop_pending"] is False
+    assert state["governance"].execute_calls == 0
+    assert state["governance"].action_loops == 0
+    assert not any(item.tool_name is ActionType.EXECUTE_SQL for item in state["observations"])
+
+
+@pytest.mark.asyncio
+async def test_event_sink_exception_returns_internal_terminal_without_raw_error() -> None:
+    context, _, _, _, _ = context_for(scripts_for(QUERY), ())
+    context = replace_context(context, events=FailingEvents())
+
+    result = await run_agent(run_id="event-failure", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.final_answer.stop_reason is StopReason.INTERNAL_ERROR
+    assert "raw event sink sentinel" not in result.final_answer.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["append_node", "append_model", "append_tool", "snapshot"])
+async def test_trace_dependency_failure_returns_internal_terminal(failure: str) -> None:
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, _, model, events, _ = context_for(scripts, (query_result(),))
+    recorder = FailingTraceRecorder(failure)
+    context = replace_context(context, model=model, recorder=recorder)
+
+    result = await run_agent(run_id=f"trace-{failure}", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.final_answer.stop_reason is StopReason.INTERNAL_ERROR
+    assert (
+        "raw"
+        not in json.dumps(
+            {
+                "answer": result.final_answer.model_dump(mode="json"),
+                "trace": result.safe_trace.model_dump(mode="json"),
+                "events": events.items,
+            }
+        ).lower()
+    )
+    if failure == "append_tool":
+        assert result.governance.execute_calls == result.governance.action_loops == 1
+
+
+@pytest.mark.asyncio
+async def test_invoke_tool_node_trace_failure_atomically_consumes_pending_loop() -> None:
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, _, model, _, _ = context_for(scripts, (query_result(),))
+    recorder = FailingTraceRecorder("append_node_invoke_tool")
+    context = replace_context(context, model=model, recorder=recorder)
+
+    result = await run_agent(run_id="tool-node-trace-failure", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+
+
+@pytest.mark.asyncio
+async def test_malicious_plan_identifier_is_rejected_before_plan_event_or_state() -> None:
+    malicious = simple_plan()
+    malicious["plan_id"] = "api_key"
+    context, _, model, events, _ = context_for(
+        scripts_for(QUERY, plan=malicious),
+        (),
+    )
+
+    result = await run_agent(run_id="malicious-plan", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.EXECUTION_FAILED
+    assert result.final_answer.stop_reason is StopReason.PLAN_INVALID
+    assert [call.purpose for call in model.calls] == ["behavior", "plan"]
+    assert not any(item[1] == "plan.created" for item in events.items)
+    assert "api_key" not in json.dumps(events.items)
+
+
+@pytest.mark.asyncio
+async def test_malicious_action_purpose_is_rejected_before_tool_call() -> None:
+    action = execute_action()
+    action["purpose"] = "secret_token"
+    context, tools, _, events, backend = context_for(
+        scripts_for(QUERY, plan=simple_plan(), actions=(action,)),
+        (),
+    )
+
+    result = await run_agent(run_id="malicious-action", query=QUERY, context=context)
+
+    assert result.final_answer.stop_reason is StopReason.PLAN_INVALID
+    assert tools.calls == [ActionType.METRIC_LOOKUP, ActionType.SCHEMA_LOOKUP]
+    assert backend.calls == 0
+    assert "secret_token" not in json.dumps(events.items)
+
+
+def bound_synthesis(
+    request: StructuredModelRequest,
+    *,
+    answer: str = "模型答案标记。",
+    evidence_ids: tuple[str, ...] | None = None,
+    completed_dimensions: tuple[str, ...] = ("metric_value",),
+    missing_dimensions: tuple[str, ...] = (),
+    limitations: tuple[str, ...] = (),
+    result_summary: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "status": "completed",
+        "stop_reason": "answer_complete",
+        "answer": answer,
+        "evidence_ids": (
+            list(evidence_ids)
+            if evidence_ids is not None
+            else list(evidence_ids_from_request(request))
+        ),
+        "completed_dimensions": list(completed_dimensions),
+        "missing_dimensions": list(missing_dimensions),
+        "limitations": list(limitations),
+        "result_summary": result_summary,
+    }
+
+
+def projected_summary_from_request(request: StructuredModelRequest) -> dict[str, object]:
+    raw_evidence = request.user_payload["evidence"]
+    assert isinstance(raw_evidence, tuple)
+    projected: list[dict[str, object]] = []
+    for item in raw_evidence:
+        assert isinstance(item, Mapping)
+        raw_dimensions = item["dimensions"]
+        assert isinstance(raw_dimensions, tuple)
+        projected.append(
+            {
+                "evidence_id": item["evidence_id"],
+                "claim_key": item["claim_key"],
+                "numeric_value": item["numeric_value"],
+                "unit": item["unit"],
+                "dimensions": tuple(
+                    {"name": pair[0], "value": pair[1]}
+                    for pair in raw_dimensions
+                    if isinstance(pair, tuple) and len(pair) == 2
+                ),
+            }
+        )
+    return {"evidence": tuple(projected)}
+
+
+@pytest.mark.asyncio
+async def test_exactly_bound_synthesis_is_accepted_and_summary_is_governed() -> None:
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+
+    def factory(request: StructuredModelRequest) -> dict[str, object]:
+        return bound_synthesis(
+            request,
+            result_summary=projected_summary_from_request(request),
+        )
+
+    context, _, _, _, _ = context_for(scripts, (query_result(),))
+    model = DynamicSynthesisModel(scripts, factory)
+    context = replace_context(context, model=model)
+
+    result = await run_agent(run_id="bound-synthesis", query=QUERY, context=context)
+
+    assert result.final_answer.answer == "模型答案标记。"
+    assert result.final_answer.evidence_ids == tuple(item.evidence_id for item in result.evidence)
+    assert result.final_answer.completed_dimensions == ("metric_value",)
+    assert result.final_answer.missing_dimensions == ()
+    assert result.final_answer.result_summary is not None
+    summary_items = result.final_answer.result_summary["evidence"]
+    assert isinstance(summary_items, tuple)
+    first_summary = summary_items[0]
+    assert isinstance(first_summary, Mapping)
+    assert first_summary["numeric_value"] == "125.00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda request: bound_synthesis(request, evidence_ids=()),
+        lambda request: bound_synthesis(request, completed_dimensions=()),
+        lambda request: bound_synthesis(request, answer="结果是 999999999。"),
+        lambda request: bound_synthesis(request, limitations=("API_KEY=private",)),
+        lambda request: bound_synthesis(
+            request,
+            result_summary={"evidence": ({"evidence_id": "wrong"},)},
+        ),
+        lambda request: bound_synthesis(
+            request,
+            result_summary={"note": "password private"},
+        ),
+    ],
+    ids=[
+        "missing-ids",
+        "wrong-dimensions",
+        "wrong-number",
+        "api-key",
+        "wrong-summary",
+        "sensitive-summary",
+    ],
+)
+async def test_unbound_or_sensitive_synthesis_falls_back_deterministically(
+    factory: SynthesisFactory,
+) -> None:
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, _, _, _, _ = context_for(scripts, (query_result(),))
+    model = DynamicSynthesisModel(scripts, factory)
+    context = replace_context(context, model=model)
+
+    result = await run_agent(run_id="invalid-synthesis", query=QUERY, context=context)
+
+    assert result.final_answer.answer != "模型答案标记。"
+    assert "999999999" not in result.final_answer.model_dump_json()
+    assert "api_key" not in result.final_answer.model_dump_json().lower()
+    assert result.final_answer.evidence_ids == tuple(item.evidence_id for item in result.evidence)
+    assert result.final_answer.completed_dimensions == ("metric_value",)
+    assert result.final_answer.result_summary is not None
+
+
+@pytest.mark.asyncio
+async def test_profile_event_and_trace_never_include_filter_value() -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(profile_action(), execute_action()),
+        synthesis_output=synthesis(),
+    )
+    context, _, _, events, _ = context_for(scripts, (query_result(),))
+
+    result = await run_agent(run_id="profile-events", query=QUERY, context=context)
+
+    profile_started = next(
+        item
+        for item in events.items
+        if item[1] == "tool.started" and item[2]["tool_name"] == "profile"
+    )
+    profile_completed = next(
+        item
+        for item in events.items
+        if item[1] == "tool.completed" and item[2]["tool_name"] == "profile"
+    )
+    assert profile_started[2]["purpose"] == "profile_context"
+    assert profile_completed[2]["purpose"] == "profile_context"
+    rendered = json.dumps(
+        {
+            "events": events.items,
+            "trace": result.safe_trace.model_dump(mode="json"),
+        },
+        ensure_ascii=False,
+    )
+    assert "private_filter_value_sentinel" not in rendered
