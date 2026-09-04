@@ -30,6 +30,7 @@ from governed_analytics.agent.nodes.behavior import (
     emit_domain_event,
     failure_delta,
     finish_node,
+    propagate_cancellation,
     safe_error_stop_reason,
     sensitive_identifier,
 )
@@ -239,14 +240,25 @@ def _valid_action_target(state: AgentState, action: AnalysisAction, pending: str
         table_name = arguments.get("table_name")
         column_name = arguments.get("column_name")
         time_column = arguments.get("time_column")
+        if (
+            not isinstance(table_name, str)
+            or not isinstance(column_name, str)
+            or (time_column is not None and not isinstance(time_column, str))
+        ):
+            return False
         raw_filters = arguments.get("filters", ())
         identifiers = [table_name, column_name]
         if time_column is not None:
             identifiers.append(time_column)
-        if isinstance(raw_filters, tuple):
-            identifiers.extend(
-                item.get("column_name") for item in raw_filters if isinstance(item, Mapping)
-            )
+        if not isinstance(raw_filters, tuple):
+            return False
+        for item in raw_filters:
+            if not isinstance(item, Mapping):
+                return False
+            filter_column = item.get("column_name")
+            if not isinstance(filter_column, str):
+                return False
+            identifiers.append(filter_column)
         if any(not isinstance(item, str) or sensitive_identifier(item) for item in identifiers):
             return False
         table = next(
@@ -255,8 +267,18 @@ def _valid_action_target(state: AgentState, action: AnalysisAction, pending: str
         )
         if table is None:
             return False
-        columns = {item.name for item in table.columns}
-        return all(item in columns for item in identifiers[1:])
+        columns = {item.name: item for item in table.columns}
+        if not all(item in columns for item in identifiers[1:]):
+            return False
+        target_column = columns[column_name]
+        operation = action.arguments.get("operation", "distinct_values")
+        if operation == "numeric_summary" and not target_column.data_type.startswith(
+            ("bigint", "integer", "numeric")
+        ):
+            return False
+        if operation == "time_range" and target_column.data_type != "timestamptz":
+            return False
+        return time_column is None or columns[time_column].data_type == "timestamptz"
     contract = state["answer_contract"]
     if contract is None or action.contract_id is None:
         return False
@@ -526,7 +548,11 @@ def _profile_safe_arguments(action: AgentAction) -> tuple[tuple[str, JsonValue],
     return tuple(sorted(values.items()))
 
 
-def _invocation_matches_action(action: AgentAction, invocation: ToolInvocation) -> bool:
+def _invocation_matches_action(
+    state: AgentState,
+    action: AgentAction,
+    invocation: ToolInvocation,
+) -> bool:
     observation = invocation.observation
     trace = invocation.trace
     if (
@@ -553,12 +579,21 @@ def _invocation_matches_action(action: AgentAction, invocation: ToolInvocation) 
             )
             if value is not None
         )
-        return trace.safe_arguments == expected_arguments
-    profile_arguments = _profile_safe_arguments(action)
-    if observation.safe_error == "invalid_request":
-        return trace.safe_arguments == () or (
-            profile_arguments is not None and trace.safe_arguments == profile_arguments
+        if trace.safe_arguments != expected_arguments:
+            return False
+        if not observation.ok:
+            return observation.columns == ()
+        contract = state["answer_contract"]
+        if contract is None or action.contract_id is None:
+            return False
+        try:
+            expected_columns = contract.contract(action.contract_id).column_names
+        except KeyError:
+            return False
+        return observation.columns == expected_columns and not any(
+            sensitive_identifier(column) for column in observation.columns
         )
+    profile_arguments = _profile_safe_arguments(action)
     if profile_arguments is None or trace.safe_arguments != profile_arguments:
         return False
     if not observation.ok:
@@ -603,8 +638,9 @@ async def invoke_tool(
         try:
             invocation = await context.tools.invoke(action, node="invoke_tool")
         except Exception:
+            propagate_cancellation()
             invocation = _safe_failure_invocation(action)
-        if not _invocation_matches_action(action, invocation):
+        if not _invocation_matches_action(state, action, invocation):
             invocation = _safe_failure_invocation(action)
         context.trace_recorder.append_tool(invocation.trace)
         trace_recorded = True
@@ -744,13 +780,17 @@ async def validate_observation_node(
     context = runtime.context
     started_at = context.clock.monotonic()
     loop_consumed = False
+    loop_delta: dict[str, object] = {}
 
     def consume_loop_once() -> dict[str, object]:
-        nonlocal loop_consumed
-        if loop_consumed or not state["action_loop_pending"]:
-            return {}
+        nonlocal loop_consumed, loop_delta
+        if loop_consumed:
+            return loop_delta
+        if not state["action_loop_pending"]:
+            return loop_delta
         loop_consumed = True
-        return _consume_pending_loop(state, context)
+        loop_delta = _consume_pending_loop(state, context)
+        return loop_delta
 
     try:
         action = state["next_action"]
@@ -816,7 +856,7 @@ async def validate_observation_node(
             )
             if not await emit_domain_event(
                 context,
-                node="validate_observation",
+                node="repair",
                 event_type="repair.completed",
                 data=repair_event_data(
                     repair_count=context.budget.snapshot.repair_count,
@@ -859,6 +899,7 @@ async def validate_observation_node(
             started_at=started_at,
             outcome="completed" if validation.valid else "failed",
             delta=delta,
+            consume_action_loop_on_failure=(validation.valid and state["action_loop_pending"]),
         )
     except Exception as error:
         delta = failure_delta(error, context)
@@ -1070,8 +1111,9 @@ async def repair(
         try:
             tool_invocation = await context.tools.invoke(repaired_action, node="repair")
         except Exception:
+            propagate_cancellation()
             tool_invocation = _safe_failure_invocation(repaired_action)
-        if not _invocation_matches_action(repaired_action, tool_invocation):
+        if not _invocation_matches_action(state, repaired_action, tool_invocation):
             tool_invocation = _safe_failure_invocation(repaired_action)
         context.trace_recorder.append_tool(tool_invocation.trace)
         tool_trace_recorded = True

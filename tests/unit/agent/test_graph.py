@@ -167,8 +167,15 @@ class FailingTraceRecorder(InMemoryTraceRecorder):
         self.failure = failure
 
     def append_node(self, trace):  # type: ignore[no-untyped-def]
-        if self.failure == "append_node" or (
-            self.failure == "append_node_invoke_tool" and trace.node == "invoke_tool"
+        if (
+            self.failure == "append_node"
+            or (self.failure == "append_node_invoke_tool" and trace.node == "invoke_tool")
+            or (
+                self.failure == "append_node_validate_observation"
+                and trace.node == "validate_observation"
+            )
+            or (self.failure == "append_node_judge_evidence" and trace.node == "judge_evidence")
+            or (self.failure == "append_node_synthesize" and trace.node == "synthesize")
         ):
             raise RuntimeError("raw append node sentinel")
         return super().append_node(trace)
@@ -738,18 +745,20 @@ async def test_attribution_checks_decline_then_three_dimensions() -> None:
 
 @pytest.mark.asyncio
 async def test_repairable_column_contract_failure_repairs_once() -> None:
+    # Column metadata is now rejected at the invocation boundary, so exercise the
+    # same result-contract repair path with a governed-column type mismatch.
     repaired = execute_action(sql="select cast(125 as numeric) as gmv")
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select cast(125 as numeric) as value"),),
+        actions=(execute_action(),),
         synthesis_output=synthesis(),
         repairs=(repaired,),
     )
     context, tools, model, events, backend = context_for(
         scripts,
         (
-            query_result(("value",), (("125",),), query_id="c" * 64),
+            query_result(("gmv",), (("not-a-number",),), query_id="c" * 64),
             query_result(("gmv",), (("125",),), query_id="d" * 64),
         ),
     )
@@ -765,7 +774,7 @@ async def test_repairable_column_contract_failure_repairs_once() -> None:
     assert tools.calls.count(ActionType.EXECUTE_SQL) == backend.calls == 2
     assert [call.purpose for call in model.calls].count("repair") == 1
     assert result.first_candidate is not None
-    assert result.first_candidate.columns == ("value",)
+    assert result.first_candidate.columns == ("gmv",)
     repair_events = [item for item in events.items if item[1].startswith("repair.")]
     assert [item[1] for item in repair_events] == ["repair.started", "repair.completed"]
     assert all(set(item[2]) == {"repair_count", "error_code", "success"} for item in repair_events)
@@ -776,14 +785,14 @@ async def test_second_contract_failure_stops_without_third_execute() -> None:
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select cast(125 as numeric) as value"),),
-        repairs=(execute_action(sql="select cast(125 as numeric) as still_wrong"),),
+        actions=(execute_action(),),
+        repairs=(execute_action(),),
     )
     context, tools, _, _, backend = context_for(
         scripts,
         (
-            query_result(("value",), (("125",),), query_id="c" * 64),
-            query_result(("still_wrong",), (("125",),), query_id="d" * 64),
+            query_result(("gmv",), (("not-a-number",),), query_id="c" * 64),
+            query_result(("gmv",), (("still-not-a-number",),), query_id="d" * 64),
         ),
     )
 
@@ -828,12 +837,12 @@ async def test_repair_execute_reapplies_full_sql_policy_without_backend_call() -
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select cast(125 as numeric) as value"),),
+        actions=(execute_action(),),
         repairs=(execute_action(sql="drop table orders"),),
     )
     context, tools, _, _, backend = context_for(
         scripts,
-        (query_result(("value",), (("125",),), query_id="c" * 64),),
+        (query_result(("gmv",), (("not-a-number",),), query_id="c" * 64),),
     )
 
     result = await run_agent(run_id="repair-policy", query=QUERY, context=context)
@@ -854,12 +863,12 @@ async def test_repair_output_invalid_stops_without_second_execute() -> None:
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select cast(125 as numeric) as value"),),
+        actions=(execute_action(),),
         repairs=({"not": "an action"},),
     )
     context, tools, model, _, backend = context_for(
         scripts,
-        (query_result(("value",), (("125",),), query_id="c" * 64),),
+        (query_result(("gmv",), (("not-a-number",),), query_id="c" * 64),),
     )
 
     result = await run_agent(run_id="repair-invalid", query=QUERY, context=context)
@@ -1490,14 +1499,14 @@ async def test_second_invalid_repair_records_and_emits_failure() -> None:
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select 125::numeric as value"),),
-        repairs=(execute_action(sql="select 125::numeric as still_wrong"),),
+        actions=(execute_action(),),
+        repairs=(execute_action(),),
     )
     context, _, _, events, _ = context_for(
         scripts,
         (
-            query_result(("value",), (("125",),), query_id="c" * 64),
-            query_result(("still_wrong",), (("125",),), query_id="d" * 64),
+            query_result(("gmv",), (("not-a-number",),), query_id="c" * 64),
+            query_result(("gmv",), (("still-not-a-number",),), query_id="d" * 64),
         ),
     )
 
@@ -1528,14 +1537,14 @@ async def test_successful_repair_records_and_emits_success() -> None:
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select 125::numeric as value"),),
+        actions=(execute_action(),),
         repairs=(execute_action(),),
         synthesis_output=synthesis(),
     )
     context, _, _, events, _ = context_for(
         scripts,
         (
-            query_result(("value",), (("125",),), query_id="c" * 64),
+            query_result(("gmv",), (("not-a-number",),), query_id="c" * 64),
             query_result(query_id="d" * 64),
         ),
     )
@@ -1546,6 +1555,7 @@ async def test_successful_repair_records_and_emits_success() -> None:
     assert result.repair_history[-1].repaired_observation_id is not None
     repair_events = [item for item in events.items if item[1].startswith("repair.")]
     assert [item[2]["success"] for item in repair_events] == [False, True]
+    assert [item[0] for item in repair_events] == ["repair", "repair"]
     assert [item[1] for item in events.items] == [
         "behavior.decided",
         "context.retrieved",
@@ -1635,12 +1645,12 @@ async def test_repair_tool_port_exception_is_safe_failed_repair() -> None:
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select 125::numeric as value"),),
+        actions=(execute_action(),),
         repairs=(execute_action(),),
     )
     context, tools, _, events, _ = context_for(
         scripts,
-        (query_result(("value",), (("125",),)),),
+        (query_result(("gmv",), (("not-a-number",),)),),
     )
     context = replace_context(context, tools=ExplodingRepairTools(tools.registry))
 
@@ -2017,7 +2027,12 @@ async def test_injected_raw_safe_error_is_replaced_by_allowlisted_internal_error
     assert result.safe_trace.tool_calls[-1].safe_error == "internal_tool_error"
     rendered = json.dumps(
         {
-            "observations": [dict(item.safe_summary) for item in result.observations],
+            "observation": result.observations[-1].model_dump(mode="json"),
+            "first_candidate": (
+                result.first_candidate.model_dump(mode="json")
+                if result.first_candidate is not None
+                else None
+            ),
             "trace": result.safe_trace.model_dump(mode="json"),
             "events": events.items,
         }
@@ -2257,13 +2272,13 @@ async def test_repaired_observation_is_committed_only_after_validation_and_compl
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select 125::numeric as value"),),
+        actions=(execute_action(),),
         repairs=(execute_action(),),
     )
     context, _, _, _, _ = context_for(
         scripts,
         (
-            query_result(("value",), (("125",),)),
+            query_result(("gmv",), (("not-a-number",),)),
             query_result(),
         ),
     )
@@ -2282,13 +2297,13 @@ async def test_repair_completion_event_failure_does_not_commit_success_record() 
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select 125::numeric as value"),),
+        actions=(execute_action(),),
         repairs=(execute_action(),),
     )
     context, _, _, _, _ = context_for(
         scripts,
         (
-            query_result(("value",), (("125",),)),
+            query_result(("gmv",), (("not-a-number",),)),
             query_result(),
         ),
     )
@@ -2308,12 +2323,12 @@ async def test_failed_repair_completion_event_is_not_retried_or_committed() -> N
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select 125::numeric as value"),),
+        actions=(execute_action(),),
         repairs=(execute_action(),),
     )
     context, _, _, _, _ = context_for(
         scripts,
-        (query_result(("value",), (("125",),)),),
+        (query_result(("gmv",), (("not-a-number",),)),),
     )
 
     class ExplodingRepairTools(RecordingTools):
@@ -2347,11 +2362,19 @@ async def test_failed_observation_validation_event_consumes_action_loop_exactly_
     context, _, _, _, _ = context_for(scripts, ())
     context = replace_context(context, events=FailOneEvent("observation.validated"))
 
-    result = await run_agent(run_id="failed-validation-event", query=QUERY, context=context)
+    state = cast(
+        AgentState,
+        await build_agent_graph().ainvoke(
+            new_agent_state(run_id="failed-validation-event", query=QUERY),
+            context=context,
+        ),
+    )
 
-    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
-    assert result.governance.execute_calls == 1
-    assert result.governance.action_loops == 1
+    assert state["final_answer"] is not None
+    assert state["final_answer"].status is FinalStatus.INTERNAL_ERROR
+    assert state["governance"].execute_calls == 1
+    assert state["governance"].action_loops == 1
+    assert state["action_loop_pending"] is False
 
 
 @pytest.mark.asyncio
@@ -2359,12 +2382,12 @@ async def test_repair_budget_rejection_warns_without_orphan_completion_event() -
     scripts = scripts_for(
         QUERY,
         plan=simple_plan(),
-        actions=(execute_action(sql="select 125::numeric as value"),),
+        actions=(execute_action(),),
         repairs=(execute_action(),),
     )
     context, _, _, events, _ = context_for(
         scripts,
-        (query_result(("value",), (("125",),)),),
+        (query_result(("gmv",), (("not-a-number",),)),),
         budget=ledger(max_repairs=0),
     )
 
@@ -2501,5 +2524,219 @@ async def test_partial_synthesis_requires_exact_evidence_partial_reason() -> Non
 
     delta = await synthesize_node(state, Runtime(context=synthesis_context))
 
-    assert delta["final_answer"] is None
-    assert delta["stop_reason"] is StopReason.INTERNAL_ERROR
+    answer = cast(FinalAnswer, delta["final_answer"])
+    assert answer.status is FinalStatus.PARTIAL
+    assert answer.stop_reason is StopReason.EVIDENCE_PARTIAL
+    assert delta["stop_reason"] is StopReason.EVIDENCE_PARTIAL
+
+
+@pytest.mark.asyncio
+async def test_judge_evidence_trace_failure_cannot_finalize_completed() -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(),),
+        synthesis_output=synthesis(),
+    )
+    context, _, model, _, _ = context_for(scripts, (query_result(),))
+    context = replace_context(
+        context,
+        model=model,
+        recorder=FailingTraceRecorder("append_node_judge_evidence"),
+    )
+
+    result = await run_agent(run_id="judge-trace-terminal", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.final_answer.stop_reason is StopReason.INTERNAL_ERROR
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+
+
+@pytest.mark.asyncio
+async def test_synthesize_trace_failure_cannot_finalize_completed() -> None:
+    scripts = scripts_for(
+        QUERY,
+        plan=simple_plan(),
+        actions=(execute_action(),),
+        synthesis_output=synthesis(),
+    )
+    context, _, model, _, _ = context_for(scripts, (query_result(),))
+    context = replace_context(
+        context,
+        model=model,
+        recorder=FailingTraceRecorder("append_node_synthesize"),
+    )
+
+    result = await run_agent(run_id="synthesize-trace-terminal", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.final_answer.stop_reason is StopReason.INTERNAL_ERROR
+    assert result.governance.execute_calls == result.governance.action_loops == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_success_columns_must_match_current_answer_contract() -> None:
+    malicious_column = "api_key"
+
+    class ForgedExecuteColumnsTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            invocation = await super().invoke(action, node=node)
+            if cast(AgentAction, action).action_type is ActionType.EXECUTE_SQL:
+                invocation = invocation.model_copy(
+                    update={
+                        "observation": invocation.observation.model_copy(
+                            update={"columns": (malicious_column,)}
+                        ),
+                        "trace": invocation.trace.model_copy(
+                            update={"columns": (malicious_column,)}
+                        ),
+                    }
+                )
+            return invocation
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, events, _ = context_for(scripts, (query_result(),))
+    context = replace_context(context, tools=ForgedExecuteColumnsTools(tools.registry))
+
+    result = await run_agent(run_id="forged-execute-columns", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.observations[-1].safe_error == "internal_tool_error"
+    assert result.safe_trace.tool_calls[-1].safe_error == "internal_tool_error"
+    rendered = json.dumps(
+        {
+            "observations": [dict(item.safe_summary) for item in result.observations],
+            "trace": result.safe_trace.model_dump(mode="json"),
+            "events": events.items,
+        }
+    )
+    assert malicious_column not in rendered
+
+
+@pytest.mark.asyncio
+async def test_profile_invalid_request_requires_exact_safe_arguments() -> None:
+    class EmptyProfileArgumentsTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            typed = cast(AgentAction, action)
+            self.calls.append(typed.action_type)
+            return ToolInvocation(
+                observation=Observation(
+                    observation_id="profile-empty-invalid-request",
+                    tool_name=ActionType.PROFILE,
+                    purpose="profile_context",
+                    ok=False,
+                    safe_error="invalid_request",
+                    hypothesis_id="metric_value",
+                ),
+                trace=ToolCallTrace(
+                    tool_name=ActionType.PROFILE,
+                    purpose="profile_context",
+                    safe_arguments=(),
+                    safe_error="invalid_request",
+                ),
+            )
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(profile_action(),))
+    context, tools, _, events, _ = context_for(scripts, ())
+    context = replace_context(context, tools=EmptyProfileArgumentsTools(tools.registry))
+
+    result = await run_agent(run_id="profile-empty-safe-args", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.INTERNAL_ERROR
+    assert result.observations[-1].safe_error == "internal_tool_error"
+    assert result.safe_trace.tool_calls[-1].safe_arguments == (
+        ("column_name", "region"),
+        ("filter_columns", ("status",)),
+        ("has_time_window", False),
+        ("limit", 5),
+        ("operation", "top_values"),
+        ("table_name", "orders"),
+    )
+    assert not any(
+        item[1] == "tool.failed" and item[2]["safe_error"] == "invalid_request"
+        for item in events.items
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "column_name", "time_column"),
+    [
+        ("numeric_summary", "region", None),
+        ("time_range", "region", None),
+        ("top_values", "region", "region"),
+    ],
+)
+async def test_profile_action_must_match_schema_column_types(
+    operation: str,
+    column_name: str,
+    time_column: str | None,
+) -> None:
+    action = profile_action()
+    arguments = cast(dict[str, object], action["arguments"])
+    arguments["operation"] = operation
+    arguments["column_name"] = column_name
+    if time_column is not None:
+        arguments.update(
+            {
+                "time_column": time_column,
+                "start_at": "2026-06-01T00:00:00Z",
+                "end_at": "2026-07-01T00:00:00Z",
+            }
+        )
+    context, tools, _, _, _ = context_for(
+        scripts_for(QUERY, plan=simple_plan(), actions=(action,)),
+        (),
+    )
+
+    result = await run_agent(run_id="profile-schema-type", query=QUERY, context=context)
+
+    assert result.final_answer.stop_reason is StopReason.PLAN_INVALID
+    assert ActionType.PROFILE not in tools.calls
+
+
+@pytest.mark.asyncio
+async def test_valid_execute_validation_trace_failure_consumes_loop_once() -> None:
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, _, model, _, _ = context_for(scripts, (query_result(),))
+    context = replace_context(
+        context,
+        model=model,
+        recorder=FailingTraceRecorder("append_node_validate_observation"),
+    )
+
+    state = cast(
+        AgentState,
+        await build_agent_graph().ainvoke(
+            new_agent_state(run_id="validation-trace-failure", query=QUERY),
+            context=context,
+        ),
+    )
+
+    assert state["final_answer"] is not None
+    assert state["final_answer"].status is FinalStatus.INTERNAL_ERROR
+    assert state["governance"].execute_calls == 1
+    assert state["governance"].action_loops == 1
+    assert state["action_loop_pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_node_self_cancellation_wins_over_tool_cleanup_runtime_error() -> None:
+    class CancellingTools(RecordingTools):
+        async def invoke(self, action: object, *, node: str):  # type: ignore[no-untyped-def]
+            del action, node
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                raise RuntimeError("cleanup replaced node cancellation sentinel") from None
+            raise AssertionError("cancellation was not delivered")
+
+    scripts = scripts_for(QUERY, plan=simple_plan(), actions=(execute_action(),))
+    context, tools, _, _, _ = context_for(scripts, ())
+    context = replace_context(context, tools=CancellingTools(tools.registry))
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_agent(run_id="node-self-cancelled", query=QUERY, context=context)

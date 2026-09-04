@@ -127,22 +127,16 @@ async def synthesize(
             max_output_tokens=900,
         )
         invocation = await context.model_invoker.invoke(request, FinalAnswer)
-        answer = invocation.result.output
-        valid = _valid_synthesis(state, answer)
-        if valid:
-            answer = _deterministic_answer(state)
+        valid = _valid_synthesis(state, invocation.result.output)
+        answer = _deterministic_answer(state)
         delta: dict[str, object] = {
             "governance": invocation.governance,
             "model_call_traces": invocation.traces,
+            "final_answer": answer,
+            "stop_reason": answer.stop_reason,
         }
         if invocation.repair_record is not None:
             delta["repair_history"] = (invocation.repair_record,)
-        if valid:
-            delta["final_answer"] = answer
-            delta["stop_reason"] = answer.stop_reason
-        else:
-            delta["final_answer"] = None
-            delta["stop_reason"] = StopReason.INTERNAL_ERROR
         return finish_node(
             context=context,
             node="synthesize",
@@ -209,6 +203,12 @@ def _deterministic_answer(state: AgentState) -> FinalAnswer:
     assessment = _assessment(state)
     completed = assessment.resolved_hypotheses if assessment is not None else ()
     gaps = assessment.gaps if assessment is not None else state["evidence_gaps"]
+    if state["stop_reason"] is StopReason.INTERNAL_ERROR:
+        return FinalAnswer(
+            status=FinalStatus.INTERNAL_ERROR,
+            stop_reason=StopReason.INTERNAL_ERROR,
+            answer="分析因内部受控错误终止。",
+        )
     if state["stop_reason"] is StopReason.RESULT_TRUNCATED:
         return FinalAnswer(
             status=FinalStatus.PARTIAL,

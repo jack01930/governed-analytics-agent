@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Mapping
 from typing import Literal
@@ -62,6 +63,14 @@ class SafeDependencyError(RuntimeError):
     """A dependency failed after raw details were intentionally discarded."""
 
 
+def propagate_cancellation() -> None:
+    """Do not let cleanup failures replace an already-requested task cancellation."""
+
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError from None
+
+
 def map_agent_failure(error: Exception) -> StopReason:
     """Reduce every graph-visible failure to the stable public reason set."""
 
@@ -111,6 +120,7 @@ def safe_error_stop_reason(safe_error: str | None) -> StopReason:
 def failure_delta(error: Exception, context: AgentContext) -> dict[str, object]:
     """Preserve governed accounting metadata while discarding the raw exception."""
 
+    propagate_cancellation()
     delta: dict[str, object] = {
         "stop_reason": map_agent_failure(error),
         "governance": context.budget.snapshot,
@@ -140,6 +150,7 @@ def finish_node(
     try:
         context.trace_recorder.append_node(trace)
     except Exception:
+        propagate_cancellation()
         delta.pop("node_traces", None)
         delta["stop_reason"] = StopReason.INTERNAL_ERROR
         delta["final_answer"] = None
@@ -169,6 +180,7 @@ async def emit_domain_event(
     try:
         await context.events.emit(node, event_type, data)
     except Exception:
+        propagate_cancellation()
         return False
     return True
 
@@ -356,6 +368,7 @@ __all__ = [
     "finish_node",
     "intake",
     "map_agent_failure",
+    "propagate_cancellation",
     "safe_error_stop_reason",
     "sensitive_identifier",
 ]
