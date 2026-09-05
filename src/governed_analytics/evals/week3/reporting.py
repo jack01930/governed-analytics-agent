@@ -523,9 +523,8 @@ def _quarantine_owned_root(reservation: Week3ReportReservation) -> None:
             )
         except OSError:
             return
-        if (
-            _identity(metadata) != reservation.staging_identity
-            or not stat.S_ISDIR(metadata.st_mode)
+        if _identity(metadata) != reservation.staging_identity or not stat.S_ISDIR(
+            metadata.st_mode
         ):
             return
         quarantine = f".week3-foreign-{uuid4().hex}"
@@ -730,12 +729,15 @@ def _markdown(report: Week3RunReport) -> str:
         lines.append(_metric_line(name, metric.numerator, metric.denominator))
     lines.extend(
         [
+            f"- Scoring failures: {sum(case.scoring_failure is not None for case in report.cases)}",
+            "- Repair counts: total / structured output / result contract; shared budget limit.",
+            "- Scoring failures retain telemetry and use conservative score placeholders.",
             f"- Requested model: {report.requested_model}",
             f"- Resolved models: {', '.join(report.resolved_models) or '(none)'}",
             f"- Executed manifest: {report.executed_manifest_sha256}",
             "",
-            "| Case | Cohort | Suite | Passed | Status | Reason |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| Case | Cohort | Suite | Passed | Status | Reason | Scoring stage | Repairs |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for case in report.cases:
@@ -749,6 +751,10 @@ def _markdown(report: Week3RunReport) -> str:
                     str(case.passed).lower(),
                     "" if case.observed_final_status is None else case.observed_final_status.value,
                     "" if case.observed_stop_reason is None else case.observed_stop_reason.value,
+                    "" if case.scoring_failure is None else case.scoring_failure.stage,
+                    f"{case.budget_score.repair_count} / "
+                    f"{case.budget_score.structured_output_repair_count} / "
+                    f"{case.budget_score.result_contract_repair_count}",
                 )
             )
             + " |"
@@ -980,9 +986,7 @@ def _validate_published(reservation: Week3ReportReservation) -> None:
         raise OSError("atomic Week 3 report publication failed")
     if reservation._cases_fd is None or reservation._cases_fd_closed:
         raise OSError("atomic Week 3 report publication failed")
-    _validate_inventory(
-        reservation, reservation._cases_fd, reservation._case_names, published=True
-    )
+    _validate_inventory(reservation, reservation._cases_fd, reservation._case_names, published=True)
 
 
 def write_week3_report(

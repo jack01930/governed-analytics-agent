@@ -71,9 +71,7 @@ class BudgetLedger:
         self._pricing = pricing
         self._monotonic = monotonic
         self._reservations: dict[str, ModelReservation] = {}
-        self._snapshot = GovernanceSnapshot(
-            deadline_monotonic=monotonic() + limits.timeout_seconds
-        )
+        self._snapshot = GovernanceSnapshot(deadline_monotonic=monotonic() + limits.timeout_seconds)
 
     @property
     def snapshot(self) -> GovernanceSnapshot:
@@ -86,9 +84,7 @@ class BudgetLedger:
         input_upper = len(request.prompt_bytes())
         projected = estimate_cost_cny(input_upper, request.max_output_tokens, self._pricing)
         if (
-            self._snapshot.committed_cost_cny
-            + self._snapshot.reserved_cost_cny
-            + projected
+            self._snapshot.committed_cost_cny + self._snapshot.reserved_cost_cny + projected
             > self._limits.hard_cost_cny
         ):
             raise BudgetExceeded(StopReason.COST_HARD_CAP)
@@ -133,12 +129,9 @@ class BudgetLedger:
                 "input_tokens": self._snapshot.input_tokens + usage.input_tokens,
                 "output_tokens": self._snapshot.output_tokens + usage.output_tokens,
                 "committed_cost_cny": committed,
-                "reserved_cost_cny": (
-                    self._snapshot.reserved_cost_cny - active.reserved_cost_cny
-                ),
+                "reserved_cost_cny": (self._snapshot.reserved_cost_cny - active.reserved_cost_cny),
                 "soft_cap_reached": (
-                    self._snapshot.soft_cap_reached
-                    or committed >= self._limits.soft_cost_cny
+                    self._snapshot.soft_cap_reached or committed >= self._limits.soft_cost_cny
                 ),
             }
         )
@@ -151,12 +144,9 @@ class BudgetLedger:
         self._snapshot = self._snapshot.model_copy(
             update={
                 "committed_cost_cny": committed,
-                "reserved_cost_cny": (
-                    self._snapshot.reserved_cost_cny - active.reserved_cost_cny
-                ),
+                "reserved_cost_cny": (self._snapshot.reserved_cost_cny - active.reserved_cost_cny),
                 "soft_cap_reached": (
-                    self._snapshot.soft_cap_reached
-                    or committed >= self._limits.soft_cost_cny
+                    self._snapshot.soft_cap_reached or committed >= self._limits.soft_cost_cny
                 ),
             }
         )
@@ -197,12 +187,17 @@ class BudgetLedger:
         )
         return self._snapshot
 
-    def consume_repair(self) -> GovernanceSnapshot:
+    def consume_repair(self, *, structured_output: bool = False) -> GovernanceSnapshot:
         self.ensure_time_remaining()
         if self._snapshot.repair_count >= self._limits.max_repairs:
             raise BudgetExceeded(StopReason.REPAIR_FAILED)
         self._snapshot = self._snapshot.model_copy(
-            update={"repair_count": self._snapshot.repair_count + 1}
+            update={
+                "repair_count": self._snapshot.repair_count + 1,
+                "structured_output_repair_count": (
+                    self._snapshot.structured_output_repair_count + int(structured_output)
+                ),
+            }
         )
         return self._snapshot
 

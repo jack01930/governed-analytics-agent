@@ -24,10 +24,13 @@ from pydantic import (
 
 from governed_analytics.agent.contracts import (
     ActionType,
+    AgentModelErrorCategory,
     BehaviorAction,
     BehaviorReasonCode,
     FinalStatus,
     FrozenJsonObjectValue,
+    ModelCallTrace,
+    NodeTrace,
     StopReason,
 )
 from governed_analytics.evals.models import QueryResult
@@ -142,8 +145,12 @@ def _canonical_case_outcome(
             StopReason.SQL_POLICY_REJECTED,
             0,
         )
-    return BehaviorAction.EXECUTE, (), FinalStatus.COMPLETED, StopReason.ANSWER_COMPLETE, (
-        1 if case_id == "W3K027" else 0
+    return (
+        BehaviorAction.EXECUTE,
+        (),
+        FinalStatus.COMPLETED,
+        StopReason.ANSWER_COMPLETE,
+        (1 if case_id == "W3K027" else 0),
     )
 
 
@@ -431,6 +438,35 @@ class SafeValidationRef(_FrozenWireModel):
         return self
 
 
+class SafeModelTraceRef(ModelCallTrace):
+    provider_model: ModelIdentifier
+    safe_error: AgentModelErrorCategory | Literal["internal_error"] | None = None
+
+
+class SafeNodeTraceRef(NodeTrace):
+    node: SafeIdentifier
+
+
+class ScoringFailure(_FrozenWireModel):
+    stage: Literal["scoring", "report_validation"]
+    category: Literal["scorer_exception", "validation_error"]
+    validation_codes: tuple[
+        Literal[
+            "execute_validation_linkage",
+            "tool_count_mismatch",
+            "execute_count_mismatch",
+            "profile_count_mismatch",
+            "model_identity_mismatch",
+            "evidence_linkage",
+            "other_validation_error",
+        ],
+        ...,
+    ] = ()
+    # Hash only the validation messages, never exception text or Pydantic inputs.
+    diagnostic_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    original_error_type: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
+
+
 class BudgetScore(_FrozenWireModel):
     conformant: bool
     action_loops: int = Field(ge=0)
@@ -439,6 +475,8 @@ class BudgetScore(_FrozenWireModel):
     execute_calls: int = Field(ge=0)
     profile_calls: int = Field(ge=0)
     repair_count: int = Field(ge=0)
+    structured_output_repair_count: int = Field(default=0, ge=0)
+    reserved_cost_cny: Decimal = Field(default=Decimal("0"), ge=0)
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     committed_cost_cny: Decimal = Field(ge=0)
@@ -454,6 +492,8 @@ class BudgetScore(_FrozenWireModel):
 
     @model_validator(mode="after")
     def _validate_conformance(self) -> BudgetScore:
+        if self.structured_output_repair_count > self.repair_count:
+            raise ValueError("structured repairs cannot exceed total repairs")
         derived = (
             self.action_loops <= self.max_action_loops
             and self.llm_calls <= self.max_llm_calls
@@ -461,12 +501,17 @@ class BudgetScore(_FrozenWireModel):
             and self.execute_calls <= self.max_execute_calls
             and self.profile_calls <= self.max_profile_calls
             and self.repair_count <= self.max_repairs
-            and self.repair_count == self.expected_repair_count
-            and self.committed_cost_cny <= self.hard_cost_cny
+            and self.result_contract_repair_count == self.expected_repair_count
+            and self.committed_cost_cny + self.reserved_cost_cny <= self.hard_cost_cny
         )
         if self.conformant != derived:
             raise ValueError("budget conformance must be derived from counts and limits")
         return self
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def result_contract_repair_count(self) -> int:
+        return self.repair_count - self.structured_output_repair_count
 
 
 class BudgetConfiguration(_FrozenWireModel):
@@ -502,6 +547,7 @@ class MetricCount(_FrozenWireModel):
 
 class SuiteScore(_FrozenWireModel):
     suite: Week3Suite
+    scoring_available: bool = True
     first_is_earliest: bool | None = None
     first_validation_invalid: bool | None = None
     final_requirement_met: bool | None = None
@@ -511,6 +557,10 @@ class SuiteScore(_FrozenWireModel):
 
     @model_validator(mode="after")
     def _validate_suite(self) -> SuiteScore:
+        if not self.scoring_available:
+            if self.conformant:
+                raise ValueError("unavailable scoring cannot claim suite conformance")
+            return self
         if self.suite == "repair":
             required = (
                 self.first_is_earliest,
@@ -632,6 +682,9 @@ class Week3CaseResult(_FrozenWireModel):
     tool_score: ToolScore
     evidence_score: EvidenceScore | None = None
     budget_score: BudgetScore
+    scoring_failure: ScoringFailure | None = None
+    safe_model_trace: tuple[SafeModelTraceRef, ...] = ()
+    safe_node_trace: tuple[SafeNodeTraceRef, ...] = ()
     safe_tool_trace: tuple[SafeToolTraceRef, ...] = ()
     safe_validation_refs: tuple[SafeValidationRef, ...] = ()
     first_candidate_observation_id: SafeIdentifier | None = None
@@ -675,6 +728,44 @@ class Week3CaseResult(_FrozenWireModel):
                 or self.budget_score.expected_repair_count != repair_count
             ):
                 raise ValueError("case expectations must match the frozen protocol")
+        if self.scoring_failure is not None:
+            if (
+                self.error_type != "scoring_contract_failure"
+                or self.suite_score.scoring_available
+                or self.behavior_score.conformant
+                or self.tool_score.conformant
+                or any(
+                    score is not None
+                    and (
+                        score.result_score != 0
+                        or score.strict_pass
+                        or score.output_contract_conformant
+                        or score.answer_contract_validated
+                        or score.execution_succeeded
+                    )
+                    for score in (self.first_candidate_score, self.final_candidate_score)
+                )
+                or (self.evidence_score is not None and self.evidence_score.verified_count != 0)
+                or self.valid_execute_count != 0
+                or self.repair_succeeded is True
+                or self.natural_refusal is True
+                or self.safe_validation_refs
+                or self.evidence_references
+            ):
+                raise ValueError("scoring failures cannot claim verified scoring results")
+            if (
+                self.model_trace_calls != len(self.safe_model_trace)
+                or self.model_trace_input_tokens
+                != sum(t.input_tokens for t in self.safe_model_trace)
+                or self.model_trace_output_tokens
+                != sum(t.output_tokens for t in self.safe_model_trace)
+                or self.resolved_models
+                != tuple(dict.fromkeys(t.provider_model for t in self.safe_model_trace))
+            ):
+                raise ValueError("failure model usage must match preserved trace")
+            return self
+        if not self.suite_score.scoring_available:
+            raise ValueError("unavailable scoring requires a failure record")
         expected_action = self.observed_behavior is self.expected_behavior
         expected_reason_by_stop = {
             StopReason.MISSING_REQUIRED_FIELDS: {
@@ -818,9 +909,7 @@ class Week3CaseResult(_FrozenWireModel):
             represented = tuple(item.purpose for item in self.evidence_references)
             validation_by_id = {item.observation_id: item for item in self.safe_validation_refs}
             linked = all(
-                (
-                    validation := validation_by_id.get(item.observation_id)
-                ) is not None
+                (validation := validation_by_id.get(item.observation_id)) is not None
                 and validation.valid
                 and validation.contract_id == item.contract_id
                 and sum(
@@ -846,14 +935,6 @@ class Week3CaseResult(_FrozenWireModel):
                 raise ValueError("evidence score must match unique safe references")
         if (self.suite == "repair") != (self.repair_succeeded is not None):
             raise ValueError("repair outcome is applicable exactly to repair cases")
-        if (
-            self.error_type is None
-            and self.suite == "repair"
-            and self.budget_score.repair_count != 1
-        ):
-            raise ValueError("repair cases require exactly one repair")
-        if self.suite != "repair" and self.budget_score.repair_count != 0:
-            raise ValueError("non-repair cases cannot claim result repair")
         if self.natural_refusal is True and self.observed_behavior not in {
             BehaviorAction.CLARIFY,
             BehaviorAction.REFUSE,
@@ -861,9 +942,7 @@ class Week3CaseResult(_FrozenWireModel):
         }:
             raise ValueError("natural refusal applies only to non-execute behavior")
         derived_natural_refusal = (
-            self.behavior_score.conformant
-            and self.terminal_conformant
-            and not self.safe_tool_trace
+            self.behavior_score.conformant and self.terminal_conformant and not self.safe_tool_trace
             if self.expected_behavior is not BehaviorAction.EXECUTE
             else None
         )
@@ -946,7 +1025,7 @@ class Week3CaseResult(_FrozenWireModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def suite_conformant(self) -> bool:
-        return self.suite_score.conformant
+        return self.scoring_failure is None and self.suite_score.conformant
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1098,8 +1177,7 @@ class Week3RunReport(_FrozenWireModel):
             raise ValueError("run resolved models must match case identity facts")
         expected_models = {case.expected_resolved_model for case in self.cases}
         if len(expected_models) != 1 or any(
-            case.model_identity_complete
-            and case.resolved_models != (case.expected_resolved_model,)
+            case.model_identity_complete and case.resolved_models != (case.expected_resolved_model,)
             for case in self.cases
         ):
             raise ValueError("case model identities must share one expected resolved model")

@@ -418,8 +418,8 @@ class SoftAfterExecuteBudget:
         self.delegate.consume_action_loop()
         return self.snapshot
 
-    def consume_repair(self) -> GovernanceSnapshot:
-        self.delegate.consume_repair()
+    def consume_repair(self, *, structured_output: bool = False) -> GovernanceSnapshot:
+        self.delegate.consume_repair(structured_output=structured_output)
         return self.snapshot
 
     def ensure_time_remaining(self) -> None:

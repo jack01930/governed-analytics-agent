@@ -329,3 +329,15 @@ def test_zero_price_fixture_still_counts_model_calls() -> None:
 
     assert snapshot.llm_calls == 1
     assert snapshot.committed_cost_cny == Decimal("0.00")
+
+
+@pytest.mark.parametrize("structured_first", (True, False))
+def test_repair_kinds_share_one_limit_without_losing_classification(structured_first: bool) -> None:
+    ledger = _ledger()
+    ledger.consume_repair(structured_output=structured_first)
+    before = ledger.snapshot
+    assert before.repair_count == 1
+    assert before.structured_output_repair_count == int(structured_first)
+    with pytest.raises(BudgetExceeded):
+        ledger.consume_repair(structured_output=not structured_first)
+    assert ledger.snapshot == before

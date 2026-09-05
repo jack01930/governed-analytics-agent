@@ -114,7 +114,7 @@ class BudgetPort(Protocol):
     def consume_action_loop(self) -> GovernanceSnapshot:
         raise NotImplementedError
 
-    def consume_repair(self) -> GovernanceSnapshot:
+    def consume_repair(self, *, structured_output: bool = False) -> GovernanceSnapshot:
         raise NotImplementedError
 
     def ensure_time_remaining(self) -> None:

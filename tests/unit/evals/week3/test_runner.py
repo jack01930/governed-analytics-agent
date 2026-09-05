@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from governed_analytics.agent.contracts import (
     FinalStatus,
     GovernanceSnapshot,
     ModelCallTrace,
+    NodeTrace,
     Observation,
     ObservationContract,
     ObservationValidation,
@@ -37,6 +39,7 @@ from governed_analytics.agent.ports import AgentModel, AgentTools
 from governed_analytics.config import AgentRuntimeSettings
 from governed_analytics.evals.models import QueryResult
 from governed_analytics.evals.week3 import runner
+from governed_analytics.evals.week3.models import Week3RunReport
 from governed_analytics.evals.week3.runner import (
     FixtureWeek3CaseExecutor,
     LiveWeek3CaseExecutor,
@@ -119,9 +122,7 @@ def _simple_result_with_evidence_value(
                 contract_id="metric_value_contract",
                 hypothesis_id="metric_value",
                 columns=(
-                    ColumnContract(
-                        name="gmv", data_type="decimal", role="metric", unit="cny"
-                    ),
+                    ColumnContract(name="gmv", data_type="decimal", role="metric", unit="cny"),
                 ),
                 shape=ResultShape.SCALAR,
                 min_rows=1,
@@ -180,18 +181,14 @@ def _simple_result_with_evidence_value(
         evidence_gaps=(),
         first_candidate=observation,
         repair_history=(),
-        governance=GovernanceSnapshot(
-            action_loops=1, llm_calls=4, tool_calls=3, execute_calls=1
-        ),
+        governance=GovernanceSnapshot(action_loops=1, llm_calls=4, tool_calls=3, execute_calls=1),
         final_answer=FinalAnswer(
             status=FinalStatus.COMPLETED,
             stop_reason=StopReason.ANSWER_COMPLETE,
             answer=f"GMV 是 {value} CNY。",
             evidence_ids=(evidence.evidence_id,),
             result_summary={
-                "evidence": (
-                    {"evidence_id": evidence.evidence_id, "numeric_value": str(value)},
-                )
+                "evidence": ({"evidence_id": evidence.evidence_id, "numeric_value": str(value)},)
             },
         ),
         safe_trace=SafeTrace(model_calls=model_calls, tool_calls=tool_calls),
@@ -292,9 +289,7 @@ async def test_runner_enforces_mode_pricing_contract_before_reservation(
     assert not tuple(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize(
-    "provider_model", ("deepseek-v4-flash", "DeepSeek-V4-Flash-0731")
-)
+@pytest.mark.parametrize("provider_model", ("deepseek-v4-flash", "DeepSeek-V4-Flash-0731"))
 @pytest.mark.asyncio
 async def test_live_pricing_bound_identity_is_preserved_in_partial_report(
     tmp_path: Path, provider_model: str
@@ -511,9 +506,7 @@ def test_wrong_evidence_numeric_claim_cannot_keep_w3k011_green() -> None:
         case,
         _simple_result_with_evidence_value(Decimal("999999")),
         AgentRuntimeSettings.model_validate({}),
-        expected_results=(
-            QueryResult(columns=("gmv",), rows=((Decimal("94636.23"),),)),
-        ),
+        expected_results=(QueryResult(columns=("gmv",), rows=((Decimal("94636.23"),),)),),
         expected_resolved_model="fixture-agent",
     )
 
@@ -634,9 +627,7 @@ def test_protocol_snapshot_rejects_restored_source_swap(
     monkeypatch.setattr(runner, "WEEK3_ROOT", protocol)
 
     if phase in {"before_open", "after_read"}:
-        original = cast(
-            Callable[[int, str], bytes], runner.__dict__["_read_protocol_file"]
-        )
+        original = cast(Callable[[int, str], bytes], runner.__dict__["_read_protocol_file"])
         injected = False
 
         def swap_around_read(directory_fd: int, name: str) -> bytes:
@@ -768,7 +759,15 @@ async def test_missing_validation_becomes_explicit_case_failure_not_run_failure(
 
     assert artifact.report_json.is_file()
     assert artifact.report.cases[0].error_type == "scoring_contract_failure"
-    assert artifact.report.cases[0].valid_execute_count == 0
+    result = artifact.report.cases[0]
+    assert result.valid_execute_count == 0
+    assert result.observed_tool_calls == 3
+    assert result.observed_execute_calls == 1
+    assert len(result.safe_tool_trace) == 3
+    assert result.scoring_failure is not None
+    assert result.scoring_failure.stage == "report_validation"
+    assert result.scoring_failure.diagnostic_sha256 is not None
+    assert result.scoring_failure.validation_codes == ("execute_validation_linkage",)
 
 
 @pytest.mark.parametrize(
@@ -831,3 +830,173 @@ async def test_hard_cost_exceed_preserves_safe_usage_in_nonconformant_result(
     assert result.budget_score.output_tokens == 45
     assert not result.budget_conformant
     assert result.error_type != "scoring_contract_failure"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("total", "structured", "conformant"),
+    ((1, 1, True), (1, 0, False), (2, 2, False), (2, 1, False)),
+)
+async def test_actual_repairs_are_publishable_and_scored_by_kind(
+    tmp_path: Path,
+    total: int,
+    structured: int,
+    conformant: bool,
+) -> None:
+    outcome = _simple_result_with_evidence_value(Decimal("94636.23"))
+    outcome = outcome.model_copy(
+        update={
+            "governance": outcome.governance.model_copy(
+                update={
+                    "repair_count": total,
+                    "structured_output_repair_count": structured,
+                }
+            )
+        }
+    )
+
+    class Executor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            return outcome
+
+    artifact = await run_week3_evaluation(
+        mode="fixture",
+        executor=Executor(),
+        cases=(load_week3_cases()[10],),
+        output_root=tmp_path,
+        run_id="repair-facts",
+    )
+    case = artifact.report.cases[0]
+    assert case.error_type is None
+    assert case.scoring_failure is None
+    assert case.budget_score.repair_count == total
+    assert case.budget_score.structured_output_repair_count == structured
+    assert case.budget_score.result_contract_repair_count == total - structured
+    assert case.budget_conformant is conformant
+    assert case.passed is conformant
+    assert case.safe_tool_trace
+    assert json.loads(artifact.report_json.read_text())["cases"][0]["passed"] is conformant
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scorer_name", ("score_candidate", "score_behavior", "_suite_score"))
+async def test_scorer_exception_preserves_original_telemetry_and_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scorer_name: str,
+) -> None:
+    outcome = _simple_result_with_evidence_value(Decimal("94636.23"))
+    model_calls = tuple(
+        call.model_copy(
+            update={
+                "input_tokens": 30,
+                "output_tokens": 5,
+                "estimated_cost_cny": Decimal("0.01"),
+            }
+        )
+        for call in outcome.safe_trace.model_calls
+    )
+    nodes = (NodeTrace(node="synthesize", duration_ms=12, outcome="completed"),)
+    outcome = outcome.model_copy(
+        update={
+            "governance": outcome.governance.model_copy(
+                update={
+                    "input_tokens": 120,
+                    "output_tokens": 20,
+                    "committed_cost_cny": Decimal("0.04"),
+                    "reserved_cost_cny": Decimal("0.02"),
+                    "repair_count": 1,
+                    "structured_output_repair_count": 1,
+                }
+            ),
+            "safe_trace": outcome.safe_trace.model_copy(
+                update={"model_calls": model_calls, "nodes": nodes}
+            ),
+        }
+    )
+
+    def broken(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("select PRIVATE_ROW from https://private.invalid sk-private")
+
+    monkeypatch.setattr(runner, scorer_name, broken)
+
+    class Executor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            return outcome
+
+    artifact = await run_week3_evaluation(
+        mode="fixture",
+        executor=Executor(),
+        cases=(load_week3_cases()[10],),
+        output_root=tmp_path,
+        run_id="scorer-failure",
+    )
+    case = artifact.report.cases[0]
+    assert not case.passed
+    assert not case.suite_conformant
+    assert case.observed_final_status is FinalStatus.COMPLETED
+    assert case.observed_stop_reason is StopReason.ANSWER_COMPLETE
+    assert case.observed_behavior is BehaviorAction.EXECUTE
+    assert case.scoring_failure is not None
+    assert case.scoring_failure.stage == "scoring"
+    assert case.budget_score.input_tokens == 120
+    assert case.budget_score.output_tokens == 20
+    assert case.budget_score.committed_cost_cny == Decimal("0.04")
+    assert case.budget_score.reserved_cost_cny == Decimal("0.02")
+    assert case.budget_score.repair_count == 1
+    assert case.budget_score.structured_output_repair_count == 1
+    assert case.model_trace_calls == 4
+    assert len(case.safe_tool_trace) == 3
+    assert [t.model_dump() for t in case.safe_model_trace] == [t.model_dump() for t in model_calls]
+    assert [t.model_dump() for t in case.safe_node_trace] == [t.model_dump() for t in nodes]
+    assert artifact.report.candidate_metrics["final_strict"].denominator == 1
+    assert artifact.report.evidence_metric.denominator == 1
+    reconstructed = Week3RunReport.model_validate(
+        artifact.report.model_dump(exclude_computed_fields=True),
+        strict=True,
+    )
+    assert reconstructed == artifact.report
+    stored = json.loads(artifact.report_json.read_text())
+    assert stored == artifact.report.model_dump(mode="json")
+    assert (
+        json.loads((artifact.report_dir / "cases" / "W3K011.json").read_text())
+        == stored["cases"][0]
+    )
+    assert not any(
+        token in artifact.report_json.read_text()
+        for token in (
+            "PRIVATE_ROW",
+            "private.invalid",
+            "sk-private",
+            "94636.23",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_canonical_scoring_failure_report_remains_publishable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("private scorer exception")
+
+    monkeypatch.setattr(runner, "_score_case", broken)
+
+    class Executor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            return _failure(case_id)
+
+    artifact = await run_week3_evaluation(
+        mode="fixture",
+        executor=Executor(),
+        output_root=tmp_path,
+        run_id="canonical-failures",
+    )
+    assert artifact.report.report_scope == "canonical"
+    assert artifact.report.case_count == 40
+    assert artifact.report.passed_count == 0
+    assert all(case.scoring_failure is not None for case in artifact.report.cases)
+    assert all(not case.suite_score.conformant for case in artifact.report.cases)
+    assert len(list((artifact.report_dir / "cases").glob("*.json"))) == 40
+    assert "Scoring failures: 40" in artifact.report_markdown.read_text()

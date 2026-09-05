@@ -915,6 +915,7 @@ class GovernanceSnapshot(_FrozenModel):
     execute_calls: NonNegativeInt = 0
     profile_calls: NonNegativeInt = 0
     repair_count: NonNegativeInt = 0
+    structured_output_repair_count: NonNegativeInt = 0
     input_tokens: NonNegativeInt = 0
     output_tokens: NonNegativeInt = 0
     committed_cost_cny: NonNegativeDecimal = Decimal("0")
@@ -924,6 +925,8 @@ class GovernanceSnapshot(_FrozenModel):
 
     @model_validator(mode="after")
     def _validate_counts(self) -> GovernanceSnapshot:
+        if self.structured_output_repair_count > self.repair_count:
+            raise ValueError("structured repairs cannot exceed total repairs")
         if self.execute_calls + self.profile_calls > self.tool_calls:
             raise ValueError("specialized tool counts cannot exceed total tool calls")
         return self

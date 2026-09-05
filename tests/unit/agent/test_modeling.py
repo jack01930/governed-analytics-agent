@@ -147,6 +147,7 @@ async def test_structural_error_repairs_once_and_returns_all_metadata() -> None:
     assert invocation.repair_record is not None
     assert invocation.repair_record.outcome == "success"
     assert invocation.governance.repair_count == 1
+    assert invocation.governance.structured_output_repair_count == 1
     assert len(invocation.traces) == 2
     assert recorder.snapshot().model_calls == invocation.traces
 
