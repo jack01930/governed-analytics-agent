@@ -190,13 +190,7 @@ def _normalize_truth_text(text: str) -> str:
 
 
 def _truth_separator(character: str) -> bool:
-    category = unicodedata.category(character)
-    return (
-        character == "_"
-        or character.isspace()
-        or category.startswith(("P", "Z"))
-        or category == "Cf"
-    )
+    return not character.isalnum()
 
 
 _TRUTH_PATTERNS = tuple(

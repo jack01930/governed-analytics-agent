@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -80,11 +81,11 @@ def test_atomic_publish_preserves_target_created_at_publication_boundary(
 
     publish = getattr(fixtures, "_publish_staged_directory", None)
 
-    def create_target_at_publish_boundary(staging: Path, destination: Path) -> None:
+    def create_target_at_publish_boundary(owned: Any, destination: Path) -> None:
         assert publish is not None
         destination.mkdir()
         (destination / "racer-owned.txt").write_text("preserve", encoding="utf-8")
-        publish(staging, destination)
+        publish(owned, destination)
 
     monkeypatch.setattr(fixtures, "_freeze_to_staging", write_complete_staging)
     monkeypatch.setattr(
@@ -113,11 +114,7 @@ def test_pre_publish_source_swap_preserves_foreign_and_owned_alias(
         (staging / "foreign.txt").write_text("foreign", encoding="utf-8")
         return ("W3K011.json",)
 
-    def publish_must_not_run(_staging: Path, _destination: Path) -> None:
-        raise AssertionError("foreign staging reached publication")
-
     monkeypatch.setattr(fixtures, "_freeze_to_staging", swap_staging)
-    monkeypatch.setattr(fixtures, "_publish_staged_directory", publish_must_not_run)
     with pytest.raises(RuntimeError, match=r"^Week 3 staging directory identity changed$"):
         freeze_week3_expected(dataset="tiny", output_root=output)
 
@@ -138,20 +135,106 @@ def test_collision_cleanup_does_not_delete_source_replacement(
         (staging / "owned.txt").write_text("owned", encoding="utf-8")
         return ("W3K011.json",)
 
-    def swap_source_then_collide(staging: Path, destination: Path) -> None:
+    def swap_source_then_collide(owned: Any, destination: Path) -> None:
+        staging = owned.path
         staging.rename(owned_alias)
         staging.mkdir(mode=0o700)
         (staging / "foreign.txt").write_text("foreign", encoding="utf-8")
         destination.mkdir()
         (destination / "racer.txt").write_text("racer", encoding="utf-8")
-        publish(staging, destination)
+        publish(owned, destination)
 
     monkeypatch.setattr(fixtures, "_freeze_to_staging", write_owned)
     monkeypatch.setattr(fixtures, "_publish_staged_directory", swap_source_then_collide)
-    with pytest.raises(FileExistsError):
+    with pytest.raises(RuntimeError, match=r"^Week 3 staging directory identity changed$"):
         freeze_week3_expected(dataset="tiny", output_root=output)
 
     assert (output / "racer.txt").read_text(encoding="utf-8") == "racer"
+    assert (owned_alias / "owned.txt").read_text(encoding="utf-8") == "owned"
+    foreign = next(tmp_path.glob(".week3-expected-*"))
+    assert (foreign / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+
+
+def test_native_publish_seam_swap_is_quarantined_without_exposing_destination(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "expected"
+    owned_alias = tmp_path / "owned-staging-alias"
+    rename_no_replace = fixtures._rename_path_no_replace
+    swapped = False
+
+    async def write_owned(staging: Path) -> tuple[str, ...]:
+        (staging / "owned.txt").write_text("owned", encoding="utf-8")
+        return ("W3K011.json",)
+
+    def swap_at_native_seam(source: Path, destination: Path) -> None:
+        nonlocal swapped
+        if not swapped and source.name.startswith(".week3-expected-"):
+            swapped = True
+            source.rename(owned_alias)
+            source.mkdir(mode=0o700)
+            (source / "foreign.txt").write_text("foreign", encoding="utf-8")
+        rename_no_replace(source, destination)
+
+    monkeypatch.setattr(fixtures, "_freeze_to_staging", write_owned)
+    monkeypatch.setattr(fixtures, "_rename_path_no_replace", swap_at_native_seam)
+    with pytest.raises(RuntimeError, match=r"^Week 3 staging directory identity changed$"):
+        freeze_week3_expected(dataset="tiny", output_root=output)
+
+    assert not output.exists()
+    assert (owned_alias / "owned.txt").read_text(encoding="utf-8") == "owned"
+    quarantines = tuple(tmp_path.glob(".week3-quarantine-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+
+
+def test_cleanup_entry_swap_preserves_foreign_and_owned_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "expected"
+    owned_alias = tmp_path / "owned-staging-alias"
+
+    async def swap_then_fail(staging: Path) -> tuple[str, ...]:
+        (staging / "owned.txt").write_text("owned", encoding="utf-8")
+        staging.rename(owned_alias)
+        staging.mkdir(mode=0o700)
+        (staging / "foreign.txt").write_text("foreign", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fixtures, "_freeze_to_staging", swap_then_fail)
+    with pytest.raises(KeyboardInterrupt):
+        freeze_week3_expected(dataset="tiny", output_root=output)
+
+    assert not output.exists()
+    assert (owned_alias / "owned.txt").read_text(encoding="utf-8") == "owned"
+    foreign = next(tmp_path.glob(".week3-expected-*"))
+    assert (foreign / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+
+
+def test_cleanup_delete_seam_revalidates_before_touching_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "expected"
+    owned_alias = tmp_path / "owned-staging-alias"
+    remove_owned = fixtures._remove_owned_staging
+
+    async def fail(staging: Path) -> tuple[str, ...]:
+        (staging / "owned.txt").write_text("owned", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    def swap_at_delete_seam(owned: Any) -> None:
+        staging = owned.path
+        staging.rename(owned_alias)
+        staging.mkdir(mode=0o700)
+        (staging / "foreign.txt").write_text("foreign", encoding="utf-8")
+        remove_owned(owned)
+
+    monkeypatch.setattr(fixtures, "_freeze_to_staging", fail)
+    monkeypatch.setattr(fixtures, "_remove_owned_staging", swap_at_delete_seam)
+    with pytest.raises(KeyboardInterrupt):
+        freeze_week3_expected(dataset="tiny", output_root=output)
+
+    assert not output.exists()
     assert (owned_alias / "owned.txt").read_text(encoding="utf-8") == "owned"
     foreign = next(tmp_path.glob(".week3-expected-*"))
     assert (foreign / "foreign.txt").read_text(encoding="utf-8") == "foreign"

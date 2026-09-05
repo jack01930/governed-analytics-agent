@@ -18,6 +18,7 @@ from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from sqlalchemy import text
 
@@ -49,6 +50,24 @@ class _DirectoryIdentity:
     mode: int
 
 
+@dataclass(slots=True)
+class _OwnedStaging:
+    path: Path
+    parent: Path
+    identity: _DirectoryIdentity
+    parent_identity: _DirectoryIdentity
+    directory_fd: int
+    parent_fd: int
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        os.close(self.directory_fd)
+        os.close(self.parent_fd)
+        self.closed = True
+
+
 def _require_real_directory(path: Path) -> None:
     current = Path(path.anchor) if path.is_absolute() else Path()
     for part in path.parts[1:] if path.is_absolute() else path.parts:
@@ -66,6 +85,10 @@ def _directory_identity(path: Path) -> _DirectoryIdentity:
         raise RuntimeError("Week 3 staging directory identity changed") from None
     if not stat.S_ISDIR(metadata.st_mode):
         raise RuntimeError("Week 3 staging directory identity changed")
+    return _identity_from_stat(metadata)
+
+
+def _identity_from_stat(metadata: os.stat_result) -> _DirectoryIdentity:
     return _DirectoryIdentity(
         device=metadata.st_dev,
         inode=metadata.st_ino,
@@ -73,40 +96,95 @@ def _directory_identity(path: Path) -> _DirectoryIdentity:
     )
 
 
-def _validate_directory_identity(
-    path: Path,
-    expected: _DirectoryIdentity,
-    *,
-    parent: Path,
-    parent_identity: _DirectoryIdentity,
-) -> None:
+def _handle_identity(file_descriptor: int) -> _DirectoryIdentity:
     try:
-        _require_real_directory(parent)
+        metadata = os.fstat(file_descriptor)
+    except OSError:
+        raise RuntimeError("Week 3 staging directory identity changed") from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError("Week 3 staging directory identity changed")
+    return _identity_from_stat(metadata)
+
+
+def _open_directory_no_follow(path: Path) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("secure Week 3 staging handles are unavailable")
+    flags = os.O_RDONLY | no_follow
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(path, flags)
+    except OSError:
+        raise RuntimeError("Week 3 staging directory identity changed") from None
+
+
+def _validate_owned_staging(owned: _OwnedStaging, *, require_path: bool = True) -> None:
+    if owned.closed:
+        raise RuntimeError("Week 3 staging directory identity changed")
+    try:
+        _require_real_directory(owned.parent)
     except ValueError:
         raise RuntimeError("Week 3 staging directory identity changed") from None
-    if _directory_identity(parent) != parent_identity or _directory_identity(path) != expected:
+    if (
+        _handle_identity(owned.parent_fd) != owned.parent_identity
+        or _directory_identity(owned.parent) != owned.parent_identity
+        or _handle_identity(owned.directory_fd) != owned.identity
+        or (require_path and _directory_identity(owned.path) != owned.identity)
+    ):
         raise RuntimeError("Week 3 staging directory identity changed")
 
 
-def _clean_owned_staging(
-    staging: Path,
-    identity: _DirectoryIdentity,
-    *,
-    parent: Path,
-    parent_identity: _DirectoryIdentity,
-) -> None:
+def _create_owned_staging(parent: Path) -> _OwnedStaging:
+    _require_real_directory(parent)
+    parent_path_identity = _directory_identity(parent)
+    parent_fd = _open_directory_no_follow(parent)
+    staging: Path | None = None
+    created_identity: _DirectoryIdentity | None = None
+    directory_fd: int | None = None
     try:
-        _validate_directory_identity(
-            staging,
-            identity,
+        parent_identity = _handle_identity(parent_fd)
+        if parent_identity != parent_path_identity:
+            raise RuntimeError("Week 3 staging directory identity changed")
+        staging = Path(tempfile.mkdtemp(prefix=".week3-expected-", dir=parent))
+        created_identity = _directory_identity(staging)
+        directory_fd = _open_directory_no_follow(staging)
+        identity = _handle_identity(directory_fd)
+        if identity != created_identity or stat.S_IMODE(identity.mode) != 0o700:
+            raise RuntimeError("Week 3 staging directory identity changed")
+        owned = _OwnedStaging(
+            path=staging,
             parent=parent,
+            identity=identity,
             parent_identity=parent_identity,
+            directory_fd=directory_fd,
+            parent_fd=parent_fd,
         )
-    except RuntimeError:
-        return
+        _validate_owned_staging(owned)
+        return owned
+    except BaseException:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        os.close(parent_fd)
+        if staging is not None and created_identity is not None:
+            try:
+                if _directory_identity(staging) == created_identity:
+                    shutil.rmtree(staging)
+            except (OSError, RuntimeError):
+                pass
+        raise
+
+
+def _remove_owned_staging(owned: _OwnedStaging) -> None:
+    _validate_owned_staging(owned)
+    shutil.rmtree(owned.path)
+
+
+def _clean_owned_staging(owned: _OwnedStaging) -> None:
     try:
-        shutil.rmtree(staging)
-    except OSError:
+        _validate_owned_staging(owned)
+        _remove_owned_staging(owned)
+    except (OSError, RuntimeError):
         return
 
 
@@ -204,16 +282,43 @@ def _publish_windows_no_replace(staging: Path, destination: Path) -> None:
         raise OSError("atomic Week 3 expected publication failed") from None
 
 
-def _publish_staged_directory(staging: Path, destination: Path) -> None:
+def _rename_path_no_replace(source: Path, destination: Path) -> None:
     system = platform.system()
     if system == "Darwin":
-        _publish_darwin_no_replace(staging, destination)
+        _publish_darwin_no_replace(source, destination)
     elif system == "Linux":
-        _publish_linux_no_replace(staging, destination)
+        _publish_linux_no_replace(source, destination)
     elif system == "Windows":
-        _publish_windows_no_replace(staging, destination)
+        _publish_windows_no_replace(source, destination)
     else:
         raise OSError("atomic Week 3 expected publication unavailable")
+
+
+def _native_publish_no_replace(owned: _OwnedStaging, destination: Path) -> None:
+    _validate_owned_staging(owned)
+    _rename_path_no_replace(owned.path, destination)
+
+
+def _quarantine_mismatched_destination(destination: Path) -> Path:
+    for _attempt in range(16):
+        quarantine = destination.parent / f".week3-quarantine-{uuid4().hex}"
+        try:
+            _rename_path_no_replace(destination, quarantine)
+        except FileExistsError:
+            continue
+        return quarantine
+    raise RuntimeError("Week 3 staging directory identity changed")
+
+
+def _publish_staged_directory(owned: _OwnedStaging, destination: Path) -> None:
+    _native_publish_no_replace(owned, destination)
+    try:
+        _validate_owned_staging(owned, require_path=False)
+        if _directory_identity(destination) != owned.identity:
+            raise RuntimeError("Week 3 staging directory identity changed")
+    except RuntimeError:
+        _quarantine_mismatched_destination(destination)
+        raise RuntimeError("Week 3 staging directory identity changed") from None
 
 
 def _json_value(value: object) -> object:
@@ -308,39 +413,20 @@ def freeze_week3_expected(
         raise FileExistsError("Week 3 expected output already exists; refusing overwrite")
     parent = output_root.parent
     _require_real_directory(parent)
-    parent_identity = _directory_identity(parent)
     _oracle_inventory()
-    staging = Path(tempfile.mkdtemp(prefix=".week3-expected-", dir=parent))
-    staging_identity = _directory_identity(staging)
+    owned = _create_owned_staging(parent)
     published = False
     try:
-        if stat.S_IMODE(staging_identity.mode) != 0o700:
-            raise RuntimeError("Week 3 staging directory identity changed")
-        names = asyncio.run(_freeze_to_staging(staging))
-        _validate_directory_identity(
-            staging,
-            staging_identity,
-            parent=parent,
-            parent_identity=parent_identity,
-        )
-        _publish_staged_directory(staging, output_root)
-        _validate_directory_identity(
-            output_root,
-            staging_identity,
-            parent=parent,
-            parent_identity=parent_identity,
-        )
+        names = asyncio.run(_freeze_to_staging(owned.path))
+        _publish_staged_directory(owned, output_root)
         published = True
         return tuple(output_root / name for name in names)
     except BaseException:
         if not published:
-            _clean_owned_staging(
-                staging,
-                staging_identity,
-                parent=parent,
-                parent_identity=parent_identity,
-            )
+            _clean_owned_staging(owned)
         raise
+    finally:
+        owned.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

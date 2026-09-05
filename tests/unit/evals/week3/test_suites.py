@@ -247,6 +247,52 @@ def test_truth_isolation_rejects_separator_and_unicode_disguises(
         load_fixture_scripts()
 
 
+@pytest.mark.parametrize(
+    "separator",
+    ["\u034f", "\ufe0f", "\u2060\u034f\ufe0f\u200b"],
+    ids=["combining-grapheme-joiner", "variation-selector", "mixed-default-ignorable"],
+)
+@pytest.mark.parametrize(
+    "surface", ["mapping_key", "mapping_value", "purpose", "raw_sql", "expanded_action"]
+)
+@pytest.mark.parametrize("truth_key", sorted(suites._TRUTH_KEYS))
+def test_truth_isolation_skips_all_non_alnum_inside_every_pattern_and_surface(
+    truth_key: str, surface: str, separator: str
+) -> None:
+    compact = "".join(character for character in truth_key if character.isalnum())
+    disguised = separator.join(compact)
+    if surface == "mapping_key":
+        value: object = {disguised: "safe"}
+    elif surface == "mapping_value":
+        value = {"safe": disguised}
+    elif surface == "purpose":
+        value = {"model_purpose": disguised}
+    elif surface == "raw_sql":
+        value = f"select 1 -- {disguised}"
+    else:
+        value = {"arguments": {"sql": f"select 1 -- {disguised}"}}
+
+    assert suites._contains_truth(value)
+
+
+@pytest.mark.parametrize("separator", ["\u034f", "\ufe0f", "\u2060\u034f\ufe0f\u200b"])
+def test_candidate_sql_unicode_marks_fail_with_fixed_redacted_error(
+    separator: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _patch_week3_root(monkeypatch, tmp_path)
+    candidate = root / "scripted/sql/W3K011.sql"
+    disguised = separator.join("oraclequeryid")
+    candidate.write_text(
+        candidate.read_text(encoding="utf-8") + f"\n-- {disguised}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match=r"^candidate SQL cannot contain evaluation truth sentinels$"
+    ):
+        load_fixture_scripts()
+
+
 def test_truth_isolation_uses_alphanumeric_boundaries_without_false_positive(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
