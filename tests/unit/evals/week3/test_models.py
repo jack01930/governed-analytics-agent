@@ -5,7 +5,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from governed_analytics.agent.contracts import ActionType
+from governed_analytics.agent.contracts import ActionType, FinalStatus, StopReason
 from governed_analytics.evals.models import QueryResult
 from governed_analytics.evals.week3.models import (
     BudgetOverrides,
@@ -28,6 +28,11 @@ def test_expected_result_uses_eval_query_result_and_is_frozen() -> None:
 
 def test_budget_overrides_require_a_coherent_tool_ceiling() -> None:
     assert BudgetOverrides(max_tool_calls=3, max_execute_calls=2).max_tool_calls == 3
+    assert BudgetOverrides(max_tool_calls=3) == BudgetOverrides(
+        max_tool_calls=3,
+        max_execute_calls=None,
+    )
+    assert BudgetOverrides(max_execute_calls=5).max_tool_calls is None
     with pytest.raises(ValidationError):
         BudgetOverrides(max_tool_calls=2, max_execute_calls=3)
 
@@ -55,5 +60,30 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
     )
 
     assert report.case_count == report.passed_count == 1
+    assert report.protocol_version == "week3-agent-evaluation-v1"
+    assert Week3RunReport.model_validate(
+        {
+            **report.model_dump(exclude_computed_fields=True),
+            "protocol_version": "week3-agent-evaluation-v1",
+        }
+    ).protocol_version == "week3-agent-evaluation-v1"
+    with pytest.raises(ValidationError):
+        Week3RunReport.model_validate(
+            {
+                **report.model_dump(exclude_computed_fields=True),
+                "protocol_version": "week3-evaluation-v1",
+            }
+        )
     with pytest.raises(ValidationError):
         Week3RunReport.model_validate({**report.model_dump(), "case_count": 2})
+
+
+def test_budget_case_uses_partial_evidence_terminal_contract() -> None:
+    from governed_analytics.evals.week3.suites import load_week3_cases
+
+    case = load_week3_cases()[28]
+
+    assert case.case_id == "W3K029"
+    assert case.expected_final_status is FinalStatus.PARTIAL
+    assert case.expected_stop_reason is StopReason.EVIDENCE_PARTIAL
+    assert case.budget_overrides == BudgetOverrides(max_tool_calls=3)

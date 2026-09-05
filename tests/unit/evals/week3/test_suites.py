@@ -185,6 +185,46 @@ def test_scripts_cannot_reference_oracle_or_expected_truth(
         load_fixture_scripts()
 
 
+@pytest.mark.parametrize("truth_key", sorted(suites._TRUTH_KEYS))
+def test_candidate_sql_rejects_every_normalized_truth_key(
+    truth_key: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _patch_week3_root(monkeypatch, tmp_path)
+    candidate = root / "scripted/sql/W3K011.sql"
+    candidate.write_text(
+        candidate.read_text(encoding="utf-8") + f"\n-- {truth_key}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="truth"):
+        load_fixture_scripts()
+
+
+def test_exact_expected_evidence_field_remains_allowed_in_expanded_request() -> None:
+    script = next(item for item in load_fixture_scripts() if item.script_id == "W3K011")
+    action = next(step for step in script.steps if step.model_purpose == "action")
+
+    assert action.output["expected_evidence"] == "contracted numeric result"
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_expected_json_rejects_non_finite_constants_with_redacted_error(
+    constant: str, tmp_path: Path
+) -> None:
+    expected = tmp_path / "expected.json"
+    expected.write_text(
+        f"""{{
+  "oracle_query_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "result": {{"columns": ["gmv"], "rows": [[{constant}]]}}
+}}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"^invalid frozen Week 3 expected result$"):
+        suites._read_expected(expected)
+
+
 def test_heldout_cannot_declare_oracle_expected_or_budget_override(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

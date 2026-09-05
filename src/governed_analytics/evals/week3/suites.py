@@ -77,18 +77,6 @@ _TRUTH_KEYS = frozenset(
         "ground_truth",
     }
 )
-_TRUTH_SENTINELS = frozenset(
-    {
-        "oracle query id",
-        "oracle truth",
-        "expected rows",
-        "expected sql",
-        "scorer truth",
-        "ground truth",
-    }
-)
-
-
 class _UniqueSafeLoader(yaml.SafeLoader):  # type: ignore[misc]
     pass
 
@@ -121,6 +109,10 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
             raise ValueError("duplicate JSON mapping key")
         result[key] = value
     return result
+
+
+def _reject_non_finite_json_constant(_constant: str) -> None:
+    raise ValueError("non-finite JSON constants are forbidden")
 
 
 def _reject_symlink_components(path: Path) -> None:
@@ -176,6 +168,7 @@ def _read_expected(path: Path) -> FrozenExpectedResult:
         raw = json.loads(
             _regular_file(path).read_text(encoding="utf-8"),
             object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_non_finite_json_constant,
         )
         return FrozenExpectedResult.model_validate_json(
             json.dumps(raw, ensure_ascii=False), strict=True
@@ -196,6 +189,9 @@ def _key_tokens(key: str) -> tuple[str, ...]:
     snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", snake).strip("_").casefold()
     return tuple(item for item in normalized.split("_") if item)
+
+
+_TRUTH_SENTINELS = frozenset(" ".join(_key_tokens(key)) for key in _TRUTH_KEYS)
 
 
 def _truth_key(key: str) -> bool:
@@ -283,6 +279,8 @@ def _parse_fixture_script(raw: dict[str, Any]) -> FixtureScript:
             if _contains_truth(sql):
                 raise ValueError("candidate SQL cannot contain evaluation truth sentinels")
             expanded = {**output, "arguments": {**arguments, "sql": sql}}
+            if _contains_truth(expanded):
+                raise ValueError("expanded fixture actions cannot contain evaluation truth")
             _strict_contract(AnalysisAction, expanded)
             if sql_path.name == "W3K030-dangerous.sql":
                 try:
@@ -417,8 +415,7 @@ def _validate_case_distribution(cases: tuple[Week3EvaluationCase, ...]) -> None:
     if (
         budget.budget_overrides is None
         or budget.budget_overrides.max_tool_calls != 3
-        or budget.budget_overrides.max_execute_calls is None
-        or budget.budget_overrides.max_execute_calls > 3
+        or budget.budget_overrides.max_execute_calls is not None
     ):
         raise ValueError("W3K029 requires its fixed downward-only tool budget")
 

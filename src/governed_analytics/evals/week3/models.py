@@ -65,9 +65,11 @@ class BudgetOverrides(_FrozenWireModel):
     def _validate_limits(self) -> BudgetOverrides:
         if self.max_tool_calls is None and self.max_execute_calls is None:
             raise ValueError("at least one budget override is required")
-        effective_tools = self.max_tool_calls if self.max_tool_calls is not None else 12
-        effective_executes = self.max_execute_calls if self.max_execute_calls is not None else 5
-        if effective_executes > effective_tools:
+        if (
+            self.max_tool_calls is not None
+            and self.max_execute_calls is not None
+            and self.max_execute_calls > self.max_tool_calls
+        ):
             raise ValueError("max_execute_calls cannot exceed max_tool_calls")
         return self
 
@@ -216,7 +218,7 @@ class Week3CaseResult(_FrozenWireModel):
 
 
 class Week3RunReport(_FrozenWireModel):
-    protocol_version: Literal["week3-evaluation-v1"] = "week3-evaluation-v1"
+    protocol_version: Literal["week3-agent-evaluation-v1"] = "week3-agent-evaluation-v1"
     mode: Literal["fixture", "live"]
     overall_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     known_cohort_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

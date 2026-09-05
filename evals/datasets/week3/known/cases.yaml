@@ -429,11 +429,11 @@
   question: 比较 2026-06-01 至 06-08 与 06-08 至 06-15 的 GMV，并在工具预算耗尽时保留部分证据。
   modes: [fixture]
   expected_behavior: execute
-  expected_final_status: budget_exhausted
-  expected_stop_reason: tool_call_limit
+  expected_final_status: partial
+  expected_stop_reason: evidence_partial
   metric_id: gmv
   script_ref: W3K029
-  budget_overrides: {max_tool_calls: 3, max_execute_calls: 3}
+  budget_overrides: {max_tool_calls: 3}
   required_tools: [metric_lookup, schema_lookup, execute_sql]
   risk_tags: [tool_budget, partial_evidence]
   source: week3-reviewed
