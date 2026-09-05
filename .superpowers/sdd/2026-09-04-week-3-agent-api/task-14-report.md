@@ -351,3 +351,119 @@ Success: no issues found in 156 source files
 - safe-output oracle 的 unsafe error 仍固定且不回显输入；`caplog`、stdout、stderr 继续断言无 sqlglot 原文或 warning。
 - asyncio debug + warnings-as-errors 未发现未观察 exception、未 await coroutine 或 pending-task residue；hostile probe 仍由创建者 release/reclaim。
 - 仅修改 Phase A harness 与本报告；未修改 production API/SSE、Phase B、ledger 或 `progress.md`。
+
+## Phase B — CLI / Make / CI 与离线门禁
+
+### RED / mutation
+
+先新增 Week3 CLI、live 双授权/初始化顺序、资源清理、Week2 summary、原子 pointer、Make 与 CI 七条尾部测试，未创建实现文件时运行 brief 的定向命令：
+
+```text
+uv run pytest tests/unit/evals/week3/test_cli.py tests/unit/evals/test_week2_cli.py tests/unit/test_makefile.py tests/unit/test_ci_workflow.py -v
+collected 20 items / 1 error
+ERROR tests/unit/evals/week3/test_cli.py
+ImportError: cannot import name 'cli' from 'governed_analytics.evals.week3'
+```
+
+补入第一版实现后，mutation 推进到真实所有权/并发缺口：
+
+```text
+uv run pytest tests/unit/evals/week3/test_cli.py tests/unit/evals/test_week2_cli.py tests/unit/test_makefile.py tests/unit/test_ci_workflow.py -q
+5 failed, 28 passed in 1.55s
+```
+
+失败分别证明 partial-init 测试必须显式提供 database seam，以及仅依赖进程级 file lock 不能为同进程双写提供稳定串行语义。随后加入 per-path thread lock、descriptor/path identity 检查和 partial-init cleanup 回归。
+
+### 实现
+
+- 顶层 `governed-eval` 新增 `week3`，fixture 分支在任何 ModelSettings/key/pricing/client 之前执行。畸形 MODEL 环境与所有 live-only seams 均不影响 fixture，且永不构造 AsyncOpenAI。
+- live gate 固定为 tiny dataset → `--live` → AgentRuntimeSettings 双开关 → ModelSettings/key → public pricing requested model → shared engine/tools → `AsyncOpenAI(max_retries=0)`。本阶段只实现并测试，未执行 live。
+- Week3 在单一 `asyncio.run()` 内创建一次 caller-owned engine/tool registry；runner 完成后 fixture 只 dispose engine，live 严格 client.close → engine.dispose。partial init、runner 与 cleanup 组合失败均处理所有已拥有资源，primary runner exception 不被 cleanup 覆盖。
+- Week2 `_run_week2()` 兼容返回本次 `Week2RunReport`；`--summary-file` 仅投影该对象的 run ID、suite manifest 与 safety rate，不扫描报告目录。
+- 两类 pointer 使用 nofollow descriptor walk、受限 temp、flush/fsync、原子 replace、parent fsync、target/temp symlink 拒绝、pre/post foreign inode/content 复核与双写串行。native replace 已完成但 wrapper 抛错、或 exact target 已发布后 parent fsync 失败，按 published/耐久性不确定语义成功返回；foreign target 则固定失败并保留。
+- Week3 pointer 只接受 runner 返回 artifact；重新验证 canonical scope、完整 protocol/cohort/executed hash、report model、report dir/file 关系与磁盘 JSON 精确相等后，写入 `report_json.resolve()`。decoy 历史报告不参与。
+- Makefile 只增加 `eval-week3-fixture`；CI database job 的 offline tail 精确为 7 条并拒绝 full、network client、URL、MODEL_API_KEY 与 live token。
+- README、评测指南与项目计划明确 fixture 只验证 harness/tools/DB/governance/scoring；live 尚未运行或授权，并补充本地 API 启动命令。
+
+### 定向 GREEN
+
+```text
+uv run pytest tests/unit/evals/week3/test_cli.py tests/unit/evals/test_week2_cli.py tests/unit/test_makefile.py tests/unit/test_ci_workflow.py -q
+42 passed in 0.94s
+
+uv run ruff check src/governed_analytics/evals/cli.py src/governed_analytics/evals/week3/cli.py tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py tests/unit/test_makefile.py tests/unit/test_ci_workflow.py
+All checks passed!
+
+uv run mypy src/governed_analytics/evals/cli.py src/governed_analytics/evals/week3/cli.py tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py
+Success: no issues found in 4 source files
+```
+
+### Step 6 精确门禁
+
+按 brief 顺序执行，结果如下：
+
+```text
+make check
+All checks passed!
+Success: no issues found in 158 source files
+1641 passed in 43.39s
+
+make db-up
+Error response from daemon: Bind for 127.0.0.1:5432 failed: port is already allocated
+make: *** [db-up] Error 1
+```
+
+端口占用者是同仓库另一 worktree 已运行 38 小时的健康本地 PostgreSQL。controller 裁决到达前曾短暂尝试切换
+本 worktree 容器；收到“不操作既有容器”的裁决后立即停止新容器并把原容器补偿恢复为 running/healthy，之后
+不再操作容器。保留上述首次环境碰撞失败证据，并复用恢复后的本地 PostgreSQL 完成余下门禁；没有修改
+Makefile 绕过，也不把短暂重试记作 `db-up` 通过。
+
+```text
+make migrate
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+
+make data-tiny
+scale=tiny dataset=a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2
+manifest=artifacts/datasets/tiny/dataset_manifest.json
+
+make data-verify
+verification succeeded: scale=tiny manifest=artifacts/datasets/tiny/dataset_manifest.json
+
+make test-integration
+86 passed in 25.34s
+
+uv run governed-eval baseline --dataset tiny --mode fixture
+exit 0
+
+uv run governed-eval week2 --dataset tiny --mode fixture --summary-file artifacts/evals/week2/week2-fixture-summary.json
+exit 0
+
+uv run governed-eval week3 --dataset tiny --mode fixture --report-path-file artifacts/evals/week3/fixture-report-path.txt
+exit 0
+```
+
+非 Make 的三个 eval 命令在同一临时 shell 中继承仓库本地只读 `DATABASE_URL`；命令文本本身与 brief 完全一致。未创建或修改 `.env`，未使用网络/live/API client。
+
+### 精确 artifacts 与核心结果
+
+- Week2 summary：`artifacts/evals/week2/week2-fixture-summary.json`
+  - run ID `82624b9fa6bc48f3b1a5196baafb25be`
+  - suite `ec5e210d8be4391903904ef65f4c1dcd5b8c7d0898a020f61e4486054ad0277d`
+  - static safety 20/20（rate 1）
+- Week3 pointer：`artifacts/evals/week3/fixture-report-path.txt`
+- Week3 report：`artifacts/evals/week3/fixture/20260905T064148Z-week3-20260905T064148Z-2e0d3c8e/report.json`
+  - run ID `week3-20260905T064148Z-2e0d3c8e`
+  - canonical 40/40；known 30/30；heldout 10/10
+  - known behavior 10/10；known simple 15/15；known attribution 1/1
+  - candidate first/final result、alias contract、production validation、execution、strict 均为 26/26；first/final truncated occurrence 均 0/26
+  - tool 40/40；evidence 27/27；budget 40/40；natural refusal 10/10
+  - repair success 1/2（W3K027 success，W3K028 expected no-valid-final）；valid Execute 37/41
+  - overall/known/heldout/executed hash 已写入归档分析，不混入 Week2 safety
+- 脱敏分析：`docs/reports/week-3-fixture-analysis-2026-09-04.md`
+
+### 停止条件
+
+除宿主机 `make db-up` 端口碰撞外，全部功能与安全离线门禁通过，已达到“可向用户申请一次固定 case/预算 Week3 live 授权”的技术条件；这不是授权。本阶段没有运行 DeepSeek/live/API、没有产生模型费用，提交后停止。
+
+提交前再次运行 `make check`：Ruff、mypy 通过，1641 tests passed in 43.92s。

@@ -61,6 +61,40 @@ USD/CNY 6.7809 快照换算为输入 CNY 2.983596、输出 CNY 8.950788/百万 t
 计量见 [live 证据归档](reports/evidence/README.md)。Week 2 唯一一次获授权的 live 结果及失败模式见
 [Week 2 DeepSeek live 分析](reports/week-2-deepseek-live-analysis-2026-09-04.md)。
 
+## Week 3 Agent 分层评测
+
+Week 3 使用独立的 `week3-agent-evaluation-v1` 协议，不把 Week 2 static safety 或裸 Text-to-SQL 分数混入
+Agent 分母。fixture 固定运行 30 个 known 与 10 个 heldout 用例；live 路径排除 4 个仅用于确定性 fault/policy
+harness 的 known 用例，因此固定为 36 例。正式报告绑定 overall、known、heldout 与按 mode/有序 case ID 派生的
+executed manifest hash，subset 只能作为 `partial_test`，不能冒充正式报告。
+
+指标全部使用自身适用分母：known behavior 10、known simple 15、known attribution 1，heldout 10 独立列示；
+first/final 的 result、alias/output contract、production validation、execution、truncation、strict 分别报告。
+此外独立报告 repair、valid execute、natural refusal、tool order、verified evidence 与 budget 的
+`numerator/denominator/rate`；无适用项时 denominator 为 0、rate 为 N/A，绝不以总 40 例代替。
+
+fixture executor 为每个 case 新建 scripted model session、预算、trace 与 context，但 40 例共享一个调用方拥有的
+只读 PostgreSQL engine/tool registry。非 Execute 工具不执行 SQL；报告只保留受限 trace metadata、验证和 evidence
+引用、计数、成本与安全终态，不包含 question、prompt、SQL、参数、raw rows、payload、endpoint、key 或价格来源。
+fixture 的全绿只证明 harness、tools、数据库治理、预算与 scorer 的一致性，不证明模型质量或语言泛化。
+
+```bash
+make eval-week3-fixture
+```
+
+报告写入不可覆盖目录 `artifacts/evals/week3/fixture/<timestamp>-<run-id>/`；命令另将本次 runner 返回的精确
+`report.json` 绝对路径写入 `artifacts/evals/week3/fixture-report-path.txt`，不搜索历史目录。live 命令已实现但
+本计划未授权执行；它要求 tiny dataset、显式 `--live`、`AGENT_RUNTIME_MODE=live`、
+`AGENT_LIVE_ENABLED=true`、有效模型设置/key 与 requested model 对应的公共价格快照全部通过后，才会创建
+`AsyncOpenAI(max_retries=0)`：
+
+```bash
+uv run governed-eval week3 --dataset tiny --mode live --live
+```
+
+CI 与 Makefile 只包含 fixture 命令，不携带 key、URL、network client 或 live 开关。任何 Week 3 live 都必须在
+审阅本次离线报告后获得新的、单次明确授权。
+
 ## Week 2 活跃评测协议
 
 Week 2 不修改 core-v1 或历史 live 报告，而是新增独立的 `week2-evaluation-v1` 协议：

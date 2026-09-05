@@ -7,7 +7,7 @@ export MIGRATION_DATABASE_URL
 export LOADER_DATABASE_URL
 export DATABASE_URL
 
-.PHONY: doctor venv sync lint format typecheck test check db-up db-down migrate migration-check test-integration data-tiny data-full data-verify metrics-check eval-fixture eval-week2-fixture
+.PHONY: doctor venv sync lint format typecheck test check db-up db-down migrate migration-check test-integration data-tiny data-full data-verify metrics-check eval-fixture eval-week2-fixture eval-week3-fixture
 
 doctor:
 	@bash scripts/check_environment.sh
@@ -64,5 +64,8 @@ eval-fixture:
 
 eval-week2-fixture:
 	@uv run governed-eval week2 --dataset tiny --mode fixture
+
+eval-week3-fixture:
+	@uv run governed-eval week3 --dataset tiny --mode fixture --report-path-file artifacts/evals/week3/fixture-report-path.txt
 
 check: lint typecheck test

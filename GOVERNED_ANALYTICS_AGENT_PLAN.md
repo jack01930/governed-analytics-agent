@@ -5,7 +5,7 @@
 > 制定日期：2026-09-01
 > 最近同步：2026-09-04
 > 项目周期：8 周
-> 当前阶段：第 2 周评测有效性、安全工具层及一次 Week 2 live 已完成，工程上可进入第 3 周
+> 当前阶段：第 3 周 Agent/API 设计与实现已批准，离线门禁按 Task 14 状态更新；Week 3 live 尚未授权
 
 ---
 
@@ -1565,6 +1565,15 @@ Week 2 live 导向（2026-09-04）：
 - 7 条“值正确、契约失败”与首批 boundary 失败形成冻结回归；裸流程与工具增强结果分开报告；
 - 超过轮数和成本能安全停止；
 - API 和 SSE 可测试。
+
+实施同步（2026-09-05）：
+
+- LangGraph 有界主链路、结构化 Answer Contract、一次修复、四类工具、预算、Trace、FastAPI 与 SSE 已实现。
+- 独立 Week 3 协议冻结 30 个 known 与 10 个 heldout fixture case，并按 behavior、simple、attribution、repair、
+  budget、policy 及 first/final component 分开计分。
+- `governed-eval week3 --dataset tiny --mode fixture`、纯 fixture Make/CI 门禁与精确 report pointer 已接线；
+  fixture 结果只代表 harness/tools/DB/governance/scoring 验证。
+- live 路径仅实现双重授权与资源所有权边界，尚未运行、尚未获准，也不作为本次离线门禁的通过条件。
 
 ## 第 4 周：可投递 MVP
 

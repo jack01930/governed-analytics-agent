@@ -60,6 +60,7 @@ make data-verify
 make metrics-check
 make eval-fixture
 make eval-week2-fixture
+make eval-week3-fixture
 ```
 
 `.env` 仅在本地使用且已被 Git 忽略；以上命令不需要模型 key 或外部 API。生成的 CSV 和
@@ -72,6 +73,16 @@ manifest 位于被忽略的 `artifacts/datasets/tiny/`。完整命令、再生�
 明确执行双重授权命令。`make eval-week2-fixture` 同样完全离线，运行 50 个业务执行例和 20 个直接安全例，
 报告写入 `artifacts/evals/week2/fixture/`。评测契约、报告字段、成本快照与 live 边界见
 [评测指南](docs/evals.md)。
+
+本地 Agent API 可在上述 tiny 数据与迁移就绪后启动：
+
+```bash
+uv run uvicorn governed_analytics.api.app:app --host 127.0.0.1 --port 8000
+```
+
+`make eval-week3-fixture` 离线运行固定的 40 个 Week 3 Agent 用例，并把本次唯一 `report.json` 的绝对路径
+原子写入 `artifacts/evals/week3/fixture-report-path.txt`。它验证 LangGraph、四类安全工具、只读数据库、预算、
+评分与报告 harness，不代表真实模型的语言泛化或质量；Week 3 live 仍需新的明确授权。
 
 当前 live provider 为 DeepSeek，默认使用 `deepseek-v4-flash` 的非思考模式。配置 Key、执行一次不可重试的
 裸基线以及根据结果确定第 2 周优先级的步骤见 [DeepSeek live 基线运行手册](docs/live-baseline-playbook.md)；
@@ -98,6 +109,7 @@ manifest 位于被忽略的 `artifacts/datasets/tiny/`。完整命令、再生�
 - GitHub 远程仓库已配置；未经确认，不进行云端部署或公开发布。
 - 未经确认，不创建云资源、不产生付费调用、不使用真实个人或企业数据。
 - 2026-09-04 的 Week 2 live 单次授权已经使用并完成；任何后续 live 重跑仍须获得新的明确付费授权。
+- Week 3 Agent/API 与 40 例 fixture 离线门禁已接线；尚未执行或授权 Week 3 live。
 
 ## License
 

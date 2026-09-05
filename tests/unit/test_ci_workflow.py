@@ -19,13 +19,14 @@ def _normalized(run_steps: list[str]) -> list[str]:
 
 def _assert_database_runs_are_safe(workflow: str) -> None:
     normalized = _normalized(_database_run_steps(workflow))
-    assert normalized[-6:] == [
+    assert normalized[-7:] == [
         "uv run governed-data generate --scale tiny",
         "uv run governed-data verify --scale tiny",
         "uv run pytest tests/unit/metrics tests/integration/metrics -v",
         "uv run pytest tests/integration/tools -v",
         "uv run governed-eval baseline --dataset tiny --mode fixture",
         "uv run governed-eval week2 --dataset tiny --mode fixture",
+        "uv run governed-eval week3 --dataset tiny --mode fixture",
     ]
     forbidden = (
         "--scale full",
@@ -48,7 +49,16 @@ def test_database_ci_uses_only_local_tiny_data_evidence() -> None:
 
 @pytest.mark.parametrize(
     "run",
-    ("CURL\thttps://example.test", "uv run governed-data generate --scale full", "make data-full"),
+    (
+        "CURL\thttps://example.test",
+        "wget https://example.test",
+        "httpie https://example.test",
+        "uv run governed-data generate --scale full",
+        "make data-full",
+        "MODEL_API_KEY=opaque uv run governed-eval week3 --dataset tiny --mode fixture",
+        "uv run governed-eval week3 --dataset tiny --mode live",
+        "uv run governed-eval week3 --dataset tiny --mode live --live",
+    ),
 )
 def test_ci_guard_rejects_case_whitespace_and_full_variants(run: str) -> None:
     workflow = f"""
@@ -62,6 +72,7 @@ jobs:
       - run: uv run pytest tests/integration/tools -v
       - run: uv run governed-eval baseline --dataset tiny --mode fixture
       - run: uv run governed-eval week2 --dataset tiny --mode fixture
+      - run: uv run governed-eval week3 --dataset tiny --mode fixture
 """
     with pytest.raises(AssertionError):
         _assert_database_runs_are_safe(workflow)
