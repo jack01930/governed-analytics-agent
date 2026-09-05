@@ -1,14 +1,31 @@
 """Independent Week 3 evaluation protocol and frozen fixture data."""
 
 from governed_analytics.evals.week3.models import (
+    BehaviorScore,
+    BudgetConfiguration,
     BudgetOverrides,
+    BudgetScore,
+    CandidateScore,
+    EvidenceScore,
     ExpectedObservation,
     FixtureModelStep,
     FixtureScript,
     FrozenExpectedResult,
+    SafeEvidenceRef,
+    SafeProfileTraceMetadata,
+    SafeToolTraceRef,
+    ToolScore,
     Week3CaseResult,
     Week3EvaluationCase,
     Week3RunReport,
+)
+from governed_analytics.evals.week3.runner import (
+    FixtureWeek3CaseExecutor,
+    LiveWeek3CaseExecutor,
+    Week3CaseExecutor,
+    Week3RunArtifact,
+    Week3RunError,
+    run_week3_evaluation,
 )
 from governed_analytics.evals.week3.suites import (
     load_fixture_scripts,
@@ -18,16 +35,31 @@ from governed_analytics.evals.week3.suites import (
 )
 
 __all__ = [
+    "BehaviorScore",
+    "BudgetConfiguration",
     "BudgetOverrides",
+    "BudgetScore",
+    "CandidateScore",
+    "EvidenceScore",
     "ExpectedObservation",
     "FixtureModelStep",
     "FixtureScript",
+    "FixtureWeek3CaseExecutor",
     "FrozenExpectedResult",
+    "LiveWeek3CaseExecutor",
+    "SafeEvidenceRef",
+    "SafeProfileTraceMetadata",
+    "SafeToolTraceRef",
+    "ToolScore",
+    "Week3CaseExecutor",
     "Week3CaseResult",
     "Week3EvaluationCase",
+    "Week3RunArtifact",
+    "Week3RunError",
     "Week3RunReport",
     "load_fixture_scripts",
     "load_week3_cases",
+    "run_week3_evaluation",
     "week3_cohort_sha256",
     "week3_manifest_sha256",
 ]

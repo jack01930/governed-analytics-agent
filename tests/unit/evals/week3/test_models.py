@@ -9,10 +9,40 @@ from governed_analytics.agent.contracts import ActionType, FinalStatus, StopReas
 from governed_analytics.evals.models import QueryResult
 from governed_analytics.evals.week3.models import (
     BudgetOverrides,
+    CandidateScore,
     FrozenExpectedResult,
     Week3CaseResult,
     Week3RunReport,
 )
+
+
+def test_candidate_strict_pass_is_not_forgeable() -> None:
+    with pytest.raises(ValidationError, match="five-part"):
+        CandidateScore(
+            result_score=Decimal("1"),
+            output_contract_conformant=True,
+            answer_contract_validated=False,
+            execution_succeeded=True,
+            possibly_truncated=False,
+            strict_pass=True,
+        )
+
+
+def test_report_models_cannot_represent_sensitive_execution_fields() -> None:
+    forbidden = {
+        "sql",
+        "rows",
+        "prompt",
+        "oracle_query_id",
+        "endpoint",
+        "api_key",
+        "deadline_monotonic",
+        "question",
+        "result_summary",
+    }
+
+    schemas = (Week3CaseResult.model_json_schema(), Week3RunReport.model_json_schema())
+    assert all(not forbidden.intersection(schema.get("properties", {})) for schema in schemas)
 
 
 def test_expected_result_uses_eval_query_result_and_is_frozen() -> None:
@@ -79,12 +109,15 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
 
     assert report.case_count == report.passed_count == 1
     assert report.protocol_version == "week3-agent-evaluation-v1"
-    assert Week3RunReport.model_validate(
-        {
-            **report.model_dump(exclude_computed_fields=True),
-            "protocol_version": "week3-agent-evaluation-v1",
-        }
-    ).protocol_version == "week3-agent-evaluation-v1"
+    assert (
+        Week3RunReport.model_validate(
+            {
+                **report.model_dump(exclude_computed_fields=True),
+                "protocol_version": "week3-agent-evaluation-v1",
+            }
+        ).protocol_version
+        == "week3-agent-evaluation-v1"
+    )
     with pytest.raises(ValidationError):
         Week3RunReport.model_validate(
             {
@@ -94,6 +127,13 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
         )
     with pytest.raises(ValidationError):
         Week3RunReport.model_validate({**report.model_dump(), "case_count": 2})
+    with pytest.raises(ValidationError, match="executed manifest"):
+        Week3RunReport.model_validate(
+            {
+                **report.model_dump(exclude_computed_fields=True),
+                "executed_manifest_sha256": "d" * 64,
+            }
+        )
 
 
 def test_budget_case_uses_partial_evidence_terminal_contract() -> None:

@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
+from datetime import date, datetime
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from governed_analytics.agent.contracts import (
     ActionType,
     BehaviorAction,
+    BehaviorReasonCode,
     FinalStatus,
     FrozenJsonObjectValue,
     StopReason,
@@ -35,8 +39,7 @@ def _contains_non_finite_number(value: object, seen: set[int]) -> bool:
             return False
         seen.add(identity)
         return any(
-            _contains_non_finite_number(key, seen)
-            or _contains_non_finite_number(item, seen)
+            _contains_non_finite_number(key, seen) or _contains_non_finite_number(item, seen)
             for key, item in value.items()
         )
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -132,6 +135,151 @@ class FixtureScript(_FrozenWireModel):
         return self
 
 
+class CandidateScore(_FrozenWireModel):
+    result_score: Decimal = Field(ge=0, le=1)
+    output_contract_conformant: bool
+    answer_contract_validated: bool
+    execution_succeeded: bool
+    possibly_truncated: bool
+    strict_pass: bool
+
+    @model_validator(mode="after")
+    def _validate_strict(self) -> CandidateScore:
+        derived = (
+            self.result_score == Decimal("1")
+            and self.output_contract_conformant
+            and self.answer_contract_validated
+            and self.execution_succeeded
+            and not self.possibly_truncated
+        )
+        if self.strict_pass != derived:
+            raise ValueError("strict_pass must be the exact five-part conjunction")
+        return self
+
+
+class BehaviorScore(_FrozenWireModel):
+    action_conformant: bool
+    reason_conformant: bool
+    missing_fields_conformant: bool
+    conformant: bool
+
+    @model_validator(mode="after")
+    def _validate_conformance(self) -> BehaviorScore:
+        derived = (
+            self.action_conformant and self.reason_conformant and self.missing_fields_conformant
+        )
+        if self.conformant != derived:
+            raise ValueError("behavior conformance must be derived")
+        return self
+
+
+class ToolScore(_FrozenWireModel):
+    required_present: bool
+    forbidden_absent: bool
+    sequence_conformant: bool
+    conformant: bool
+
+    @model_validator(mode="after")
+    def _validate_conformance(self) -> ToolScore:
+        derived = self.required_present and self.forbidden_absent and self.sequence_conformant
+        if self.conformant != derived:
+            raise ValueError("tool conformance must be derived")
+        return self
+
+
+class EvidenceScore(_FrozenWireModel):
+    required_count: int = Field(ge=0)
+    verified_count: int = Field(ge=0)
+    oracle_verified_sufficient: bool
+
+    @model_validator(mode="after")
+    def _validate_counts(self) -> EvidenceScore:
+        if self.verified_count > self.required_count:
+            raise ValueError("verified evidence cannot exceed required purposes")
+        if self.oracle_verified_sufficient != (self.verified_count == self.required_count):
+            raise ValueError("evidence sufficiency must be derived")
+        return self
+
+
+class SafeToolTraceRef(_FrozenWireModel):
+    tool_name: ActionType
+    purpose: str = Field(min_length=1, max_length=128)
+    contract_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    hypothesis_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    query_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    columns: tuple[str, ...] = ()
+    row_count: int | None = Field(default=None, ge=0)
+    possibly_truncated: bool = False
+    outcome: Literal["completed", "failed"]
+    safe_error: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    profile_metadata: SafeProfileTraceMetadata | None = None
+
+    @model_validator(mode="after")
+    def _validate_tool_metadata(self) -> SafeToolTraceRef:
+        if (self.tool_name is ActionType.PROFILE) != (self.profile_metadata is not None):
+            raise ValueError("profile metadata belongs only to profile calls")
+        if self.tool_name is not ActionType.EXECUTE_SQL and (
+            self.contract_id is not None or self.hypothesis_id is not None
+        ):
+            raise ValueError("only Execute trace refs carry contract identifiers")
+        return self
+
+
+class SafeProfileTraceMetadata(_FrozenWireModel):
+    table_name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    column_name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    operation: (
+        Literal[
+            "time_range",
+            "numeric_summary",
+            "null_summary",
+            "distinct_values",
+            "top_values",
+        ]
+        | None
+    ) = None
+    filter_columns: tuple[str, ...] = ()
+    has_time_window: bool | None = None
+    limit: int | None = Field(default=None, ge=1, le=50)
+    time_column: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+class SafeEvidenceRef(_FrozenWireModel):
+    evidence_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    observation_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    purpose: str = Field(min_length=1, max_length=128)
+    contract_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    hypothesis_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    query_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class BudgetScore(_FrozenWireModel):
+    conformant: bool
+    action_loops: int = Field(ge=0)
+    llm_calls: int = Field(ge=0)
+    tool_calls: int = Field(ge=0)
+    execute_calls: int = Field(ge=0)
+    profile_calls: int = Field(ge=0)
+    repair_count: int = Field(ge=0)
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    committed_cost_cny: Decimal = Field(ge=0)
+    soft_cap_reached: bool
+
+
+class BudgetConfiguration(_FrozenWireModel):
+    max_action_loops: int = Field(ge=1)
+    max_llm_calls: int = Field(ge=1)
+    max_tool_calls: int = Field(ge=1)
+    max_execute_calls: int = Field(ge=1)
+    max_profile_calls: int = Field(ge=1)
+    max_repairs: int = Field(ge=1)
+    max_concurrent_runs: int = Field(ge=1)
+    timeout_seconds: int = Field(ge=1)
+    soft_cost_cny: Decimal = Field(gt=0)
+    hard_cost_cny: Decimal = Field(gt=0)
+
+
 class Week3EvaluationCase(_FrozenWireModel):
     case_id: str = Field(pattern=r"^W3[KH][0-9]{3}$")
     cohort: Week3Cohort
@@ -220,6 +368,8 @@ class Week3CaseResult(_FrozenWireModel):
     evidence_conformant: bool | None = None
     budget_conformant: bool
     observed_behavior: BehaviorAction | None = None
+    observed_behavior_reason: BehaviorReasonCode | None = None
+    observed_missing_fields: tuple[str, ...] = ()
     observed_final_status: FinalStatus | None = None
     observed_stop_reason: StopReason | None = None
     observed_tools: tuple[ActionType, ...] = ()
@@ -228,6 +378,26 @@ class Week3CaseResult(_FrozenWireModel):
     observed_execute_calls: int = Field(default=0, ge=0)
     observed_repair_count: int = Field(default=0, ge=0)
     error_type: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    first_candidate_score: CandidateScore | None = None
+    final_candidate_score: CandidateScore | None = None
+    behavior_score: BehaviorScore | None = None
+    tool_score: ToolScore | None = None
+    evidence_score: EvidenceScore | None = None
+    budget_score: BudgetScore | None = None
+    safe_tool_trace: tuple[SafeToolTraceRef, ...] = ()
+    evidence_references: tuple[SafeEvidenceRef, ...] = ()
+    resolved_models: tuple[str, ...] = ()
+    model_identity_complete: bool = True
+
+    @field_validator("resolved_models")
+    @classmethod
+    def _validate_case_model_identities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(
+            not item or len(item) > 128 or item.casefold().startswith(("sk-", "pk-", "bearer-"))
+            for item in value
+        ):
+            raise ValueError("per-case model identity must be safe")
+        return value
 
     @model_validator(mode="after")
     def _validate_outcome(self) -> Week3CaseResult:
@@ -235,6 +405,8 @@ class Week3CaseResult(_FrozenWireModel):
             raise ValueError("case ID prefix must match result cohort")
         if self.observed_execute_calls > self.observed_tool_calls:
             raise ValueError("execute calls cannot exceed tool calls")
+        if len(self.resolved_models) != len(set(self.resolved_models)):
+            raise ValueError("per-case resolved model identities must be unique")
         checks = (
             self.first_candidate_conformant,
             self.final_conformant,
@@ -242,6 +414,7 @@ class Week3CaseResult(_FrozenWireModel):
             self.tools_conformant,
             self.evidence_conformant,
             self.budget_conformant,
+            self.model_identity_complete,
         )
         derived_pass = all(item is not False for item in checks) and self.error_type is None
         if self.passed != derived_pass:
@@ -255,13 +428,48 @@ class Week3RunReport(_FrozenWireModel):
     overall_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     known_cohort_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     heldout_cohort_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    executed_manifest_sha256: str = Field(default="0" * 64, pattern=r"^[0-9a-f]{64}$")
+    run_id: str = Field(default="week3", pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    generated_at_utc: datetime | None = None
+    requested_model: str = Field(
+        default="fixture-agent", pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    )
+    resolved_models: tuple[str, ...] = ()
+    pricing_effective_date: date | None = None
+    pricing_snapshot_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    budget_configuration: BudgetConfiguration | None = None
     cases: tuple[Week3CaseResult, ...]
+
+    @field_validator("requested_model", "resolved_models")
+    @classmethod
+    def _validate_model_identity(cls, value: object) -> object:
+        values = value if isinstance(value, tuple) else (value,)
+        if any(
+            not isinstance(item, str) or item.casefold().startswith(("sk-", "pk-", "bearer-"))
+            for item in values
+        ):
+            raise ValueError("model identity must be a safe identifier")
+        return value
 
     @model_validator(mode="after")
     def _validate_cases(self) -> Week3RunReport:
         ids = tuple(case.case_id for case in self.cases)
         if not ids or len(ids) != len(set(ids)):
             raise ValueError("reports require nonempty unique case IDs")
+        if len(self.resolved_models) != len(set(self.resolved_models)):
+            raise ValueError("resolved model identities must be unique")
+        if self.mode == "fixture" and self.requested_model != "fixture-agent":
+            raise ValueError("fixture reports require the fixture model identity")
+        canonical = json.dumps(
+            {"mode": self.mode, "case_ids": list(ids)},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        derived_manifest = sha256(canonical).hexdigest()
+        if self.executed_manifest_sha256 != "0" * 64 and (
+            self.executed_manifest_sha256 != derived_manifest
+        ):
+            raise ValueError("executed manifest must be derived from ordered report cases")
         return self
 
     @computed_field  # type: ignore[prop-decorator]
@@ -284,14 +492,113 @@ class Week3RunReport(_FrozenWireModel):
     def pass_rate(self) -> Decimal:
         return Decimal(self.passed_count) / Decimal(self.case_count)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def known_count(self) -> int:
+        return sum(case.cohort == "known" for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def heldout_count(self) -> int:
+        return sum(case.cohort == "heldout" for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def behavior_passed(self) -> int:
+        return sum(
+            case.cohort == "known" and case.suite == "behavior" and case.behavior_conformant
+            for case in self.cases
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def behavior_case_count(self) -> int:
+        return sum(case.cohort == "known" and case.suite == "behavior" for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def simple_strict_passed(self) -> int:
+        return sum(
+            case.cohort == "known"
+            and case.suite == "simple"
+            and case.final_candidate_score is not None
+            and case.final_candidate_score.strict_pass
+            for case in self.cases
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def known_passed_count(self) -> int:
+        return sum(case.cohort == "known" and case.passed for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def heldout_passed_count(self) -> int:
+        return sum(case.cohort == "heldout" and case.passed for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def simple_known_count(self) -> int:
+        return sum(case.cohort == "known" and case.suite == "simple" for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def attribution_count(self) -> int:
+        return sum(case.suite == "attribution" for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def attribution_passed(self) -> int:
+        return sum(case.suite == "attribution" and case.passed for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def first_candidate_strict_passed(self) -> int:
+        return sum(
+            case.first_candidate_score is not None and case.first_candidate_score.strict_pass
+            for case in self.cases
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def final_candidate_strict_passed(self) -> int:
+        return sum(
+            case.final_candidate_score is not None and case.final_candidate_score.strict_pass
+            for case in self.cases
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def tool_conformant_count(self) -> int:
+        return sum(case.tools_conformant for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def evidence_conformant_count(self) -> int:
+        return sum(case.evidence_conformant is True for case in self.cases)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def budget_conformant_count(self) -> int:
+        return sum(case.budget_conformant for case in self.cases)
+
 
 __all__ = [
+    "BehaviorScore",
+    "BudgetConfiguration",
     "BudgetOverrides",
+    "BudgetScore",
+    "CandidateScore",
     "EvalQueryResult",
+    "EvidenceScore",
     "ExpectedObservation",
     "FixtureModelStep",
     "FixtureScript",
     "FrozenExpectedResult",
+    "SafeEvidenceRef",
+    "SafeProfileTraceMetadata",
+    "SafeToolTraceRef",
+    "ToolScore",
     "Week3CaseResult",
     "Week3Cohort",
     "Week3EvaluationCase",
