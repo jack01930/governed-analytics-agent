@@ -22,6 +22,7 @@ from governed_analytics.evals.week3.models import (
     Week3EvaluationCase,
     Week3RunReport,
 )
+from governed_analytics.evals.week3.reporting import Week3PublicationEvidence
 from governed_analytics.evals.week3.runner import (
     FixtureWeek3CaseExecutor,
     LiveWeek3CaseExecutor,
@@ -60,6 +61,7 @@ __all__ = [
     "Week3CaseExecutor",
     "Week3CaseResult",
     "Week3EvaluationCase",
+    "Week3PublicationEvidence",
     "Week3RunArtifact",
     "Week3RunError",
     "Week3RunReport",

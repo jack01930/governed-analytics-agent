@@ -14,14 +14,22 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from pydantic import ValidationError
+import sqlglot
+from sqlglot import exp
 
 from governed_analytics.evals.week3.models import Week3CaseResult, Week3RunReport
 
+if TYPE_CHECKING:
+    from governed_analytics.agent.contracts import AgentRunResult
+    from governed_analytics.config import AgentRuntimeSettings
+    from governed_analytics.evals.models import QueryResult as EvalQueryResult
+    from governed_analytics.evals.week3.models import Week3EvaluationCase
+    from governed_analytics.pricing import ModelPricing
+
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_SQL_TEXT = re.compile(r"(?i)\b(select|insert|update|delete|alter|drop|create|with)\s+")
 _URL = re.compile(r"(?i)\b(?:https?|postgres(?:ql)?|mysql)://")
 _CREDENTIAL = re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:sk-|pk-|bearer\s+)")
 _FORBIDDEN_KEY_TOKENS = frozenset(
@@ -86,10 +94,15 @@ class Week3ReportReservation:
     _case_names: tuple[str, ...] = ()
     _file_bindings: list[_FileBinding] = field(default_factory=list)
     _foreign_content: bool = False
+    _close_unknown: bool = False
 
     @property
     def active(self) -> bool:
         return self._active
+
+    @property
+    def close_unknown(self) -> bool:
+        return self._close_unknown
 
     @property
     def closed(self) -> bool:
@@ -105,36 +118,37 @@ class Week3ReportReservation:
         for binding in self._file_bindings:
             if binding.closed:
                 continue
+            binding.closed = True
             try:
                 os.close(binding.fd)
             except OSError as error:
+                self._close_unknown = True
                 if first is None:
                     first = error
-            else:
-                binding.closed = True
         if not self._cases_fd_closed and self._cases_fd is not None:
+            self._cases_fd_closed = True
             try:
                 os.close(self._cases_fd)
             except OSError as error:
+                self._close_unknown = True
                 if first is None:
                     first = error
-            else:
-                self._cases_fd_closed = True
         if not self._staging_fd_closed:
+            self._staging_fd_closed = True
             try:
                 os.close(self.staging_fd)
             except OSError as error:
-                first = error
-            else:
-                self._staging_fd_closed = True
+                self._close_unknown = True
+                if first is None:
+                    first = error
         if not self._parent_fd_closed:
+            self._parent_fd_closed = True
             try:
                 os.close(self.parent_fd)
             except OSError as error:
+                self._close_unknown = True
                 if first is None:
                     first = error
-            else:
-                self._parent_fd_closed = True
         if first is not None:
             raise first
 
@@ -145,6 +159,19 @@ class PublishedWeek3Report:
     report_json: Path
     report_markdown: Path
     cases_dir: Path
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class Week3PublicationEvidence:
+    mode: Literal["fixture", "live"]
+    cases: tuple[Week3EvaluationCase, ...]
+    outcomes: tuple[AgentRunResult, ...]
+    error_types: tuple[str | None, ...]
+    expected_results: tuple[tuple[EvalQueryResult, ...], ...]
+    settings: AgentRuntimeSettings
+    pricing: ModelPricing
+    generated_at_utc: datetime
+    run_id: str
 
 
 def _identity(metadata: os.stat_result) -> _Identity:
@@ -175,12 +202,20 @@ def _open_or_create_directory_tree(path: Path) -> int:
             with suppress(FileExistsError):
                 os.mkdir(part, mode=0o700, dir_fd=fd)
             child = os.open(part, _directory_flags(), dir_fd=fd)
-            os.close(fd)
+            old_fd = fd
+            fd = -1
+            try:
+                os.close(old_fd)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(child)
+                raise
             fd = child
         return fd
     except BaseException:
-        with suppress(OSError):
-            os.close(fd)
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
         raise
 
 
@@ -190,12 +225,20 @@ def _open_directory_tree(path: Path) -> int:
     try:
         for part in absolute.parts[1:]:
             child = os.open(part, _directory_flags(), dir_fd=fd)
-            os.close(fd)
+            old_fd = fd
+            fd = -1
+            try:
+                os.close(old_fd)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(child)
+                raise
             fd = child
         return fd
     except BaseException:
-        with suppress(OSError):
-            os.close(fd)
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
         raise
 
 
@@ -235,8 +278,9 @@ def reserve_week3_report(
         with suppress(FileExistsError):
             os.mkdir(mode, mode=0o700, dir_fd=root_fd)
         parent_fd = os.open(mode, _directory_flags(), dir_fd=root_fd)
-        os.close(root_fd)
+        detached_root_fd = root_fd
         root_fd = -1
+        os.close(detached_root_fd)
         parent_identity = _directory_handle_identity(parent_fd)
         if not _path_is_bound_to(mode_dir, parent_identity):
             raise OSError("Week 3 report reservation unavailable")
@@ -321,25 +365,63 @@ def _find_owned_name(reservation: Week3ReportReservation) -> str | None:
     return None
 
 
-def _empty_directory(fd: int) -> None:
-    for name in os.listdir(fd):
-        metadata = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        if stat.S_ISDIR(metadata.st_mode):
-            child_fd = os.open(
+def _binding_matches(binding: _FileBinding) -> bool:
+    try:
+        _validate_file_binding(binding)
+    except OSError:
+        return False
+    return True
+
+
+def _quarantine_entry(reservation: Week3ReportReservation, directory_fd: int, name: str) -> None:
+    for _attempt in range(16):
+        quarantine = f".week3-foreign-{uuid4().hex}"
+        try:
+            _native_rename_between_no_replace(
+                directory_fd,
                 name,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=fd,
+                reservation.parent_fd,
+                quarantine,
             )
-            try:
-                _empty_directory(child_fd)
-            finally:
-                os.close(child_fd)
-            os.rmdir(name, dir_fd=fd)
-        else:
-            os.unlink(name, dir_fd=fd)
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            return
+        return
+    raise OSError("atomic Week 3 report publication failed")
+
+
+def _remove_known_leaf_or_quarantine(
+    reservation: Week3ReportReservation,
+    directory_fd: int,
+    name: str,
+    binding: _FileBinding | None,
+) -> None:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if binding is not None and _binding_matches(binding):
+        os.unlink(name, dir_fd=directory_fd)
+    else:
+        _quarantine_entry(reservation, directory_fd, name)
+
+
+def _cleanup_cases_directory(reservation: Week3ReportReservation) -> None:
+    if reservation._cases_fd is None or reservation._cases_fd_closed:
+        return
+    bindings = {
+        item.name: item
+        for item in reservation._file_bindings
+        if item.directory_fd == reservation._cases_fd
+    }
+    for name in tuple(os.listdir(reservation._cases_fd)):
+        _remove_known_leaf_or_quarantine(
+            reservation,
+            reservation._cases_fd,
+            name,
+            bindings.get(name),
+        )
 
 
 def _remove_owned(reservation: Week3ReportReservation) -> None:
@@ -348,8 +430,33 @@ def _remove_owned(reservation: Week3ReportReservation) -> None:
         return
     if _directory_handle_identity(reservation.staging_fd) != reservation.staging_identity:
         return
-    _empty_directory(reservation.staging_fd)
-    os.rmdir(name, dir_fd=reservation.parent_fd)
+    _cleanup_cases_directory(reservation)
+    root_bindings = {
+        item.name: item
+        for item in reservation._file_bindings
+        if item.directory_fd == reservation.staging_fd
+    }
+    for entry in tuple(os.listdir(reservation.staging_fd)):
+        metadata = os.stat(entry, dir_fd=reservation.staging_fd, follow_symlinks=False)
+        if (
+            reservation._cases_identity is not None
+            and _identity(metadata) == reservation._cases_identity
+            and stat.S_ISDIR(metadata.st_mode)
+            and reservation._cases_fd is not None
+            and not os.listdir(reservation._cases_fd)
+        ):
+            os.rmdir(entry, dir_fd=reservation.staging_fd)
+        else:
+            _remove_known_leaf_or_quarantine(
+                reservation,
+                reservation.staging_fd,
+                entry,
+                root_bindings.get(entry),
+            )
+    if not os.listdir(reservation.staging_fd):
+        os.rmdir(name, dir_fd=reservation.parent_fd)
+    else:
+        _quarantine_entry(reservation, reservation.parent_fd, name)
 
 
 def cancel_week3_report_reservation(reservation: Week3ReportReservation) -> None:
@@ -376,11 +483,29 @@ def _scan_safe(value: object, *, key: str | None = None) -> None:
         for child in value:
             _scan_safe(child)
     elif isinstance(value, str) and (
-        _SQL_TEXT.search(value)
-        or _URL.search(value)
-        or _CREDENTIAL.search(value)
+        _is_complete_sql(value) or _URL.search(value) or _CREDENTIAL.search(value)
     ):
         raise ValueError("Week 3 report contains unsafe metadata")
+
+
+def _is_complete_sql(value: str) -> bool:
+    try:
+        statements = sqlglot.parse(value, read="postgres")
+    except sqlglot.errors.SqlglotError:
+        return False
+    statement_types = (
+        exp.Query,
+        exp.DDL,
+        exp.DML,
+        exp.Values,
+        exp.Grant,
+        exp.Revoke,
+        exp.Drop,
+        exp.Alter,
+    )
+    return bool(statements) and any(
+        isinstance(statement, statement_types) for statement in statements
+    )
 
 
 def _dump(model: Week3RunReport | Week3CaseResult) -> dict[str, object]:
@@ -544,7 +669,7 @@ def _validate_file_bindings(reservation: Week3ReportReservation) -> None:
         raise
 
 
-def _validate_inventory(
+def _validate_inventory_content(
     reservation: Week3ReportReservation,
     cases_fd: int,
     case_names: tuple[str, ...],
@@ -575,6 +700,25 @@ def _validate_inventory(
     _validate_file_bindings(reservation)
 
 
+def _validate_inventory(
+    reservation: Week3ReportReservation,
+    cases_fd: int,
+    case_names: tuple[str, ...],
+    *,
+    published: bool = False,
+) -> None:
+    try:
+        _validate_inventory_content(
+            reservation,
+            cases_fd,
+            case_names,
+            published=published,
+        )
+    except OSError:
+        reservation._foreign_content = True
+        raise
+
+
 def _quarantine_final(reservation: Week3ReportReservation) -> None:
     for _attempt in range(16):
         quarantine = f".week3-foreign-{uuid4().hex}"
@@ -594,7 +738,12 @@ def _raise_publish_error(error_number: int) -> None:
     raise OSError("atomic Week 3 report publication failed") from None
 
 
-def _native_rename_at_no_replace(parent_fd: int, source: str, destination: str) -> None:
+def _native_rename_between_no_replace(
+    source_fd: int,
+    source: str,
+    destination_fd: int,
+    destination: str,
+) -> None:
     system = platform.system()
     if system == "Darwin":
         try:
@@ -611,9 +760,9 @@ def _native_rename_at_no_replace(parent_fd: int, source: str, destination: str) 
         renameatx_np.restype = ctypes.c_int
         ctypes.set_errno(0)
         result = renameatx_np(
-            parent_fd,
+            source_fd,
             os.fsencode(source),
-            parent_fd,
+            destination_fd,
             os.fsencode(destination),
             0x00000004,
         )
@@ -632,9 +781,9 @@ def _native_rename_at_no_replace(parent_fd: int, source: str, destination: str) 
         renameat2.restype = ctypes.c_int
         ctypes.set_errno(0)
         result = renameat2(
-            parent_fd,
+            source_fd,
             os.fsencode(source),
-            parent_fd,
+            destination_fd,
             os.fsencode(destination),
             1,
         )
@@ -645,6 +794,10 @@ def _native_rename_at_no_replace(parent_fd: int, source: str, destination: str) 
         if error_number == errno.ENOENT:
             raise FileNotFoundError from None
         _raise_publish_error(error_number)
+
+
+def _native_rename_at_no_replace(parent_fd: int, source: str, destination: str) -> None:
+    _native_rename_between_no_replace(parent_fd, source, parent_fd, destination)
 
 
 def _native_publish_owned(reservation: Week3ReportReservation) -> None:
@@ -675,43 +828,35 @@ def _validate_published(reservation: Week3ReportReservation) -> None:
     )
 
 
-def _close_reservation_best_effort(reservation: Week3ReportReservation) -> None:
-    for _attempt in range(4):
-        if reservation.closed:
-            return
-        with suppress(OSError):
-            reservation.close()
-
-
-def _quarantine_owned_with_foreign_content(reservation: Week3ReportReservation) -> None:
-    owned_name = _find_owned_name(reservation)
-    if owned_name is None:
-        return
-    for _attempt in range(16):
-        quarantine = f".week3-foreign-{uuid4().hex}"
-        try:
-            _native_rename_at_no_replace(reservation.parent_fd, owned_name, quarantine)
-        except FileExistsError:
-            continue
-        except FileNotFoundError:
-            return
-        return
-    raise OSError("atomic Week 3 report publication failed")
-
-
 def write_week3_report(
     reservation: Week3ReportReservation,
     report: Week3RunReport,
+    *,
+    publication_evidence: Week3PublicationEvidence | None = None,
 ) -> PublishedWeek3Report:
     try:
         report = Week3RunReport.model_validate(
             report.model_dump(exclude_computed_fields=True), strict=True
         )
+        if publication_evidence is None:
+            if report.report_scope == "canonical":
+                raise ValueError("canonical report requires independent publication evidence")
+        else:
+            from governed_analytics.evals.week3.runner import (
+                _rebuild_report_from_publication_evidence,
+            )
+
+            rebuilt = _rebuild_report_from_publication_evidence(publication_evidence)
+            if report.model_dump(exclude_computed_fields=True) != rebuilt.model_dump(
+                exclude_computed_fields=True
+            ):
+                raise ValueError("report does not match independent publication evidence")
+            report = rebuilt
         report_value = _dump(report)
         case_values = tuple(_dump(case) for case in report.cases)
-    except (ValidationError, ValueError) as error:
+    except Exception:
         cancel_week3_report_reservation(reservation)
-        raise ValueError("Week 3 report contains unsafe metadata") from error
+        raise ValueError("Week 3 report contains unsafe metadata") from None
     published = False
     primary: BaseException | None = None
     try:
@@ -757,18 +902,16 @@ def write_week3_report(
         raise
     finally:
         if primary is not None:
-            if reservation._foreign_content:
-                with suppress(OSError):
-                    _quarantine_owned_with_foreign_content(reservation)
-            else:
-                with suppress(OSError):
-                    _remove_owned(reservation)
+            with suppress(OSError):
+                _remove_owned(reservation)
             reservation._active = False
-            _close_reservation_best_effort(reservation)
+            with suppress(OSError):
+                reservation.close()
     if not published:
         raise OSError("atomic Week 3 report publication failed")
+    with suppress(OSError):
+        reservation.close()
     reservation._active = False
-    _close_reservation_best_effort(reservation)
     return PublishedWeek3Report(
         report_dir=reservation.final_dir,
         report_json=reservation.final_dir / "report.json",
@@ -779,6 +922,7 @@ def write_week3_report(
 
 __all__ = [
     "PublishedWeek3Report",
+    "Week3PublicationEvidence",
     "Week3ReportReservation",
     "cancel_week3_report_reservation",
     "reserve_week3_report",

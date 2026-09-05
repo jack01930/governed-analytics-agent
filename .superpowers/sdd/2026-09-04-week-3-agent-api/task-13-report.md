@@ -157,3 +157,56 @@
 
 - 按禁令未执行 live/付费/API client/network 调用；live provider 实际质量与 engine/client 生命周期
   仍归 Task 14。
+
+## Fix round 3（2026-09-05）
+
+### 修复结果
+
+- 报告失败清理不再递归删除目录内容，只删除创建时已记录、且当前仍满足
+  device/inode/type/size/SHA-256 绑定的 owned leaf/directory。任何 extra、replacement 或同 inode
+  内容篡改都视为 foreign，并通过 parent FD 原子隔离；无论发生在 publish 前还是 publish 后，
+  固定 final 名称均不可见，foreign 内容保留。
+- 新增进程内、`repr=False` 且不进入任何输出的 `Week3PublicationEvidence`。runner 在调用任何 case
+  前把 canonical frozen expected 读成内存冻结值，并连同原始公开 `AgentRunResult`、case registry、
+  settings 与 pricing/model identity 交给 writer；writer 独立重跑 scorer，与拟发布 report 全字段
+  比较，只序列化重建结果。同步伪造 candidate、validation、model identity 或 aggregate 不能发布。
+- `SafeValidationRef` 增加 purpose/contract/hypothesis/query/columns/row-count/truncation 与安全 result
+  digest；每条 completed Execute trace 必须与 validation ref 精确 multiset 双射，valid ref 必须具有
+  严格恢复后的 result digest，evidence 继续核对同一 observation/query/hypothesis。
+- recursive guard 使用 sqlglot PostgreSQL statement classification，拒绝 SELECT、VALUES、GRANT、
+  COPY、DML、DDL 与 CTE 等完整 SQL 值，同时允许 `please select a cached model`、`drop shipping is
+  selected from cache` 与 `sentinel-llm` 等普通文本。
+- FD close 按正式 ruling 改为 one-shot detach：调用 `close(2)` 前即从 reservation ownership 状态释放，
+  同一整数只尝试一次；异常记录为 `close_unknown` 并继续尝试所有其他 FD，绝不因复用同编号而误关
+  unrelated FD。已完成 post-publish identity/digest 校验的 final 仍成功返回，publication validity 与
+  resource close state 分离。本节取代 Fix round 2 的“四轮重试”旧描述。
+- directory walker 显式分离 old/child ownership；parent close 异常时仍回收 child，外层异常处理不会
+  再次 close 状态未知的 old FD。缺失 validation 等 scorer contract 问题转成固定
+  `scoring_contract_failure` case 并继续生成报告，不破坏整次 run。
+
+### RED / mutation 回归
+
+- Fix round 2 review baseline 的六类 mutation 分别可绕过 foreign cleanup、candidate/model 自报、自然
+  文本 SQL 误判、FD 重试/泄漏和 walker child ownership；本轮新增确定性 probe，直接注入 cases-dir
+  replacement、root/cases extra regular/dir/symlink、held-FD same-inode tamper、独立 evidence 同步伪造、
+  close-then-dup2 FD reuse、persistent close failure 与 parent-close exception。
+- 定向命令：
+  `uv run pytest tests/unit/evals/week3/test_reporting.py tests/unit/evals/week3/test_runner.py::test_runner_freezes_expected_results_before_invoking_any_case tests/unit/evals/week3/test_runner.py::test_missing_validation_becomes_explicit_case_failure_not_run_failure -q`
+- 输出：reporting 独立回归 `57 passed in 9.60s`；两个 runner publication-evidence/fail-closed 回归
+  `2 passed in 6.22s`。所有错误断言使用固定脱敏诊断，不回显注入内容。
+
+### 最终验证
+
+- `uv run pytest tests/unit/evals/week3 -q` → `398 passed in 51.00s`。
+- `DATABASE_URL=postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.0.0.1:5432/governed_analytics uv run pytest tests/integration/evals/test_week3_runner.py -q`
+  → `1 passed in 17.96s`；覆盖 canonical fixture 40/40、completed Execute ↔ validation ref
+  一对一、valid result digest、special suites 与 W3K030 backend=0。
+- 定向 Ruff/mypy：`All checks passed!`；`Success: no issues found in 15 source files`。
+- `make check` → Ruff `All checks passed!`；mypy
+  `Success: no issues found in 156 source files`；unit `1572 passed in 73.60s`。
+
+### 剩余关注
+
+- 按禁令未执行 live/付费/API client/network 调用；`close_unknown` 仅在 OS 无法确认 close 状态的罕见
+  分支保留到进程退出，避免重试同一整数误关复用 FD。live provider 与 engine/client 生命周期仍归
+  Task 14。

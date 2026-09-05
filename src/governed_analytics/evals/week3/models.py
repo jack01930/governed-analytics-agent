@@ -413,9 +413,22 @@ class SafeEvidenceRef(_FrozenWireModel):
 
 class SafeValidationRef(_FrozenWireModel):
     observation_id: SafeIdentifier
+    purpose: SafeIdentifier
     contract_id: SafeIdentifier
+    hypothesis_id: SafeIdentifier
+    query_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    columns: tuple[SafeIdentifier, ...]
+    row_count: int = Field(ge=0)
+    possibly_truncated: bool
+    result_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     validation_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     valid: bool
+
+    @model_validator(mode="after")
+    def _validate_result_link(self) -> SafeValidationRef:
+        if self.valid and self.result_sha256 is None:
+            raise ValueError("valid validation refs require a restored result digest")
+        return self
 
 
 class BudgetScore(_FrozenWireModel):
@@ -763,6 +776,33 @@ class Week3CaseResult(_FrozenWireModel):
             raise ValueError("safe validation refs must be unique")
         if len(self.safe_validation_refs) > execute_count:
             raise ValueError("validation refs cannot exceed execute attempts")
+        completed_execute = tuple(
+            (
+                trace.purpose,
+                trace.contract_id,
+                trace.hypothesis_id,
+                trace.query_id,
+                trace.columns,
+                trace.row_count,
+                trace.possibly_truncated,
+            )
+            for trace in self.safe_tool_trace
+            if trace.tool_name is ActionType.EXECUTE_SQL and trace.outcome == "completed"
+        )
+        validation_links = tuple(
+            (
+                item.purpose,
+                item.contract_id,
+                item.hypothesis_id,
+                item.query_id,
+                item.columns,
+                item.row_count,
+                item.possibly_truncated,
+            )
+            for item in self.safe_validation_refs
+        )
+        if Counter(completed_execute) != Counter(validation_links):
+            raise ValueError("safe validation refs must bind completed Execute traces one-to-one")
         derived_valid_execute_count = sum(item.valid for item in self.safe_validation_refs)
         if self.valid_execute_count != derived_valid_execute_count:
             raise ValueError("valid execute count must match safe validation refs")
@@ -792,6 +832,8 @@ class Week3CaseResult(_FrozenWireModel):
                     for trace in self.safe_tool_trace
                 )
                 == 1
+                and validation.query_id == item.query_id
+                and validation.hypothesis_id == item.hypothesis_id
                 for item in self.evidence_references
             )
             if (
@@ -1059,6 +1101,8 @@ class Week3RunReport(_FrozenWireModel):
             case.resolved_models not in {(), (case.expected_resolved_model,)} for case in self.cases
         ):
             raise ValueError("case model identities must share one expected resolved model")
+        if self.mode == "fixture" and expected_models != {"fixture-agent"}:
+            raise ValueError("fixture cases require the fixture resolved model identity")
         if self.budget_configuration is None:
             if self.report_scope == "canonical":
                 raise ValueError("canonical reports require a budget configuration")

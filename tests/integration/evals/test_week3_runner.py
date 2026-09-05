@@ -138,6 +138,16 @@ async def test_fixture_runner_executes_all_40_cases_on_one_shared_readonly_engin
     assert not by_id["W3K030"].evidence_references
     assert executor.calls_by_case["W3K030"] == 0
     for case_id, case_result in by_id.items():
+        completed_execute_count = sum(
+            trace.tool_name.value == "execute_sql" and trace.outcome == "completed"
+            for trace in case_result.safe_tool_trace
+        )
+        assert len(case_result.safe_validation_refs) == completed_execute_count
+        assert all(
+            validation.result_sha256 is not None
+            for validation in case_result.safe_validation_refs
+            if validation.valid
+        )
         assert executor.calls_by_case[case_id] == sum(
             trace.tool_name.value == "execute_sql" and trace.query_id is not None
             for trace in case_result.safe_tool_trace

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
@@ -50,6 +51,7 @@ from governed_analytics.evals.week3.models import (
     derive_executed_manifest_sha256,
 )
 from governed_analytics.evals.week3.reporting import (
+    Week3PublicationEvidence,
     cancel_week3_report_reservation,
     reserve_week3_report,
     write_week3_report,
@@ -403,6 +405,61 @@ def _safe_tool_refs(result: AgentRunResult) -> tuple[SafeToolTraceRef, ...]:
     return tuple(refs)
 
 
+def _result_digest(result: EvalQueryResult) -> str:
+    encoded = json.dumps(
+        result.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return sha256(encoded).hexdigest()
+
+
+def _safe_validation_refs(result: AgentRunResult) -> tuple[SafeValidationRef, ...]:
+    observation_counts = Counter(item.observation_id for item in result.observations)
+    observations = {
+        item.observation_id: item
+        for item in result.observations
+        if observation_counts[item.observation_id] == 1
+        and item.tool_name is ActionType.EXECUTE_SQL
+        and item.ok
+    }
+    refs: list[SafeValidationRef] = []
+    for validation in result.observation_validations:
+        observation = observations.get(validation.observation_id)
+        if (
+            observation is None
+            or observation.contract_id is None
+            or observation.hypothesis_id is None
+            or observation.query_id is None
+            or observation.row_count is None
+        ):
+            continue
+        restored = restore_query_result(observation)
+        refs.append(
+            SafeValidationRef(
+                observation_id=observation.observation_id,
+                purpose=observation.purpose,
+                contract_id=observation.contract_id,
+                hypothesis_id=observation.hypothesis_id,
+                query_id=observation.query_id,
+                columns=observation.columns,
+                row_count=observation.row_count,
+                possibly_truncated=observation.possibly_truncated,
+                result_sha256=(
+                    None
+                    if restored is None
+                    else _result_digest(
+                        EvalQueryResult(columns=restored.columns, rows=restored.rows)
+                    )
+                ),
+                validation_fingerprint=validation.validation_fingerprint,
+                valid=validation.valid and restored is not None,
+            )
+        )
+    return tuple(refs)
+
+
 def _evidence_refs(
     result: AgentRunResult, required_purposes: tuple[str, ...]
 ) -> tuple[SafeEvidenceRef, ...]:
@@ -545,9 +602,12 @@ def _score_case(
     result: AgentRunResult,
     settings: AgentRuntimeSettings,
     *,
+    expected_results: tuple[EvalQueryResult, ...],
     expected_resolved_model: str,
     error_override: str | None = None,
 ) -> Week3CaseResult:
+    if len(expected_results) != len(case.expected_observations):
+        raise Week3RunError("publication evidence is incomplete")
     behavior = score_behavior(
         expected_action=case.expected_behavior,
         expected_missing_fields=case.expected_missing_fields,
@@ -580,7 +640,7 @@ def _score_case(
         first, final, first_link, final_link = candidate_observations(
             result, purpose=expected_observation.purpose
         )
-        expected = _read_expected(expected_observation.expected_result_path)
+        expected = expected_results[expected_index]
         candidates = [(final, final_link, final_scores)]
         if expected_index == 0:
             candidates.insert(0, (first, first_link, first_scores))
@@ -659,6 +719,7 @@ def _score_case(
         expected_repair_count=case.expected_repair_count,
         hard_cost_cny=limits.hard_cost_cny,
     )
+    validation_refs = _safe_validation_refs(result)
     return Week3CaseResult(
         case_id=case.case_id,
         cohort=case.cohort,
@@ -681,15 +742,7 @@ def _score_case(
         evidence_score=evidence_score,
         budget_score=budget_score,
         safe_tool_trace=_safe_tool_refs(result),
-        safe_validation_refs=tuple(
-            SafeValidationRef(
-                observation_id=item.observation_id,
-                contract_id=item.contract_id,
-                validation_fingerprint=item.validation_fingerprint,
-                valid=item.valid,
-            )
-            for item in result.observation_validations
-        ),
+        safe_validation_refs=validation_refs,
         first_candidate_observation_id=(
             None if result.first_candidate is None else result.first_candidate.observation_id
         ),
@@ -703,7 +756,7 @@ def _score_case(
         repair_succeeded=(
             case.case_id == "W3K027" and suite_score.conformant if case.suite == "repair" else None
         ),
-        valid_execute_count=sum(item.valid for item in result.observation_validations),
+        valid_execute_count=sum(item.valid for item in validation_refs),
         natural_refusal=(
             behavior.conformant and terminal_ok and not result.safe_trace.tool_calls
             if case.expected_behavior != "execute"
@@ -720,6 +773,94 @@ def _pricing_hash(pricing: ModelPricing) -> str:
         sort_keys=True,
     ).encode()
     return sha256(encoded).hexdigest()
+
+
+def _rebuild_report_from_publication_evidence(
+    evidence: Week3PublicationEvidence,
+) -> Week3RunReport:
+    if len(evidence.cases) != len(evidence.outcomes) or len(evidence.cases) != len(
+        evidence.error_types
+    ) or len(evidence.cases) != len(evidence.expected_results):
+        raise Week3RunError("publication evidence is incomplete")
+    frozen_cases_by_id = {item.case_id: item for item in load_week3_cases()}
+    if any(
+        case.case_id not in frozen_cases_by_id
+        or case != frozen_cases_by_id[case.case_id]
+        or evidence.mode not in frozen_cases_by_id[case.case_id].modes
+        for case in evidence.cases
+    ):
+        raise Week3RunError("publication evidence does not match the frozen registry")
+    scored_items: list[Week3CaseResult] = []
+    for case, outcome, error_type, expected_results in zip(
+        evidence.cases,
+        evidence.outcomes,
+        evidence.error_types,
+        evidence.expected_results,
+        strict=True,
+    ):
+        try:
+            scored_case = _score_case(
+                case,
+                outcome,
+                evidence.settings,
+                expected_results=expected_results,
+                expected_resolved_model=evidence.pricing.resolved_model,
+                error_override=error_type,
+            )
+        except Exception:
+            scored_case = _score_case(
+                case,
+                _safe_failure(case_id=case.case_id, reason=StopReason.INTERNAL_ERROR),
+                evidence.settings,
+                expected_results=expected_results,
+                expected_resolved_model=evidence.pricing.resolved_model,
+                error_override="scoring_contract_failure",
+            )
+        scored_items.append(scored_case)
+    resolved = tuple(
+        dict.fromkeys(
+            model
+            for scored_case in scored_items
+            for model in scored_case.resolved_models
+        )
+    )
+    limits = BudgetLimits.from_settings(evidence.settings)
+    overall_manifest = week3_manifest_sha256()
+    case_ids = tuple(case.case_id for case in evidence.cases)
+    canonical_ids = tuple(
+        case.case_id for case in load_week3_cases() if evidence.mode in case.modes
+    )
+    return Week3RunReport(
+        mode=evidence.mode,
+        overall_manifest_sha256=overall_manifest,
+        known_cohort_sha256=week3_cohort_sha256("known"),
+        heldout_cohort_sha256=week3_cohort_sha256("heldout"),
+        executed_manifest_sha256=derive_executed_manifest_sha256(
+            overall_manifest_sha256=overall_manifest,
+            mode=evidence.mode,
+            case_ids=case_ids,
+        ),
+        report_scope="canonical" if case_ids == canonical_ids else "partial_test",
+        run_id=evidence.run_id,
+        generated_at_utc=evidence.generated_at_utc,
+        requested_model=evidence.pricing.requested_model,
+        resolved_models=resolved,
+        pricing_effective_date=evidence.pricing.effective_date,
+        pricing_snapshot_sha256=_pricing_hash(evidence.pricing),
+        budget_configuration=BudgetConfiguration(
+            max_action_loops=limits.max_action_loops,
+            max_llm_calls=limits.max_llm_calls,
+            max_tool_calls=limits.max_tool_calls,
+            max_execute_calls=limits.max_execute_calls,
+            max_profile_calls=limits.max_profile_calls,
+            max_repairs=limits.max_repairs,
+            max_concurrent_runs=evidence.settings.max_concurrent_runs,
+            timeout_seconds=limits.timeout_seconds,
+            soft_cost_cny=limits.soft_cost_cny,
+            hard_cost_cny=limits.hard_cost_cny,
+        ),
+        cases=tuple(scored_items),
+    )
 
 
 async def run_week3_evaluation(
@@ -750,6 +891,14 @@ async def run_week3_evaluation(
     )
     settings = getattr(executor, "settings", AgentRuntimeSettings.model_validate({}))
     try:
+        expected_results = tuple(
+            tuple(
+                _read_expected(item.expected_result_path)
+                for item in case.expected_observations
+            )
+            for case in active
+        )
+        effective_pricing = _fixture_pricing() if mode == "fixture" else cast(ModelPricing, pricing)
         outcomes: list[tuple[AgentRunResult, str | None]] = []
         for case in active:
             error_type: str | None
@@ -767,71 +916,23 @@ async def run_week3_evaluation(
                 else:
                     error_type = None
             outcomes.append((outcome, error_type))
-        effective_pricing = _fixture_pricing() if mode == "fixture" else cast(ModelPricing, pricing)
-        scored_items: list[Week3CaseResult] = []
-        for case, (outcome, error_type) in zip(active, outcomes, strict=True):
-            try:
-                scored_case = _score_case(
-                    case,
-                    outcome,
-                    settings,
-                    expected_resolved_model=effective_pricing.resolved_model,
-                    error_override=error_type,
-                )
-            except Exception:
-                scored_case = _score_case(
-                    case,
-                    _safe_failure(case_id=case.case_id, reason=StopReason.INTERNAL_ERROR),
-                    settings,
-                    expected_resolved_model=effective_pricing.resolved_model,
-                    error_override="scoring_contract_failure",
-                )
-            scored_items.append(scored_case)
-        scored = tuple(scored_items)
-        resolved = tuple(
-            dict.fromkeys(
-                trace.provider_model
-                for outcome, _error_type in outcomes
-                for trace in outcome.safe_trace.model_calls
-            )
-        )
-        requested = effective_pricing.requested_model
-        limits = BudgetLimits.from_settings(settings)
-        overall_manifest = week3_manifest_sha256()
-        case_ids = tuple(case.case_id for case in active)
-        canonical_ids = tuple(case.case_id for case in load_week3_cases() if mode in case.modes)
-        report = Week3RunReport(
+        publication_evidence = Week3PublicationEvidence(
             mode=mode,
-            overall_manifest_sha256=overall_manifest,
-            known_cohort_sha256=week3_cohort_sha256("known"),
-            heldout_cohort_sha256=week3_cohort_sha256("heldout"),
-            executed_manifest_sha256=derive_executed_manifest_sha256(
-                overall_manifest_sha256=overall_manifest,
-                mode=mode,
-                case_ids=case_ids,
-            ),
-            report_scope="canonical" if case_ids == canonical_ids else "partial_test",
-            run_id=effective_run_id,
+            cases=active,
+            outcomes=tuple(outcome for outcome, _error_type in outcomes),
+            error_types=tuple(error_type for _outcome, error_type in outcomes),
+            expected_results=expected_results,
+            settings=settings,
+            pricing=effective_pricing,
             generated_at_utc=generated,
-            requested_model=requested,
-            resolved_models=resolved,
-            pricing_effective_date=effective_pricing.effective_date,
-            pricing_snapshot_sha256=_pricing_hash(effective_pricing),
-            budget_configuration=BudgetConfiguration(
-                max_action_loops=limits.max_action_loops,
-                max_llm_calls=limits.max_llm_calls,
-                max_tool_calls=limits.max_tool_calls,
-                max_execute_calls=limits.max_execute_calls,
-                max_profile_calls=limits.max_profile_calls,
-                max_repairs=limits.max_repairs,
-                max_concurrent_runs=settings.max_concurrent_runs,
-                timeout_seconds=limits.timeout_seconds,
-                soft_cost_cny=limits.soft_cost_cny,
-                hard_cost_cny=limits.hard_cost_cny,
-            ),
-            cases=scored,
+            run_id=effective_run_id,
         )
-        published = write_week3_report(reservation, report)
+        report = _rebuild_report_from_publication_evidence(publication_evidence)
+        published = write_week3_report(
+            reservation,
+            report,
+            publication_evidence=publication_evidence,
+        )
         return Week3RunArtifact(
             report=report,
             report_dir=published.report_dir,

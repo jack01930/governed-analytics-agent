@@ -17,6 +17,7 @@ from governed_analytics.agent.contracts import (
     StopReason,
     ToolCallTrace,
 )
+from governed_analytics.evals.week3 import runner
 from governed_analytics.evals.week3.runner import _suite_score, run_week3_evaluation
 from governed_analytics.evals.week3.suites import load_week3_cases
 
@@ -156,6 +157,90 @@ async def test_runner_rejects_known_result_replayed_for_heldout_case(tmp_path: P
 
     assert artifact.report.cases[0].error_type == "case_identity_mismatch"
     assert not artifact.report.cases[0].passed
+
+
+@pytest.mark.asyncio
+async def test_runner_freezes_expected_results_before_invoking_any_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    class SpyExecutor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            nonlocal called
+            del case_id, question
+            called = True
+            raise AssertionError("executor must not run")
+
+    def unavailable_expected(_path: Path) -> object:
+        raise RuntimeError("private expected diagnostic")
+
+    monkeypatch.setattr(runner, "_read_expected", unavailable_expected)
+    with pytest.raises(RuntimeError, match="private expected diagnostic"):
+        await run_week3_evaluation(
+            mode="fixture",
+            executor=SpyExecutor(),
+            cases=(load_week3_cases()[10],),
+            output_root=tmp_path,
+            run_id="expected-freeze",
+            now=lambda: datetime(2026, 9, 4, tzinfo=UTC),
+        )
+
+    assert not called
+    assert not tuple((tmp_path / "fixture").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_missing_validation_becomes_explicit_case_failure_not_run_failure(
+    tmp_path: Path,
+) -> None:
+    case = load_week3_cases()[10]
+
+    class MissingValidationExecutor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            del question
+            trace = (
+                ToolCallTrace(
+                    tool_name=ActionType.METRIC_LOOKUP,
+                    purpose="metric_lookup",
+                    safe_arguments=(),
+                ),
+                ToolCallTrace(
+                    tool_name=ActionType.SCHEMA_LOOKUP,
+                    purpose="schema_lookup",
+                    safe_arguments=(),
+                ),
+                ToolCallTrace(
+                    tool_name=ActionType.EXECUTE_SQL,
+                    purpose="metric_value_contract",
+                    safe_arguments=(
+                        ("contract_id", "metric_value_contract"),
+                        ("hypothesis_id", "metric_value"),
+                    ),
+                    query_id="a" * 64,
+                    columns=("gmv",),
+                    row_count=1,
+                ),
+            )
+            return _failure(case_id).model_copy(
+                update={
+                    "governance": GovernanceSnapshot(tool_calls=3, execute_calls=1),
+                    "safe_trace": SafeTrace(tool_calls=trace),
+                }
+            )
+
+    artifact = await run_week3_evaluation(
+        mode="fixture",
+        executor=MissingValidationExecutor(),
+        cases=(case,),
+        output_root=tmp_path,
+        run_id="missing-validation",
+        now=lambda: datetime(2026, 9, 4, tzinfo=UTC),
+    )
+
+    assert artifact.report_json.is_file()
+    assert artifact.report.cases[0].error_type == "scoring_contract_failure"
+    assert artifact.report.cases[0].valid_execute_count == 0
 
 
 @pytest.mark.parametrize(
