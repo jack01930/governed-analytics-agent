@@ -118,13 +118,21 @@ def _open_pointer_parent(path: Path) -> _PointerParent:
     if not name or name in {".", ".."}:
         raise OSError("atomic evaluation pointer unavailable")
     directory_fd = _open_directory_nofollow(absolute.parent, create_missing=True)
-    status = os.fstat(directory_fd)
-    return _PointerParent(
-        directory_fd=directory_fd,
-        target_name=name,
-        requested_parent=absolute.parent,
-        identity=(status.st_dev, status.st_ino),
-    )
+    owns_directory_fd = True
+    try:
+        status = os.fstat(directory_fd)
+        parent = _PointerParent(
+            directory_fd=directory_fd,
+            target_name=name,
+            requested_parent=absolute.parent,
+            identity=(status.st_dev, status.st_ino),
+        )
+        owns_directory_fd = False
+        return parent
+    finally:
+        if owns_directory_fd:
+            with suppress(OSError):
+                os.close(directory_fd)
 
 
 def _verify_pointer_parent(parent: _PointerParent) -> None:
@@ -268,6 +276,34 @@ def _verify_bound_identity(
         raise OSError("atomic evaluation pointer unavailable")
 
 
+def _unlink_owned_open_temporary(
+    directory_fd: int,
+    name: str,
+    *,
+    held_fd: int,
+    expected_identity: tuple[int, int] | None,
+) -> bool:
+    """Best-effort removal while the newly created inode is still held open."""
+    try:
+        held = os.fstat(held_fd)
+        held_identity = (held.st_dev, held.st_ino)
+        if (
+            not stat.S_ISREG(held.st_mode)
+            or (expected_identity is not None and held_identity != expected_identity)
+        ):
+            return False
+        adjacent = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(adjacent.st_mode) or (
+            adjacent.st_dev,
+            adjacent.st_ino,
+        ) != held_identity:
+            return False
+        os.unlink(name, dir_fd=directory_fd)
+        return True
+    except OSError:
+        return False
+
+
 def _pointer_matches(
     parent: _PointerParent,
     identity: tuple[int, int, int] | None,
@@ -335,14 +371,32 @@ def _atomic_write_text_locked(
             0o600,
             dir_fd=directory_fd,
         )
-        status = os.fstat(temporary_fd)
-        temporary_identity = (status.st_dev, status.st_ino)
-        with os.fdopen(temporary_fd, "w", encoding="utf-8", newline="") as stream:
-            stream.write(contents)
-            stream.flush()
-            os.fsync(stream.fileno())
-            status = os.fstat(stream.fileno())
-            staged_identity = (status.st_dev, status.st_ino, status.st_size)
+        owns_temporary_fd = True
+        try:
+            try:
+                status = os.fstat(temporary_fd)
+                temporary_identity = (status.st_dev, status.st_ino)
+                stream = os.fdopen(temporary_fd, "w", encoding="utf-8", newline="")
+            except BaseException:
+                if _unlink_owned_open_temporary(
+                    directory_fd,
+                    temporary_name,
+                    held_fd=temporary_fd,
+                    expected_identity=temporary_identity,
+                ):
+                    temporary_name = None
+                raise
+            owns_temporary_fd = False
+            with stream:
+                stream.write(contents)
+                stream.flush()
+                os.fsync(stream.fileno())
+                status = os.fstat(stream.fileno())
+                staged_identity = (status.st_dev, status.st_ino, status.st_size)
+        finally:
+            if owns_temporary_fd:
+                with suppress(OSError):
+                    os.close(temporary_fd)
         _verify_pointer_parent(parent)
         if publication_guard is not None:
             publication_guard()

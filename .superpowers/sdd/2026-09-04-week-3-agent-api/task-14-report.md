@@ -619,3 +619,42 @@ Success: no issues found in 158 source files
 ```
 
 本轮未重跑 DB/eval，未访问 network/live/API，未修改 production API/SSE 或 ledger。
+
+## Phase B Fix round 4
+
+### 问题与修复
+
+- atomic pointer staging 在 `os.open()` 成功后、首次 `fstat()` 或 `os.fdopen()` 失败时，原实现尚未建立可供
+  finally 使用的 inode identity，raw FD 与随机临时文件可能遗留。
+- `_open_pointer_parent()` 从 directory walker 接管 FD 后，首次 parent `fstat()` 失败时原实现没有关闭该 FD。
+- parent FD 现在以显式 raw ownership 包裹：只有 `_PointerParent` 构造成功才转移所有权；此前任一异常均只尝试
+  一次 `close`。
+- staging FD 在 `os.open()` 后立即进入 raw ownership `try/finally`。首次 `fstat` 或 `fdopen` 失败时，仍用
+  held FD 尽力重新取得 inode identity，并紧邻核对同一 parent FD 下的 regular leaf 后删除；目录项已被换成
+  foreign inode 时不会删除。成功交给 `fdopen` 后才解除 raw ownership，避免重复关闭同一 FD 号。
+- 若 `fstat` 持续失败，无法安全证明目录项仍属于 held inode，因此保守留下不可预测名称的 owned temp；命令仍
+  返回固定 `atomic evaluation pointer unavailable`，raw FD 已关闭。该残留优于在身份未知时误删替换文件。
+
+### 定向回归
+
+新增 5 个确定性用例，覆盖首次 `fstat` 失败后安全清理、持续 `fstat` 失败的保守残留与 FD 关闭、首次
+`fstat` seam 的 foreign replacement 保留、`fdopen` 失败清理，以及 parent `fstat` 失败关闭 returned directory
+FD：
+
+```text
+uv run pytest tests/unit/evals/week3/test_cli.py tests/unit/evals/test_week2_cli.py tests/unit/test_makefile.py tests/unit/test_ci_workflow.py -q
+68 passed in 1.39s
+
+uv run ruff check src/governed_analytics/evals/cli.py tests/unit/evals/test_week2_cli.py
+All checks passed!
+
+uv run mypy src/governed_analytics/evals/cli.py tests/unit/evals/test_week2_cli.py
+Success: no issues found in 2 source files
+
+make check
+All checks passed!
+Success: no issues found in 158 source files
+1667 passed in 42.32s
+```
+
+本轮未运行 DB eval、network/live/API，未修改 production API/SSE、progress 或 ledger。

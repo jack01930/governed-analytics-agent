@@ -484,3 +484,171 @@ def test_atomic_pointer_cleans_owned_partial_temp_by_inode(
         cli._atomic_write_text(tmp_path / "pointer.txt", "partial-owned")
 
     assert not temporary.exists()
+
+
+def test_atomic_pointer_cleans_temp_when_initial_fstat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "uuid4", lambda: SimpleNamespace(hex="initial-fstat"))
+    temporary = tmp_path / ".eval-pointer-initial-fstat.tmp"
+    original_open = os.open
+    original_fstat = os.fstat
+    temporary_fds: list[int] = []
+    failures = 0
+
+    def track_open(path: object, *args: object, **kwargs: object) -> int:
+        fd = original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        if path == temporary.name:
+            temporary_fds.append(fd)
+        return fd
+
+    def fail_initial_fstat(fd: int) -> os.stat_result:
+        nonlocal failures
+        if temporary_fds and fd == temporary_fds[0] and failures == 0:
+            failures += 1
+            raise OSError("initial temp fstat failure")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(os, "fstat", fail_initial_fstat)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(tmp_path / "pointer.txt", "owned")
+
+    assert failures == 1
+    assert not temporary.exists()
+    with pytest.raises(OSError):
+        original_fstat(temporary_fds[0])
+
+
+def test_atomic_pointer_persistent_initial_fstat_failure_closes_raw_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "uuid4", lambda: SimpleNamespace(hex="persistent-fstat"))
+    temporary = tmp_path / ".eval-pointer-persistent-fstat.tmp"
+    original_open = os.open
+    original_fstat = os.fstat
+    temporary_fds: list[int] = []
+
+    def track_open(path: object, *args: object, **kwargs: object) -> int:
+        fd = original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        if path == temporary.name:
+            temporary_fds.append(fd)
+        return fd
+
+    def fail_temp_fstat(fd: int) -> os.stat_result:
+        if temporary_fds and fd == temporary_fds[0]:
+            raise OSError("persistent temp fstat failure")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(os, "fstat", fail_temp_fstat)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(tmp_path / "pointer.txt", "owned")
+
+    assert temporary.is_file()
+    with pytest.raises(OSError):
+        original_fstat(temporary_fds[0])
+
+
+def test_atomic_pointer_initial_fstat_failure_preserves_foreign_temp_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "uuid4", lambda: SimpleNamespace(hex="foreign-fstat"))
+    temporary = tmp_path / ".eval-pointer-foreign-fstat.tmp"
+    original_open = os.open
+    original_fstat = os.fstat
+    temporary_fds: list[int] = []
+    injected = False
+
+    def track_open(path: object, *args: object, **kwargs: object) -> int:
+        fd = original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        if path == temporary.name:
+            temporary_fds.append(fd)
+        return fd
+
+    def replace_before_failed_fstat(fd: int) -> os.stat_result:
+        nonlocal injected
+        if temporary_fds and fd == temporary_fds[0] and not injected:
+            injected = True
+            temporary.unlink()
+            temporary.write_text("foreign", encoding="utf-8")
+            raise OSError("initial temp fstat failure")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(os, "fstat", replace_before_failed_fstat)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(tmp_path / "pointer.txt", "owned")
+
+    assert injected
+    assert temporary.read_text(encoding="utf-8") == "foreign"
+    with pytest.raises(OSError):
+        original_fstat(temporary_fds[0])
+
+
+def test_atomic_pointer_fdopen_failure_closes_and_unlinks_owned_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "uuid4", lambda: SimpleNamespace(hex="fdopen"))
+    temporary = tmp_path / ".eval-pointer-fdopen.tmp"
+    original_open = os.open
+    original_fstat = os.fstat
+    original_fdopen = os.fdopen
+    temporary_fds: list[int] = []
+
+    def track_open(path: object, *args: object, **kwargs: object) -> int:
+        fd = original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        if path == temporary.name:
+            temporary_fds.append(fd)
+        return fd
+
+    def fail_temp_fdopen(fd: int, *args: object, **kwargs: object) -> object:
+        if temporary_fds and fd == temporary_fds[0]:
+            raise OSError("temp fdopen failure")
+        return original_fdopen(fd, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(os, "fdopen", fail_temp_fdopen)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(tmp_path / "pointer.txt", "owned")
+
+    assert not temporary.exists()
+    with pytest.raises(OSError):
+        original_fstat(temporary_fds[0])
+
+
+def test_atomic_pointer_parent_fstat_failure_closes_returned_directory_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_open_directory = cli._open_directory_nofollow
+    original_fstat = os.fstat
+    parent_fds: list[int] = []
+
+    def track_parent(path: Path, *, create_missing: bool) -> int:
+        fd = original_open_directory(path, create_missing=create_missing)
+        if create_missing and not parent_fds:
+            parent_fds.append(fd)
+        return fd
+
+    def fail_parent_fstat(fd: int) -> os.stat_result:
+        if parent_fds and fd == parent_fds[0]:
+            raise OSError("parent fstat failure")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(cli, "_open_directory_nofollow", track_parent)
+    monkeypatch.setattr(os, "fstat", fail_parent_fstat)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(tmp_path / "pointer.txt", "owned")
+
+    with pytest.raises(OSError):
+        original_fstat(parent_fds[0])
