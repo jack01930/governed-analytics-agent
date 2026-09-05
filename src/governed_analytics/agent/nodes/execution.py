@@ -351,7 +351,10 @@ async def route_action(
                 "definitions, including default_filters and the plan time windows. "
                 "Set purpose to contract_id; copy the supplied hypothesis_id and contract_id. "
                 "Return explicit columns with the contract aliases/order and limit. "
-                "Follow execute_arguments_schema and use :named parameters for dates."
+                "Follow execute_arguments_schema. Every :named parameter must be directly CAST "
+                "to a supported SQL type: for dates use CAST(:start_at AS timestamptz) and "
+                "CAST(:end_at AS timestamptz), with ISO strings in arguments.parameters. "
+                "Bare :named placeholders and CAST to date are rejected by the SQL policy."
             ),
             user_payload=_action_prompt(state, pending),
             output_type=AnalysisAction,
