@@ -501,6 +501,86 @@ def test_week3_report_swap_immediately_after_pointer_replace_is_rolled_back(
     assert not pointer.exists()
 
 
+def test_week3_report_swap_during_final_parent_fsync_rolls_back_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report_path = tmp_path / "run" / "report.json"
+    report_path.parent.mkdir()
+    report_path.write_text("{}", encoding="utf-8")
+    artifact = _artifact(report_path)
+    monkeypatch.setattr(week3_cli, "_run_week3", lambda **_kwargs: artifact)
+    monkeypatch.setattr(
+        Week3RunReport,
+        "model_validate",
+        lambda *_args, **_kwargs: artifact.report,
+    )
+    pointer = tmp_path / "pointer.txt"
+    original_fsync = os.fsync
+    calls = 0
+
+    def fsync_then_swap_source(fd: int) -> None:
+        nonlocal calls
+        original_fsync(fd)
+        calls += 1
+        if calls == 2:
+            report_path.unlink()
+            report_path.write_text("foreign", encoding="utf-8")
+
+    monkeypatch.setattr(os, "fsync", fsync_then_swap_source)
+
+    assert cli.main(
+        [
+            "week3",
+            "--dataset",
+            "tiny",
+            "--mode",
+            "fixture",
+            "--report-path-file",
+            str(pointer),
+        ]
+    ) == 2
+    assert capsys.readouterr().err.strip() == "Week 3 report pointer publication failed"
+    assert report_path.read_text(encoding="utf-8") == "foreign"
+    assert not pointer.exists()
+
+
+def test_week3_report_leaf_swap_after_held_read_is_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = tmp_path / "run" / "report.json"
+    report_path.parent.mkdir()
+    report_path.write_text("{}", encoding="utf-8")
+    artifact = _artifact(report_path)
+    monkeypatch.setattr(
+        Week3RunReport,
+        "model_validate",
+        lambda *_args, **_kwargs: artifact.report,
+    )
+    original_read = os.read
+    reads = 0
+
+    def read_then_swap_leaf(fd: int, size: int) -> bytes:
+        nonlocal reads
+        chunk = original_read(fd, size)
+        if chunk == b"{}":
+            reads += 1
+            if reads == 2:
+                report_path.unlink()
+                report_path.write_text("foreign", encoding="utf-8")
+        return chunk
+
+    monkeypatch.setattr(os, "read", read_then_swap_leaf)
+
+    with pytest.raises(Week3RunError, match="Week 3 report artifact is unavailable"):
+        week3_cli._open_validated_report(artifact, mode="fixture")
+
+    assert reads == 2
+    assert report_path.read_text(encoding="utf-8") == "foreign"
+
+
 def test_week3_success_is_not_relabelled_failed_by_resource_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

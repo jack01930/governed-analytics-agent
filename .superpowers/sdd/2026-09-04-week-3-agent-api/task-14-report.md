@@ -516,3 +516,57 @@ Success: no issues found in 158 source files
 ```
 
 本轮按要求未重跑数据库/eval 门禁，未访问 network/live/API，未修改 production API/SSE 或 ledger。
+
+## Phase B Fix round 2
+
+### RED / mutation
+
+在上一轮实现上新增 held-read 后 leaf 换位、parent fsync 时 report 换位、rollback read/unlink 换位，
+以及 `symlink/../pointer` 词法路径回归：
+
+```text
+uv run pytest tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py -q
+3 failed, 40 passed in 1.12s
+
+uv run pytest tests/unit/evals/test_week2_cli.py -q -k 'rollback_rechecks'
+1 failed, 16 deselected in 1.20s
+```
+
+前三项失败分别证明旧实现会预先折叠 `..`、在 pointer parent fsync 后缺少最终 report guard、以及
+`_ValidatedReport.verify` 读取 held FD 后未再次核对 leaf。单独 rollback mutation 进一步复现：校验函数返回后、
+unlink 前换入 foreign inode 时，旧实现会误删 foreign 文件。
+
+### 修复
+
+- 新增单一 handle-bound regular-file verifier：通过 parent `dir_fd` + `O_NOFOLLOW` 打开 leaf，执行
+  `fstat before → held-FD read → fstat after → nofollow dir-entry stat`，核对 regular type、dev/ino/size、
+  expected bytes，并在返回前再次核对 held FD 与 leaf directory entry。
+- pointer 发布后的 content/identity 检查、replace wrapper 模糊状态检查和 rollback 均复用该 primitive；
+  rollback 的最终相邻 leaf identity 检查与 unlink 留在 primitive 内，只保留已接受的 native syscall 边界，
+  foreign replacement 会保留。
+- `_ValidatedReport` 初次读取和每次 publication guard 都复用同一 verifier；每次 held read 后再次验证
+  report leaf 与 report parent path/FD identity。atomic pointer 在自身最终 held-FD/dir-entry 验证后、返回前
+  再调用一次 publication guard，因此 parent fsync seam 的源换位会失败并撤回 owned pointer。
+- 路径构造改为保留用户提供的词法组件，walker 实际逐项打开 `..` 之前的目录。`safe/link/../pointer`
+  会在 symlink 处被 `O_NOFOLLOW` 拒绝；真实 `sub/../pointer` 最终打开同一目录 inode，因此 alias lock 仍串行。
+- 上一轮 cleanup/cancellation、fixture/live gate、exact artifact 与 CI/Make 断言继续通过；本轮未改变资源所有权语义。
+
+### GREEN / verification
+
+```text
+uv run pytest tests/unit/evals/week3/test_cli.py tests/unit/evals/test_week2_cli.py tests/unit/test_makefile.py tests/unit/test_ci_workflow.py -q
+57 passed in 0.95s
+
+uv run ruff check src/governed_analytics/evals/cli.py src/governed_analytics/evals/week3/cli.py tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py
+All checks passed!
+
+uv run mypy src/governed_analytics/evals/cli.py src/governed_analytics/evals/week3/cli.py tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py
+Success: no issues found in 4 source files
+
+make check
+All checks passed!
+Success: no issues found in 158 source files
+1656 passed in 42.42s
+```
+
+本轮按 controller 要求未重跑 DB/eval，未访问 network/live/API，未修改 production API/SSE 或 ledger。

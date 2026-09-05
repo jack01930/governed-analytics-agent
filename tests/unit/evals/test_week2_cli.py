@@ -232,6 +232,7 @@ def test_atomic_pointer_aliases_share_one_thread_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "pointer.txt"
+    (tmp_path / "unused").mkdir()
     alias = tmp_path / "unused" / ".." / "pointer.txt"
     first_entered = threading.Event()
     release_first = threading.Event()
@@ -287,6 +288,7 @@ def test_atomic_pointer_alias_writers_remain_complete_across_repeated_runs(
     tmp_path: Path,
 ) -> None:
     target = tmp_path / "pointer.txt"
+    (tmp_path / "spare").mkdir()
     alias = tmp_path / "spare" / ".." / "pointer.txt"
     values = ("A" * 4096, "B" * 4096)
 
@@ -299,3 +301,81 @@ def test_atomic_pointer_alias_writers_remain_complete_across_repeated_runs(
             for future in futures:
                 future.result(timeout=5)
         assert target.read_text(encoding="utf-8") in values
+
+
+def test_atomic_pointer_rejects_symlink_before_dotdot_component(tmp_path: Path) -> None:
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    linked = safe / "linked"
+    linked.symlink_to(tmp_path, target_is_directory=True)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(linked / ".." / "pointer.txt", "unsafe")
+
+    assert not (safe / "pointer.txt").exists()
+    assert not (tmp_path / "pointer.txt").exists()
+
+
+def test_atomic_pointer_preserves_foreign_leaf_swapped_after_bound_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "pointer.txt"
+    original_read = os.read
+    injected = False
+
+    def read_then_swap(fd: int, size: int) -> bytes:
+        nonlocal injected
+        chunk = original_read(fd, size)
+        if chunk == b"owned" and not injected:
+            injected = True
+            target.unlink()
+            target.write_text("foreign", encoding="utf-8")
+        return chunk
+
+    monkeypatch.setattr(os, "read", read_then_swap)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(target, "owned")
+
+    assert injected
+    assert target.read_text(encoding="utf-8") == "foreign"
+
+
+def test_atomic_pointer_rollback_rechecks_leaf_next_to_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "pointer.txt"
+    original_read = os.read
+    owned_reads = 0
+    guard_calls = 0
+
+    def read_then_swap_during_rollback(fd: int, size: int) -> bytes:
+        nonlocal owned_reads
+        chunk = original_read(fd, size)
+        if chunk == b"owned":
+            owned_reads += 1
+            if owned_reads == 2:
+                target.unlink()
+                target.write_text("foreign", encoding="utf-8")
+        return chunk
+
+    def fail_postpublication_guard() -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls == 2:
+            raise OSError("source changed")
+
+    monkeypatch.setattr(os, "read", read_then_swap_during_rollback)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(
+            target,
+            "owned",
+            publication_guard=fail_postpublication_guard,
+        )
+
+    assert guard_calls == 2
+    assert owned_reads == 2
+    assert target.read_text(encoding="utf-8") == "foreign"

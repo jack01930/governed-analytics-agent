@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import stat
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from governed_analytics.agent.ports import AgentTools
 from governed_analytics.agent.tool_registry import ToolRegistry
 from governed_analytics.config import AgentRuntimeSettings, DatabaseSettings, ModelSettings
-from governed_analytics.evals.cli import _atomic_write_text, _open_directory_nofollow
+from governed_analytics.evals.cli import (
+    _atomic_write_text,
+    _lexical_absolute,
+    _open_directory_nofollow,
+    _verify_bound_regular_file,
+)
 from governed_analytics.evals.pricing import ModelPricing, load_model_pricing
 from governed_analytics.evals.week3.models import Week3RunReport
 from governed_analytics.evals.week3.runner import (
@@ -144,14 +148,6 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
-def _fd_bytes(file_fd: int) -> bytes:
-    os.lseek(file_fd, 0, os.SEEK_SET)
-    chunks: list[bytes] = []
-    while chunk := os.read(file_fd, 8192):
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
 @dataclass
 class _ValidatedReport:
     report_path: Path
@@ -162,31 +158,29 @@ class _ValidatedReport:
     file_identity: tuple[int, int, int]
     expected_bytes: bytes
 
+    def _verify_parent(self) -> None:
+        directory_status = os.fstat(self.directory_fd)
+        if (directory_status.st_dev, directory_status.st_ino) != self.directory_identity:
+            raise OSError
+        path_fd = _open_directory_nofollow(self.report_dir, create_missing=False)
+        try:
+            path_status = os.fstat(path_fd)
+            if (path_status.st_dev, path_status.st_ino) != self.directory_identity:
+                raise OSError
+        finally:
+            os.close(path_fd)
+
     def verify(self) -> None:
         try:
-            directory_status = os.fstat(self.directory_fd)
-            if (directory_status.st_dev, directory_status.st_ino) != self.directory_identity:
-                raise OSError
-            path_fd = _open_directory_nofollow(self.report_dir, create_missing=False)
-            try:
-                path_status = os.fstat(path_fd)
-                if (path_status.st_dev, path_status.st_ino) != self.directory_identity:
-                    raise OSError
-            finally:
-                os.close(path_fd)
-            held_before = os.fstat(self.file_fd)
-            held_identity = (held_before.st_dev, held_before.st_ino, held_before.st_size)
-            if not stat.S_ISREG(held_before.st_mode) or held_identity != self.file_identity:
-                raise OSError
-            leaf_status = os.stat("report.json", dir_fd=self.directory_fd, follow_symlinks=False)
-            leaf_identity = (leaf_status.st_dev, leaf_status.st_ino, leaf_status.st_size)
-            if not stat.S_ISREG(leaf_status.st_mode) or leaf_identity != self.file_identity:
-                raise OSError
-            if _fd_bytes(self.file_fd) != self.expected_bytes:
-                raise OSError
-            held_after = os.fstat(self.file_fd)
-            if (held_after.st_dev, held_after.st_ino, held_after.st_size) != self.file_identity:
-                raise OSError
+            self._verify_parent()
+            _verify_bound_regular_file(
+                self.directory_fd,
+                "report.json",
+                expected_identity=self.file_identity,
+                expected_bytes=self.expected_bytes,
+                held_fd=self.file_fd,
+            )
+            self._verify_parent()
         except OSError:
             raise OSError("Week 3 report artifact is unavailable") from None
 
@@ -215,8 +209,8 @@ def _open_validated_report(
         )
         if report.mode != mode or report.report_scope != "canonical":
             raise ValueError
-        report_dir = Path(os.path.abspath(os.fspath(artifact.report_dir)))
-        report_json = Path(os.path.abspath(os.fspath(artifact.report_json)))
+        report_dir = _lexical_absolute(artifact.report_dir)
+        report_json = _lexical_absolute(artifact.report_json)
         if report_json.name != "report.json" or report_json.parent != report_dir:
             raise ValueError
         directory_fd = _open_directory_nofollow(report_dir, create_missing=False)
@@ -226,14 +220,11 @@ def _open_validated_report(
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
             dir_fd=directory_fd,
         )
-        before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError
-        stored_bytes = _fd_bytes(file_fd)
-        after = os.fstat(file_fd)
-        file_identity = (before.st_dev, before.st_ino, before.st_size)
-        if file_identity != (after.st_dev, after.st_ino, after.st_size):
-            raise ValueError
+        file_identity, stored_bytes = _verify_bound_regular_file(
+            directory_fd,
+            "report.json",
+            held_fd=file_fd,
+        )
         stored = json.loads(
             stored_bytes.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
@@ -242,7 +233,8 @@ def _open_validated_report(
         if stored != report.model_dump(mode="json"):
             raise ValueError
         validated = _ValidatedReport(
-            report_path=report_json,
+            # Normalize only after descriptor traversal has rejected symlink components.
+            report_path=Path(os.path.abspath(os.fspath(report_json))),
             report_dir=report_dir,
             directory_fd=directory_fd,
             file_fd=file_fd,
