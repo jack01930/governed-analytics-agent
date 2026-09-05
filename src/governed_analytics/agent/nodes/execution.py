@@ -55,15 +55,27 @@ _SQL_GENERATION_RULES = (
     "Return explicit columns with the contract aliases/order and limit. "
     "Honor validation_contract: column types/nullability, unique keys and exact ORDER BY "
     "including tie-breaks and NULL placement. "
+    "Follow attribution_sql_rules when supplied. "
+    "Follow execute_arguments_schema. Every :named parameter must be directly CAST "
+    "to a supported SQL type: for dates use CAST(:start_at AS timestamptz) and "
+    "CAST(:end_at AS timestamptz), with ISO strings in arguments.parameters. "
+    "Bare :named placeholders and CAST to date are rejected by the SQL policy."
+)
+
+_SQL_ATTRIBUTION_RULES = (
     "For GMV attribution, compute each group's previous_gmv and current_gmv separately "
     "within the corresponding plan windows, including the metric's status filters. "
     "gmv_loss = previous_gmv - current_gmv, never a single-window sum. "
     "delta = current_gmv - previous_gmv; change_rate = delta / NULLIF(previous_gmv, 0). "
     "Include groups present in either window, using zero for an absent side. "
-    "Follow execute_arguments_schema. Every :named parameter must be directly CAST "
-    "to a supported SQL type: for dates use CAST(:start_at AS timestamptz) and "
-    "CAST(:end_at AS timestamptz), with ISO strings in arguments.parameters. "
-    "Bare :named placeholders and CAST to date are rejected by the SQL policy."
+    "Use attribution_windows for the exact previous/current bounds. Aggregate both periods "
+    "in ONE pass over orders joined to order_items: "
+    "COALESCE(SUM(CASE WHEN ordered_at >= previous_start AND ordered_at < previous_end "
+    "THEN net_amount ELSE 0 END), 0) AS previous_gmv, and the same expression with current "
+    "bounds AS current_gmv. Qualify columns and CAST bound parameters as required below. "
+    "For dimension contributions, GROUP BY the dimension in that aggregation, then compute "
+    "the difference and sort/limit in an outer SELECT. Do not join raw period rows together "
+    "or apply only one period's WHERE filter to both aggregates. "
 )
 
 _SAFE_COLUMN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -237,10 +249,24 @@ def _action_prompt(state: AgentState, hypothesis_id: str) -> Mapping[str, object
     matching = tuple(
         item for item in contract.observation_contracts if item.hypothesis_id == hypothesis_id
     )
+    plan = _current_plan(state)
+    windows = sorted(plan.windows, key=lambda item: item.start_at)
+    attribution_windows = (
+        {
+            "previous": windows[0].model_dump(mode="json"),
+            "current": windows[1].model_dump(mode="json"),
+        }
+        if plan.analysis_type.value == "attribution" and len(windows) == 2
+        else None
+    )
     return {
         "query": state["normalized_query"],
         "target_hypothesis_id": hypothesis_id,
-        "plan": _current_plan(state).model_dump(mode="json"),
+        "plan": plan.model_dump(mode="json"),
+        "attribution_windows": attribution_windows,
+        "attribution_sql_rules": (
+            _SQL_ATTRIBUTION_RULES if plan.analysis_type.value == "attribution" else None
+        ),
         "metrics": tuple(item.model_dump(mode="json") for item in state["metric_context"]),
         "tables": tuple(item.model_dump(mode="json") for item in state["schema_context"]),
         "execute_arguments_schema": ExecuteSqlRequest.model_json_schema(),

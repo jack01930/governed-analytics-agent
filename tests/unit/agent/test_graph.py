@@ -805,9 +805,15 @@ async def test_attribution_checks_decline_then_three_dimensions(dimension_rows: 
             query_id="4" * 64,
         ),
     )
+    plan = attribution_plan()
+    if dimension_rows == 10:
+        windows = cast(list[dict[str, object]], plan["windows"])
+        for index, window in enumerate(windows):
+            window["label"] = f"w{index + 1}"
+        plan["windows"] = list(reversed(windows))
     scripts = scripts_for(
         ATTRIBUTION_QUERY,
-        plan=attribution_plan(),
+        plan=plan,
         actions=actions,
         synthesis_output=synthesis(),
     )
@@ -832,6 +838,10 @@ async def test_attribution_checks_decline_then_three_dimensions(dimension_rows: 
     if dimension_rows == 10:
         assert len(evidence_ids_from_request(request)) > 20
         assert request.max_output_tokens >= len(json.dumps(evidence_ids_from_request(request)))
+    action_request = next(call for call in model.calls if call.purpose == "action")
+    windows = action_request.model_dump(mode="json")["user_payload"]["attribution_windows"]
+    assert windows["previous"]["start_at"] == "2026-06-01T00:00:00Z"
+    assert windows["current"]["start_at"] == "2026-06-08T00:00:00Z"
 
 
 @pytest.mark.asyncio

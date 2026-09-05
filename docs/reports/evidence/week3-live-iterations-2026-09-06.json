@@ -3,7 +3,7 @@
     "integration_tests_passed": 86,
     "mypy_files": 158,
     "ruff_passed": true,
-    "unit_tests_passed": 1724
+    "unit_tests_passed": 1725
   },
   "historical_file_sha256": {
     "artifacts/evals/week3/live/20260905T094825Z-week3-20260905T094825Z-41ef87d5/cases/W3H001.json": "6f0ec1c8a701297528ecd24dad8f150643ee135af7649941bf759d759e1748e9",
@@ -1420,6 +1420,169 @@
       "valid_execute": {
         "denominator": 34,
         "numerator": 34,
+        "rate": "1"
+      }
+    },
+    {
+      "all_model_identity_complete": true,
+      "artifact_verification_passed": true,
+      "budget_metric": {
+        "denominator": 36,
+        "numerator": 36,
+        "rate": "1"
+      },
+      "calls_with_missing_usage": 0,
+      "candidate_metrics": {
+        "final_alias_contract": {
+          "denominator": 26,
+          "numerator": 23,
+          "rate": "0.8846153846153846153846153846"
+        },
+        "final_execution": {
+          "denominator": 26,
+          "numerator": 23,
+          "rate": "0.8846153846153846153846153846"
+        },
+        "final_production_validation": {
+          "denominator": 26,
+          "numerator": 23,
+          "rate": "0.8846153846153846153846153846"
+        },
+        "final_result": {
+          "denominator": 26,
+          "numerator": 23,
+          "rate": "0.8846153846153846153846153846"
+        },
+        "final_strict": {
+          "denominator": 26,
+          "numerator": 23,
+          "rate": "0.8846153846153846153846153846"
+        },
+        "final_truncated": {
+          "denominator": 26,
+          "numerator": 0,
+          "rate": "0"
+        },
+        "first_alias_contract": {
+          "denominator": 26,
+          "numerator": 26,
+          "rate": "1"
+        },
+        "first_execution": {
+          "denominator": 26,
+          "numerator": 26,
+          "rate": "1"
+        },
+        "first_production_validation": {
+          "denominator": 26,
+          "numerator": 26,
+          "rate": "1"
+        },
+        "first_result": {
+          "denominator": 26,
+          "numerator": 23,
+          "rate": "0.8846153846153846153846153846"
+        },
+        "first_strict": {
+          "denominator": 26,
+          "numerator": 23,
+          "rate": "0.8846153846153846153846153846"
+        },
+        "first_truncated": {
+          "denominator": 26,
+          "numerator": 0,
+          "rate": "0"
+        }
+      },
+      "case_count": 36,
+      "evidence_metric": {
+        "denominator": 26,
+        "numerator": 23,
+        "rate": "0.8846153846153846153846153846"
+      },
+      "execute_calls": 26,
+      "failing_cases": [
+        {
+          "budget_conformant": true,
+          "case_id": "W3K006",
+          "final_candidate_score": {
+            "answer_contract_validated": false,
+            "execution_succeeded": false,
+            "output_contract_conformant": false,
+            "possibly_truncated": false,
+            "result_score": "0",
+            "strict_pass": false
+          },
+          "model_identity_complete": true,
+          "stop_reason": "premise_not_met"
+        },
+        {
+          "budget_conformant": true,
+          "case_id": "W3K026",
+          "final_candidate_score": {
+            "answer_contract_validated": false,
+            "execution_succeeded": false,
+            "output_contract_conformant": false,
+            "possibly_truncated": false,
+            "result_score": "0",
+            "strict_pass": false
+          },
+          "model_identity_complete": true,
+          "stop_reason": "premise_not_met"
+        },
+        {
+          "budget_conformant": true,
+          "case_id": "W3H008",
+          "final_candidate_score": {
+            "answer_contract_validated": false,
+            "execution_succeeded": false,
+            "output_contract_conformant": false,
+            "possibly_truncated": false,
+            "result_score": "0",
+            "strict_pass": false
+          },
+          "model_identity_complete": true,
+          "stop_reason": "premise_not_met"
+        }
+      ],
+      "generated_at_utc": "2026-09-05T17:55:22.975233Z",
+      "heldout_passed": 9,
+      "implementation_commit": "a4a580c",
+      "known_passed": 24,
+      "ledger_cost_cny": "1.150844583504",
+      "ledger_tools_match_trace": true,
+      "ledger_usage_matches_trace": true,
+      "llm_calls": 115,
+      "model_errors": {
+        "invalid_structure": 1
+      },
+      "model_input_tokens": 334979,
+      "model_output_tokens": 16915,
+      "natural_refusal_metric": {
+        "denominator": 10,
+        "numerator": 10,
+        "rate": "1"
+      },
+      "passed": 33,
+      "report_json": "artifacts/evals/week3/live/20260905T175522Z-week3-20260905T175522Z-841eb14a/report.json",
+      "report_sha256": "7d89b66268285d126ed9701b68d7029e26475a4bf983443094b30b5acdcfbdb2",
+      "run_id": "week3-20260905T175522Z-841eb14a",
+      "scoring_failures": 0,
+      "stop_counts": {
+        "answer_complete": 23,
+        "missing_required_fields": 5,
+        "premise_not_met": 3,
+        "sensitive_data_request": 2,
+        "unsafe_request": 1,
+        "unsupported_analysis": 1,
+        "unsupported_data_domain": 1
+      },
+      "tool_calls": 78,
+      "tool_errors": {},
+      "usage_estimate_cny": "1.150844583504",
+      "valid_execute": {
+        "denominator": 26,
+        "numerator": 26,
         "rate": "1"
       }
     }

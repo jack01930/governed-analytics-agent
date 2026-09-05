@@ -868,6 +868,8 @@ class StructuredModelRequest(_FrozenModel):
             "tables",
             "planning_contract",
             "plan",
+            "attribution_windows",
+            "attribution_sql_rules",
             "target_hypothesis_id",
             "execute_arguments_schema",
             "contracts",
