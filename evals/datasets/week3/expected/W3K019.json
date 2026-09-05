@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "8268ce9496f531230877d42a959f4d184e7982c2ad4fde95954b8d877af0e9ca",
+  "result": {
+    "columns": [
+      "active_customers"
+    ],
+    "rows": [
+      [
+        198
+      ]
+    ]
+  }
+}

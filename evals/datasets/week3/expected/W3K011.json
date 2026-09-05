@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "885efaa85eb639b3105862223bc91eef0404b823b37adedc64a3fbc6b02dae31",
+  "result": {
+    "columns": [
+      "gmv"
+    ],
+    "rows": [
+      [
+        "94636.23"
+      ]
+    ]
+  }
+}

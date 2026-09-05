@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "2201a6e715c4e435455d73b485f93e06c99ef3fc7dae95084075e1de8282c315",
+  "result": {
+    "columns": [
+      "average_order_value"
+    ],
+    "rows": [
+      [
+        "389.4495061728395062"
+      ]
+    ]
+  }
+}

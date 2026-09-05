@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "f6f5b1bf7a96a8db7658f2b030325a7a487bca47f432d1f4790d8ee86d55a40c",
+  "result": {
+    "columns": [
+      "paid_gmv"
+    ],
+    "rows": [
+      [
+        "95998.23"
+      ]
+    ]
+  }
+}

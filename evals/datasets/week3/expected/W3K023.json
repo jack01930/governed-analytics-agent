@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "f1741f9adb5211017bf1b27a67dff411bea2f4efa03ddedf37a83494e4706ec7",
+  "result": {
+    "columns": [
+      "conversion_rate"
+    ],
+    "rows": [
+      [
+        "0.27085478887744593203"
+      ]
+    ]
+  }
+}

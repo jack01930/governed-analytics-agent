@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "cf25e90ffa83081ca9eb595bb49e2d49b75876aea0d1c9200a3ae845e36c600f",
+  "result": {
+    "columns": [
+      "payment_success_rate"
+    ],
+    "rows": [
+      [
+        "0.82935153583617747440"
+      ]
+    ]
+  }
+}

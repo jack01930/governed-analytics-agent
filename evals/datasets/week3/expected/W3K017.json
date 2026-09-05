@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "b3dcbcea40887e3a55b00b4023a295459a8eb12218850b4b39053958d9aedf9f",
+  "result": {
+    "columns": [
+      "refund_amount"
+    ],
+    "rows": [
+      [
+        "1699.50"
+      ]
+    ]
+  }
+}
