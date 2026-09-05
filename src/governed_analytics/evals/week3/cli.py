@@ -20,6 +20,7 @@ from governed_analytics.evals.cli import (
     _atomic_write_text,
     _lexical_absolute,
     _open_directory_nofollow,
+    _verify_bound_identity,
     _verify_bound_regular_file,
 )
 from governed_analytics.evals.pricing import ModelPricing, load_model_pricing
@@ -180,7 +181,18 @@ class _ValidatedReport:
                 expected_bytes=self.expected_bytes,
                 held_fd=self.file_fd,
             )
-            self._verify_parent()
+        except OSError:
+            raise OSError("Week 3 report artifact is unavailable") from None
+
+    def verify_identity(self) -> None:
+        try:
+            _verify_bound_identity(
+                self.directory_fd,
+                "report.json",
+                held_fd=self.file_fd,
+                expected_identity=self.file_identity,
+                expected_parent_identity=self.directory_identity,
+            )
         except OSError:
             raise OSError("Week 3 report artifact is unavailable") from None
 
@@ -312,6 +324,7 @@ def run_week3_command(
                 report_path_file,
                 f"{validated.report_path}\n",
                 publication_guard=validated.verify,
+                final_publication_guard=validated.verify_identity,
             )
         except (OSError, Week3RunError):
             raise Week3CliError("Week 3 report pointer publication failed") from None

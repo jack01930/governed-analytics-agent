@@ -183,7 +183,7 @@ def _verify_bound_regular_file(
     directory_fd: int,
     name: str,
     *,
-    expected_identity: tuple[int, int, int] | None = None,
+    expected_identity: tuple[int, int] | tuple[int, int, int] | None = None,
     expected_bytes: bytes | None = None,
     held_fd: int | None = None,
     unlink_verified: bool = False,
@@ -215,7 +215,10 @@ def _verify_bound_regular_file(
             or not stat.S_ISREG(entry.st_mode)
             or after_identity != identity
             or entry_identity != identity
-            or (expected_identity is not None and identity != expected_identity)
+            or (
+                expected_identity is not None
+                and identity[: len(expected_identity)] != expected_identity
+            )
             or (expected_bytes is not None and contents != expected_bytes)
         ):
             raise OSError("atomic evaluation pointer unavailable")
@@ -242,6 +245,29 @@ def _verify_bound_regular_file(
             os.close(file_fd)
 
 
+def _verify_bound_identity(
+    directory_fd: int,
+    name: str,
+    *,
+    held_fd: int,
+    expected_identity: tuple[int, int, int],
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> None:
+    if expected_parent_identity is not None:
+        parent = os.fstat(directory_fd)
+        if (parent.st_dev, parent.st_ino) != expected_parent_identity:
+            raise OSError("atomic evaluation pointer unavailable")
+    held = os.fstat(held_fd)
+    entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(held.st_mode)
+        or not stat.S_ISREG(entry.st_mode)
+        or (held.st_dev, held.st_ino, held.st_size) != expected_identity
+        or (entry.st_dev, entry.st_ino, entry.st_size) != expected_identity
+    ):
+        raise OSError("atomic evaluation pointer unavailable")
+
+
 def _pointer_matches(
     parent: _PointerParent,
     identity: tuple[int, int, int] | None,
@@ -266,6 +292,7 @@ def _atomic_write_text_locked(
     contents: str,
     *,
     publication_guard: Callable[[], None] | None = None,
+    final_publication_guard: Callable[[], None] | None = None,
 ) -> None:
     """Atomically replace one local pointer without following path symlinks.
 
@@ -277,7 +304,8 @@ def _atomic_write_text_locked(
     directory_fd = parent.directory_fd
     lock_fd = -1
     temporary_name: str | None = None
-    temporary_identity: tuple[int, int, int] | None = None
+    temporary_identity: tuple[int, int] | None = None
+    staged_identity: tuple[int, int, int] | None = None
     expected_bytes = contents.encode("utf-8")
     published_identity: tuple[int, int, int] | None = None
     try:
@@ -308,13 +336,13 @@ def _atomic_write_text_locked(
             dir_fd=directory_fd,
         )
         status = os.fstat(temporary_fd)
-        temporary_identity = (status.st_dev, status.st_ino, status.st_size)
+        temporary_identity = (status.st_dev, status.st_ino)
         with os.fdopen(temporary_fd, "w", encoding="utf-8", newline="") as stream:
             stream.write(contents)
             stream.flush()
             os.fsync(stream.fileno())
             status = os.fstat(stream.fileno())
-            temporary_identity = (status.st_dev, status.st_ino, status.st_size)
+            staged_identity = (status.st_dev, status.st_ino, status.st_size)
         _verify_pointer_parent(parent)
         if publication_guard is not None:
             publication_guard()
@@ -328,11 +356,11 @@ def _atomic_write_text_locked(
                 dst_dir_fd=directory_fd,
             )
         except OSError:
-            if not _pointer_matches(parent, temporary_identity, expected_bytes):
+            if not _pointer_matches(parent, staged_identity, expected_bytes):
                 raise
         temporary_name = None
-        published_identity = temporary_identity
-        if not _pointer_matches(parent, temporary_identity, expected_bytes):
+        published_identity = staged_identity
+        if not _pointer_matches(parent, staged_identity, expected_bytes):
             raise OSError("atomic evaluation pointer unavailable")
         _verify_pointer_parent(parent)
         if publication_guard is not None:
@@ -340,21 +368,48 @@ def _atomic_write_text_locked(
         try:
             os.fsync(directory_fd)
         except OSError:
-            if not _pointer_matches(parent, temporary_identity, expected_bytes):
+            if not _pointer_matches(parent, staged_identity, expected_bytes):
                 raise OSError("atomic evaluation pointer unavailable") from None
         _verify_pointer_parent(parent)
-        if not _pointer_matches(parent, temporary_identity, expected_bytes):
+        if staged_identity is None:
             raise OSError("atomic evaluation pointer unavailable")
-        if publication_guard is not None:
-            publication_guard()
+        final_fd = os.open(
+            target_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            _verify_bound_regular_file(
+                directory_fd,
+                target_name,
+                expected_identity=staged_identity,
+                expected_bytes=expected_bytes,
+                held_fd=final_fd,
+            )
+            if final_publication_guard is not None:
+                final_publication_guard()
+            _verify_bound_identity(
+                directory_fd,
+                target_name,
+                held_fd=final_fd,
+                expected_identity=staged_identity,
+                expected_parent_identity=parent.identity,
+            )
+        finally:
+            os.close(final_fd)
     except OSError:
         _unlink_owned_pointer(parent, published_identity, expected_bytes)
         raise OSError("atomic evaluation pointer unavailable") from None
     finally:
         if temporary_name is not None and directory_fd >= 0:
             with suppress(OSError):
-                if _file_identity_at(directory_fd, temporary_name) == temporary_identity:
-                    os.unlink(temporary_name, dir_fd=directory_fd)
+                if temporary_identity is not None:
+                    _verify_bound_regular_file(
+                        directory_fd,
+                        temporary_name,
+                        expected_identity=temporary_identity,
+                        unlink_verified=True,
+                    )
         if lock_fd >= 0:
             with suppress(OSError):
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -367,6 +422,7 @@ def _atomic_write_text(
     contents: str,
     *,
     publication_guard: Callable[[], None] | None = None,
+    final_publication_guard: Callable[[], None] | None = None,
 ) -> None:
     parent: _PointerParent | None = None
     try:
@@ -380,6 +436,7 @@ def _atomic_write_text(
                 parent,
                 contents,
                 publication_guard=publication_guard,
+                final_publication_guard=final_publication_guard,
             )
     except OSError:
         raise OSError("atomic evaluation pointer unavailable") from None

@@ -425,6 +425,7 @@ def test_week3_report_swap_after_validation_never_publishes_pointer(
         contents: str,
         *,
         publication_guard: Callable[[], None] | None = None,
+        final_publication_guard: Callable[[], None] | None = None,
     ) -> None:
         report_path.unlink()
         if replacement == "regular":
@@ -433,7 +434,12 @@ def test_week3_report_swap_after_validation_never_publishes_pointer(
             referent = tmp_path / "foreign.json"
             referent.write_text("{}", encoding="utf-8")
             report_path.symlink_to(referent)
-        original(path, contents, publication_guard=publication_guard)
+        original(
+            path,
+            contents,
+            publication_guard=publication_guard,
+            final_publication_guard=final_publication_guard,
+        )
 
     monkeypatch.setattr(week3_cli, "_atomic_write_text", swap_then_publish)
     pointer = tmp_path / "pointer.txt"
@@ -579,6 +585,78 @@ def test_week3_report_leaf_swap_after_held_read_is_detected(
 
     assert reads == 2
     assert report_path.read_text(encoding="utf-8") == "foreign"
+
+
+def test_week3_report_full_verification_ends_with_bound_leaf_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = tmp_path / "run" / "report.json"
+    report_path.parent.mkdir()
+    report_path.write_text("{}", encoding="utf-8")
+    artifact = _artifact(report_path)
+    monkeypatch.setattr(
+        Week3RunReport,
+        "model_validate",
+        lambda *_args, **_kwargs: artifact.report,
+    )
+    validated = week3_cli._open_validated_report(artifact, mode="fixture")
+    events: list[str] = []
+    original_parent = validated._verify_parent
+    original_bound = cli._verify_bound_regular_file
+
+    def record_parent() -> None:
+        events.append("parent-full")
+        original_parent()
+
+    def record_bound(*args: object, **kwargs: object) -> object:
+        events.append("leaf-full")
+        return original_bound(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(validated, "_verify_parent", record_parent)
+    monkeypatch.setattr(week3_cli, "_verify_bound_regular_file", record_bound)
+    try:
+        validated.verify()
+    finally:
+        validated.close()
+
+    assert events == ["parent-full", "leaf-full"]
+
+
+def test_week3_report_never_runs_parent_walker_after_final_leaf_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = tmp_path / "run" / "report.json"
+    report_path.parent.mkdir()
+    report_path.write_text("{}", encoding="utf-8")
+    artifact = _artifact(report_path)
+    monkeypatch.setattr(
+        Week3RunReport,
+        "model_validate",
+        lambda *_args, **_kwargs: artifact.report,
+    )
+    validated = week3_cli._open_validated_report(artifact, mode="fixture")
+    original_open = cli._open_directory_nofollow
+    opens = 0
+
+    def open_and_swap_on_second(*args: object, **kwargs: object) -> int:
+        nonlocal opens
+        directory_fd = original_open(*args, **kwargs)  # type: ignore[arg-type]
+        opens += 1
+        if opens == 2:
+            report_path.unlink()
+            report_path.write_text("foreign", encoding="utf-8")
+        return directory_fd
+
+    monkeypatch.setattr(week3_cli, "_open_directory_nofollow", open_and_swap_on_second)
+    try:
+        validated.verify()
+    finally:
+        validated.close()
+
+    assert opens == 1
+    assert report_path.read_text(encoding="utf-8") == "{}"
 
 
 def test_week3_success_is_not_relabelled_failed_by_resource_cleanup(

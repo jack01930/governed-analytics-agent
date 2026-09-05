@@ -379,3 +379,108 @@ def test_atomic_pointer_rollback_rechecks_leaf_next_to_unlink(
     assert guard_calls == 2
     assert owned_reads == 2
     assert target.read_text(encoding="utf-8") == "foreign"
+
+
+def test_atomic_pointer_final_guard_cannot_swap_pointer_undetected(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "pointer.txt"
+
+    def swap_pointer() -> None:
+        target.unlink()
+        target.write_text("foreign", encoding="utf-8")
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(
+            target,
+            "owned",
+            final_publication_guard=swap_pointer,
+        )
+
+    assert target.read_text(encoding="utf-8") == "foreign"
+
+
+def test_atomic_pointer_final_checks_are_full_then_source_then_pointer_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "pointer.txt"
+    events: list[str] = []
+    original_full = cli._verify_bound_regular_file
+    original_identity = cli._verify_bound_identity
+
+    def record_full(*args: object, **kwargs: object) -> object:
+        if args[1] == target.name and kwargs.get("held_fd") is not None:
+            events.append("pointer-full")
+        return original_full(*args, **kwargs)  # type: ignore[arg-type]
+
+    def record_source() -> None:
+        events.append("source-light")
+
+    def record_identity(*args: object, **kwargs: object) -> None:
+        events.append("pointer-light")
+        original_identity(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "_verify_bound_regular_file", record_full)
+    monkeypatch.setattr(cli, "_verify_bound_identity", record_identity)
+
+    cli._atomic_write_text(
+        target,
+        "owned",
+        final_publication_guard=record_source,
+    )
+
+    assert events == ["pointer-full", "source-light", "pointer-light"]
+
+
+def test_atomic_pointer_partial_temp_cleanup_never_unlinks_foreign_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "uuid4", lambda: SimpleNamespace(hex="fixed-cleanup"))
+    temporary = tmp_path / ".eval-pointer-fixed-cleanup.tmp"
+    original_identity = cli._file_identity_at
+    original_verify = cli._verify_bound_regular_file
+
+    def identity_then_swap(directory_fd: int, name: str) -> tuple[int, int, int] | None:
+        identity = original_identity(directory_fd, name)
+        if name == temporary.name and identity is not None:
+            temporary.unlink()
+            temporary.write_text("foreign", encoding="utf-8")
+        return identity
+
+    def verify_then_swap(*args: object, **kwargs: object) -> object:
+        result = original_verify(*args, **kwargs)  # type: ignore[arg-type]
+        if args[1] == temporary.name and kwargs.get("unlink_verified") is True:
+            temporary.write_text("foreign", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(cli, "_file_identity_at", identity_then_swap)
+    monkeypatch.setattr(cli, "_verify_bound_regular_file", verify_then_swap)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(
+            tmp_path / "pointer.txt",
+            "partial-owned",
+            publication_guard=lambda: (_ for _ in ()).throw(OSError("stop")),
+        )
+
+    assert temporary.read_text(encoding="utf-8") == "foreign"
+
+
+def test_atomic_pointer_cleans_owned_partial_temp_by_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "uuid4", lambda: SimpleNamespace(hex="fixed-partial"))
+    temporary = tmp_path / ".eval-pointer-fixed-partial.tmp"
+
+    def fail_staging_fsync(_fd: int) -> None:
+        raise OSError("staging failure")
+
+    monkeypatch.setattr(os, "fsync", fail_staging_fsync)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(tmp_path / "pointer.txt", "partial-owned")
+
+    assert not temporary.exists()

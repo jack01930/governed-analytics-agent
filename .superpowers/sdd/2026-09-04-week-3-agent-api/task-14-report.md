@@ -570,3 +570,52 @@ Success: no issues found in 158 source files
 ```
 
 本轮按 controller 要求未重跑 DB/eval，未访问 network/live/API，未修改 production API/SSE 或 ledger。
+
+## Phase B Fix round 3
+
+### RED / mutation
+
+新增 final source/pointer 顺序、report second-parent-walk、temp cleanup helper-return 换位及 partial-write 清理回归：
+
+```text
+uv run pytest tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py -q -k 'final_guard or final_checks or partial_temp_cleanup or full_verification_ends'
+4 failed, 44 deselected in 1.53s
+```
+
+失败证明上一轮仍允许：report 最后 leaf 校验之后执行完整 parent walker；final source guard 换入 foreign pointer 后
+无相邻 pointer identity 检查；temp cleanup 在 identity helper 返回后再 unlink，存在误删 foreign replacement 的 seam。
+
+### 修复
+
+- `_ValidatedReport.verify()` 重排为完整 parent path/held-directory 校验在前，held report FD 内容与 leaf
+  directory-entry bound verifier 在最后；删除 leaf 后的第二次完整 parent walker。
+- 新增只执行 held directory/file 与 leaf identity/type/size 核对的 `verify_identity()`，不重读内容、不打开路径。
+  atomic writer 的最终顺序固定为 pointer parent + held-content 完整校验 → report 轻量 final guard → pointer
+  held-FD/dir-entry 轻量 identity 校验；最后一步之后不再调用 callback 或执行长读取。
+- staging temp 记录创建时 dev/ino；finally 直接调用 handle-bound verifier 的 `unlink_verified=True`，partial write
+  不要求 expected bytes/size，因此 owned partial 可清理，foreign replacement 则在相邻身份检查处保留。
+- 回归覆盖 second parent helper 不再有执行/换位机会、final guard 主动换 pointer、temp identity helper-return
+  换 foreign、owned partial write，以及精确的 full-pointer → light-report → light-pointer 顺序。
+
+report 与 pointer 两组轻量检查之间，以及最终 leaf identity check 与 native syscall/return 之间，仍存在同 UID
+对手可调度的两个不可消除原生边界；按既有 Task12 native-syscall trust boundary 接受。本实现不声称提供跨对象原子快照。
+
+### GREEN / verification
+
+```text
+uv run pytest tests/unit/evals/week3/test_cli.py tests/unit/evals/test_week2_cli.py tests/unit/test_makefile.py tests/unit/test_ci_workflow.py -q
+63 passed in 0.86s
+
+uv run ruff check src/governed_analytics/evals/cli.py src/governed_analytics/evals/week3/cli.py tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py
+All checks passed!
+
+uv run mypy src/governed_analytics/evals/cli.py src/governed_analytics/evals/week3/cli.py tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py
+Success: no issues found in 4 source files
+
+make check
+All checks passed!
+Success: no issues found in 158 source files
+1662 passed in 42.47s
+```
+
+本轮未重跑 DB/eval，未访问 network/live/API，未修改 production API/SSE 或 ledger。
