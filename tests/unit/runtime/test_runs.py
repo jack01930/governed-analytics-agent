@@ -286,6 +286,9 @@ class ControlledTimeout:
         self._triggered = True
         self._task.cancel()
 
+    def expired(self) -> bool:
+        return self._triggered
+
 
 class ControlledTimeoutFactory:
     def __init__(self) -> None:
@@ -335,12 +338,136 @@ class BlockingExecutor:
         return completed_result(run_id)
 
 
+class BlockingStartedEventStore(InMemoryEventStore):
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        super().__init__(clock=clock)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def emit(
+        self,
+        run_id: str,
+        node: str,
+        event_type: str,
+        data: Any,
+        *,
+        owner_token: object | None = None,
+    ) -> RunEvent:
+        if event_type == "run.started":
+            self.entered.set()
+            await self.release.wait()
+        return await super().emit(
+            run_id,
+            node,
+            event_type,
+            data,
+            owner_token=owner_token,
+        )
+
+
 async def wait_until(predicate: Callable[[], bool]) -> None:
     for _ in range(100):
         if predicate():
             return
         await asyncio.sleep(0)
     raise AssertionError("condition was not reached")
+
+
+@pytest.mark.asyncio
+async def test_running_deadline_covers_blocked_run_started_event() -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = BlockingStartedEventStore(clock=clock.now)
+    timeout_factory = ControlledTimeoutFactory()
+    contexts: list[AgentContext] = []
+    executor_calls: list[str] = []
+
+    def make_context(_run_id: str, _owner_token: object) -> AgentContext:
+        context = context_for(clock)
+        contexts.append(context)
+        return context
+
+    async def executor(*, run_id: str, query: str, context: AgentContext) -> AgentRunResult:
+        del query, context
+        executor_calls.append(run_id)
+        return completed_result(run_id)
+
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=make_context,
+        agent_executor=executor,
+        timeout_factory=timeout_factory,
+        id_factory=lambda: "run-1",
+    )
+    try:
+        await runner.submit("query")
+        await events.entered.wait()
+
+        running = await runs.get("run-1")
+        assert running.lifecycle_status is RunLifecycleStatus.RUNNING
+        assert len(contexts) == 1
+        assert contexts[0].budget.snapshot.deadline_monotonic == 60.0
+        assert len(timeout_factory.contexts) == 1
+        assert timeout_factory.contexts[0].entered.is_set()
+
+        clock.advance(600)
+        assert contexts[0].budget.snapshot.deadline_monotonic == 60.0
+        timeout_factory.contexts[0].trigger()
+
+        terminal = await runner.wait("run-1")
+        assert terminal.final_status is FinalStatus.EXECUTION_FAILED
+        assert terminal.stop_reason is StopReason.TASK_TIMEOUT
+        assert executor_calls == []
+        terminal_events = [
+            event
+            for event in await events.replay_snapshot(
+                "run-1",
+                high_water_mark=await events.high_water_mark("run-1"),
+            )
+            if event.type == "run.terminal"
+        ]
+        assert len(terminal_events) == 1
+    finally:
+        await runner.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["context_factory", "agent_executor"])
+async def test_internal_timeout_error_is_not_reported_as_task_timeout(source: str) -> None:
+    clock = FakeClock()
+    runs = InMemoryRunStore(max_runs=2, retention_seconds=3600, clock=clock)
+    events = InMemoryEventStore(clock=clock.now)
+    timeout_factory = ControlledTimeoutFactory()
+
+    def make_context(_run_id: str, _owner_token: object) -> AgentContext:
+        if source == "context_factory":
+            raise TimeoutError("dependency timeout")
+        return context_for(clock)
+
+    async def executor(*, run_id: str, query: str, context: AgentContext) -> AgentRunResult:
+        del run_id, query, context
+        raise TimeoutError("dependency timeout")
+
+    runner = AnalysisRunner(
+        settings=settings(),
+        runs=runs,
+        events=events,
+        context_factory=make_context,
+        agent_executor=executor,
+        timeout_factory=timeout_factory,
+        id_factory=lambda: "run-1",
+    )
+    try:
+        await runner.submit("query")
+        terminal = await runner.wait("run-1")
+
+        assert terminal.final_status is FinalStatus.INTERNAL_ERROR
+        assert terminal.stop_reason is StopReason.INTERNAL_ERROR
+        assert all(not timeout.expired() for timeout in timeout_factory.contexts)
+    finally:
+        await runner.shutdown()
 
 
 @pytest.mark.asyncio
