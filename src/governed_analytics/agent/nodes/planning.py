@@ -438,6 +438,8 @@ def _metric_prompt(metric: MetricInfo) -> Mapping[str, JsonValue]:
     return {
         "metric_id": metric.metric_id,
         "version": metric.version,
+        "description": metric.description,
+        "expression_sql": metric.expression_sql,
         "dimensions": metric.dimensions,
         "unit": metric.unit,
         "time_field": metric.time_field,
@@ -496,7 +498,9 @@ async def build_plan(
                 "Follow planning_contract exactly; hypothesis identifiers are protocol "
                 "identifiers, not arbitrary labels. Copy the metric version from metrics. "
                 "Use simple for scalar/grouped/Top-K values; attribution only for "
-                "GMV decline diagnosis. Use UTC half-open time windows."
+                "GMV decline diagnosis. Use UTC half-open time windows. "
+                "For ratios/averages, populate numerator and denominator from the metric "
+                "definition, with zero_denominator_policy=return_null when documented."
             ),
             user_payload={
                 "query": state["normalized_query"],

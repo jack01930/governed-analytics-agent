@@ -850,6 +850,13 @@ async def test_repairable_column_contract_failure_repairs_once() -> None:
     assert [call.purpose for call in model.calls].count("repair") == 1
     assert result.first_candidate is not None
     assert result.first_candidate.columns == ("value",)
+    repair_request = next(call for call in model.calls if call.purpose == "repair")
+    repair_payload = repair_request.model_dump(mode="json")["user_payload"]
+    assert repair_payload["query"] == QUERY
+    assert repair_payload["plan"]["metric_id"] == "gmv"
+    assert any(item["metric_id"] == "gmv" for item in repair_payload["metrics"])
+    assert any(item["name"] == "orders" for item in repair_payload["tables"])
+    assert repair_payload["execute_arguments_schema"]["properties"]["parameters"]
     assert result.observation_validations[0].error_code == "column_contract_mismatch"
     assert result.observation_validations[0].repairable is True
     repair_events = [item for item in events.items if item[1].startswith("repair.")]

@@ -281,7 +281,19 @@ async def decide_behavior(
         request = StructuredModelRequest.for_output(
             purpose="behavior",
             system_prompt=(
-                "Classify the governed analytics request. Return only the bound schema."
+                "Classify requests for this company's historical e-commerce database. "
+                "Support GMV, payments, refunds, order counts, averages, conversion rates, "
+                "grouping/Top-K and two-window GMV decline attribution by region, SKU and "
+                "customer segment. GMV is already an explicit metric, including in attribution. "
+                "Refuse destructive operations and requests for raw personal contact data. "
+                "Forecasting is unsupported_analysis; competitor or external-site data is "
+                "unsupported_data_domain. Check unsupported scope before missing fields. "
+                "Clarify ambiguous metrics such as unspecified performance or revenue. "
+                "Return ALL missing_fields: metric first, then time_window for absent or "
+                "vague dates such as recently. A decline/comparison needs previous_window "
+                "and current_window instead of time_window when those windows are missing. "
+                "Explicit ranges, including short dates borrowing a stated year, are supplied "
+                "windows. Return execute/ready when supported and all required fields exist."
             ),
             user_payload={"query": state["normalized_query"]},
             output_type=BehaviorDecision,

@@ -48,6 +48,17 @@ from governed_analytics.agent.validation import (
 from governed_analytics.runtime.budgets import BudgetExceeded
 from governed_analytics.tools.contracts import ExecuteSqlRequest
 
+_SQL_GENERATION_RULES = (
+    "For execute_sql, generate PostgreSQL SELECT from the supplied tables and metric "
+    "definitions, including default_filters and the plan time windows. "
+    "Set purpose to contract_id; copy the supplied hypothesis_id and contract_id. "
+    "Return explicit columns with the contract aliases/order and limit. "
+    "Follow execute_arguments_schema. Every :named parameter must be directly CAST "
+    "to a supported SQL type: for dates use CAST(:start_at AS timestamptz) and "
+    "CAST(:end_at AS timestamptz), with ISO strings in arguments.parameters. "
+    "Bare :named placeholders and CAST to date are rejected by the SQL policy."
+)
+
 _SAFE_COLUMN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_TOOL_ERRORS = frozenset(
     {
@@ -347,14 +358,7 @@ async def route_action(
             purpose="action",
             system_prompt=(
                 "Choose one bounded profile or execute_sql action for the supplied hypothesis. "
-                "For execute_sql, generate PostgreSQL SELECT from the supplied tables and metric "
-                "definitions, including default_filters and the plan time windows. "
-                "Set purpose to contract_id; copy the supplied hypothesis_id and contract_id. "
-                "Return explicit columns with the contract aliases/order and limit. "
-                "Follow execute_arguments_schema. Every :named parameter must be directly CAST "
-                "to a supported SQL type: for dates use CAST(:start_at AS timestamptz) and "
-                "CAST(:end_at AS timestamptz), with ISO strings in arguments.parameters. "
-                "Bare :named placeholders and CAST to date are rejected by the SQL policy."
+                + _SQL_GENERATION_RULES
             ),
             user_payload=_action_prompt(state, pending),
             output_type=AnalysisAction,
@@ -1196,8 +1200,12 @@ async def repair(
         started_emitted = True
         request = StructuredModelRequest.for_output(
             purpose="repair",
-            system_prompt=("Repair the result contract once. Return one execute_sql action only."),
+            system_prompt=(
+                "Repair the result contract once. Return one execute_sql action only. "
+                + _SQL_GENERATION_RULES
+            ),
             user_payload={
+                **_action_prompt(state, cast(str, action.hypothesis_id)),
                 "error_code": error_code,
                 "contract_id": action.contract_id,
                 "hypothesis_id": action.hypothesis_id,
