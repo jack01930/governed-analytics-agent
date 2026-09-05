@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -39,6 +40,9 @@ class _AttributingExecutor:
         self.backend = backend
         self.settings = executor.settings
         self.calls_by_case: dict[str, int] = {}
+
+    def bind_execution_catalog(self, catalog: Any) -> None:
+        self.executor.bind_execution_catalog(catalog)
 
     async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
         before = len(self.backend.query_ids)

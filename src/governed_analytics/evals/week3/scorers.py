@@ -11,9 +11,11 @@ from pydantic import ValidationError
 from governed_analytics.agent.contracts import (
     ActionType,
     AgentRunResult,
+    AnswerContract,
     BehaviorAction,
     EvidenceItem,
     Observation,
+    ObservationContract,
     ObservationValidation,
     ToolCallTrace,
 )
@@ -29,6 +31,13 @@ from governed_analytics.tools.contracts import QueryResult as ProductionQueryRes
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
 type ExecuteTriple = tuple[str, str, str]
+type EvidenceClaim = tuple[
+    str,
+    tuple[tuple[str, str], ...],
+    str,
+    Decimal | None,
+    str | None,
+]
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -440,61 +449,172 @@ def execute_linkage_is_bijective(
     )
 
 
-def score_evidence(
+def _evidence_claim(item: EvidenceItem) -> EvidenceClaim:
+    return (
+        item.claim_key,
+        item.dimensions,
+        item.stance,
+        item.numeric_value,
+        item.unit,
+    )
+
+
+def _canonical_claims(
+    contract: ObservationContract,
+    result: ProductionQueryResult,
+) -> tuple[EvidenceClaim, ...] | None:
+    if contract.column_names != result.columns:
+        return None
+    dimension_indexes = tuple(
+        (index, column.name)
+        for index, column in enumerate(contract.columns)
+        if column.role in {"dimension", "identifier", "period"}
+    )
+    metric_indexes = tuple(
+        (index, column.name, column.unit)
+        for index, column in enumerate(contract.columns)
+        if column.role == "metric"
+    )
+    if not metric_indexes:
+        return None
+    stance = "supports"
+    if contract.contract_id == "gmv_comparison":
+        indexes = {name: index for index, name in enumerate(result.columns)}
+        try:
+            current = _decimal(result.rows[0][indexes["current_gmv"]])
+            previous = _decimal(result.rows[0][indexes["previous_gmv"]])
+        except (IndexError, KeyError):
+            return None
+        stance = (
+            "supports"
+            if current is not None and previous is not None and current < previous
+            else "refutes"
+        )
+    claims: list[EvidenceClaim] = []
+    for row in result.rows:
+        dimensions = tuple((name, str(row[index])) for index, name in dimension_indexes)
+        for index, claim_key, unit in metric_indexes:
+            if row[index] is None:
+                continue
+            numeric_value = _decimal(row[index])
+            claims.append(
+                (
+                    claim_key,
+                    dimensions,
+                    stance,
+                    numeric_value,
+                    unit if numeric_value is not None else None,
+                )
+            )
+    return tuple(claims) if claims else None
+
+
+def validated_evidence_by_purpose(
     *,
     required_purposes: tuple[str, ...],
+    answer_contract: AnswerContract | None,
     evidence: tuple[EvidenceItem, ...],
-    observations: tuple[Observation, ...] = (),
-    validations: tuple[ObservationValidation, ...] = (),
+    observations: tuple[Observation, ...],
+    validations: tuple[ObservationValidation, ...],
     tool_calls: tuple[ToolCallTrace, ...] = (),
-) -> EvidenceScore:
+) -> tuple[tuple[str, tuple[EvidenceItem, ...]], ...]:
+    """Return only purposes whose complete evidence multiset matches restored rows."""
+
+    if len(required_purposes) != len(set(required_purposes)):
+        return ()
+    if not required_purposes:
+        return ()
+    if answer_contract is None or len({item.evidence_id for item in evidence}) != len(evidence):
+        return ()
     observation_counts = Counter(item.observation_id for item in observations)
-    observation_by_id = {
-        item.observation_id: item
-        for item in observations
-        if observation_counts[item.observation_id] == 1
-    }
     validation_counts = Counter(item.observation_id for item in validations)
     validation_by_id = {
         item.observation_id: item
         for item in validations
         if validation_counts[item.observation_id] == 1
     }
-    evidence_ids_unique = len({item.evidence_id for item in evidence}) == len(evidence)
-    links_ok = bool(observations) and (
-        len({item.validation_fingerprint for item in validations}) == len(validations)
-        and (not tool_calls or execute_linkage_is_bijective(observations, validations, tool_calls))
-    )
-    verified_purposes: list[str] = []
-    for item in evidence:
-        if not item.verified or not evidence_ids_unique:
+    if (
+        not observations
+        or len({item.validation_fingerprint for item in validations}) != len(validations)
+        or (tool_calls and not execute_linkage_is_bijective(observations, validations, tool_calls))
+    ):
+        return ()
+    contracts = {item.contract_id: item for item in answer_contract.observation_contracts}
+    accepted: list[tuple[str, tuple[EvidenceItem, ...]]] = []
+    assigned_evidence_ids: set[str] = set()
+    for purpose in required_purposes:
+        expected_contract_id = "gmv_comparison" if purpose == "confirm_decline" else purpose
+        candidates: list[
+            tuple[Observation, ObservationValidation, ObservationContract, ProductionQueryResult]
+        ] = []
+        for observation in observations:
+            if (
+                observation_counts[observation.observation_id] != 1
+                or observation.tool_name is not ActionType.EXECUTE_SQL
+                or not observation.ok
+                or observation.contract_id != expected_contract_id
+                or (observation.purpose != purpose and observation.hypothesis_id != purpose)
+            ):
+                continue
+            validation = validation_by_id.get(observation.observation_id)
+            contract = contracts.get(expected_contract_id)
+            restored = restore_query_result(observation)
+            if (
+                validation is None
+                or not validation.valid
+                or validation.contract_id != expected_contract_id
+                or contract is None
+                or contract.hypothesis_id != observation.hypothesis_id
+                or restored is None
+            ):
+                continue
+            candidates.append((observation, validation, contract, restored))
+        if len(candidates) != 1:
             continue
-        observation = observation_by_id.get(item.observation_id)
-        validation = validation_by_id.get(item.observation_id)
+        observation, _validation, contract, restored = candidates[0]
+        expected_claims = _canonical_claims(contract, restored)
+        actual_items = tuple(
+            item for item in evidence if item.observation_id == observation.observation_id
+        )
+        metadata_matches = all(
+            item.verified
+            and item.contract_id == observation.contract_id
+            and item.hypothesis_id == observation.hypothesis_id
+            and item.query_id == observation.query_id
+            for item in actual_items
+        )
         if (
-            not links_ok
-            or observation is None
-            or validation is None
-            or not validation.valid
-            or observation.contract_id != item.contract_id
-            or observation.hypothesis_id != item.hypothesis_id
-            or observation.query_id != item.query_id
-            or (
-                observation.purpose not in required_purposes
-                and observation.hypothesis_id not in required_purposes
-            )
-            or validation.contract_id != item.contract_id
-            or restore_query_result(observation) is None
+            expected_claims is None
+            or not actual_items
+            or not metadata_matches
+            or Counter(map(_evidence_claim, actual_items)) != Counter(expected_claims)
         ):
             continue
-        purpose = (
-            observation.purpose
-            if observation.purpose in required_purposes
-            else observation.hypothesis_id or observation.purpose
-        )
-        verified_purposes.append(purpose)
-    counts = Counter(verified_purposes)
-    verified_count = sum(counts[purpose] >= 1 for purpose in required_purposes)
+        accepted.append((purpose, actual_items))
+        assigned_evidence_ids.update(item.evidence_id for item in actual_items)
+    if assigned_evidence_ids != {item.evidence_id for item in evidence}:
+        return ()
+    return tuple(accepted)
+
+
+def score_evidence(
+    *,
+    required_purposes: tuple[str, ...],
+    answer_contract: AnswerContract | None = None,
+    evidence: tuple[EvidenceItem, ...],
+    observations: tuple[Observation, ...] = (),
+    validations: tuple[ObservationValidation, ...] = (),
+    tool_calls: tuple[ToolCallTrace, ...] = (),
+) -> EvidenceScore:
+    verified = validated_evidence_by_purpose(
+        required_purposes=required_purposes,
+        answer_contract=answer_contract,
+        evidence=evidence,
+        observations=observations,
+        validations=validations,
+        tool_calls=tool_calls,
+    )
+    verified_count = len(verified)
     required_count = len(required_purposes)
     return EvidenceScore(
         required_count=required_count,
@@ -512,4 +632,5 @@ __all__ = [
     "score_candidate",
     "score_evidence",
     "score_tool_trace",
+    "validated_evidence_by_purpose",
 ]

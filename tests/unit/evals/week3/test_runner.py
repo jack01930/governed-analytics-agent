@@ -13,16 +13,36 @@ import pytest
 
 from governed_analytics.agent.contracts import (
     ActionType,
+    AgentFinishReason,
     AgentRunResult,
+    AnswerContract,
+    BehaviorAction,
+    BehaviorDecision,
+    BehaviorReasonCode,
+    ColumnContract,
+    EvidenceItem,
     FinalAnswer,
     FinalStatus,
     GovernanceSnapshot,
+    ModelCallTrace,
+    Observation,
+    ObservationContract,
+    ObservationValidation,
+    ResultShape,
     SafeTrace,
     StopReason,
     ToolCallTrace,
 )
+from governed_analytics.agent.ports import AgentTools
+from governed_analytics.config import AgentRuntimeSettings
+from governed_analytics.evals.models import QueryResult
 from governed_analytics.evals.week3 import runner
-from governed_analytics.evals.week3.runner import _suite_score, run_week3_evaluation
+from governed_analytics.evals.week3.runner import (
+    FixtureWeek3CaseExecutor,
+    _score_case,
+    _suite_score,
+    run_week3_evaluation,
+)
 from governed_analytics.evals.week3.suites import load_week3_cases
 
 
@@ -44,6 +64,133 @@ def _failure(case_id: str) -> AgentRunResult:
             answer="受控失败。",
         ),
         safe_trace=SafeTrace(),
+    )
+
+
+def _simple_result_with_evidence_value(value: Decimal) -> AgentRunResult:
+    query_id = "b" * 64
+    actual = Decimal("94636.23")
+    observation = Observation(
+        observation_id="observation-1",
+        tool_name=ActionType.EXECUTE_SQL,
+        purpose="metric_value_contract",
+        ok=True,
+        hypothesis_id="metric_value",
+        contract_id="metric_value_contract",
+        query_id=query_id,
+        columns=("gmv",),
+        row_count=1,
+        payload={
+            "query_id": query_id,
+            "columns": ("gmv",),
+            "rows": ((str(actual),),),
+            "row_count": 1,
+            "row_limit": 500,
+            "possibly_truncated": False,
+        },
+    )
+    validation = ObservationValidation(
+        observation_id=observation.observation_id,
+        contract_id="metric_value_contract",
+        validation_fingerprint="c" * 64,
+        valid=True,
+    )
+    evidence = EvidenceItem(
+        evidence_id="evidence-1",
+        observation_id=observation.observation_id,
+        hypothesis_id="metric_value",
+        contract_id="metric_value_contract",
+        query_id=query_id,
+        claim_key="gmv",
+        stance="supports",
+        numeric_value=value,
+        unit="cny",
+        verified=True,
+    )
+    answer_contract = AnswerContract(
+        answer_contract_id="simple-answer",
+        required_hypotheses=("metric_value",),
+        observation_contracts=(
+            ObservationContract(
+                contract_id="metric_value_contract",
+                hypothesis_id="metric_value",
+                columns=(
+                    ColumnContract(
+                        name="gmv", data_type="decimal", role="metric", unit="cny"
+                    ),
+                ),
+                shape=ResultShape.SCALAR,
+                min_rows=1,
+                max_rows=1,
+            ),
+        ),
+    )
+    tool_calls = (
+        ToolCallTrace(
+            tool_name=ActionType.METRIC_LOOKUP,
+            purpose="metric_lookup",
+            safe_arguments=(),
+        ),
+        ToolCallTrace(
+            tool_name=ActionType.SCHEMA_LOOKUP,
+            purpose="schema_lookup",
+            safe_arguments=(),
+        ),
+        ToolCallTrace(
+            tool_name=ActionType.EXECUTE_SQL,
+            purpose="metric_value_contract",
+            safe_arguments=(
+                ("contract_id", "metric_value_contract"),
+                ("hypothesis_id", "metric_value"),
+            ),
+            query_id=query_id,
+            columns=("gmv",),
+            row_count=1,
+        ),
+    )
+    model_calls = tuple(
+        ModelCallTrace(
+            purpose=purpose,
+            provider_model="fixture-agent",
+            outcome="completed",
+            latency_ms=0,
+            input_tokens=0,
+            output_tokens=0,
+            finish_reason=AgentFinishReason.STOP,
+            output_truncated=False,
+            estimated_cost_cny=Decimal("0"),
+        )
+        for purpose in ("behavior", "plan", "action", "synthesis")
+    )
+    return AgentRunResult(
+        run_id="W3K011",
+        behavior=BehaviorDecision(
+            action=BehaviorAction.EXECUTE,
+            reason_code=BehaviorReasonCode.READY,
+            user_message="开始分析。",
+        ),
+        answer_contract=answer_contract,
+        observations=(observation,),
+        observation_validations=(validation,),
+        evidence=(evidence,),
+        evidence_gaps=(),
+        first_candidate=observation,
+        repair_history=(),
+        governance=GovernanceSnapshot(
+            action_loops=1, llm_calls=4, tool_calls=3, execute_calls=1
+        ),
+        final_answer=FinalAnswer(
+            status=FinalStatus.COMPLETED,
+            stop_reason=StopReason.ANSWER_COMPLETE,
+            answer=f"GMV 是 {value} CNY。",
+            evidence_ids=(evidence.evidence_id,),
+            result_summary={
+                "evidence": (
+                    {"evidence_id": evidence.evidence_id, "numeric_value": str(value)},
+                )
+            },
+        ),
+        safe_trace=SafeTrace(model_calls=model_calls, tool_calls=tool_calls),
     )
 
 
@@ -192,6 +339,60 @@ async def test_runner_freezes_expected_results_before_invoking_any_case(
 
     assert not called
     assert not tuple(tmp_path.iterdir())
+
+
+def test_wrong_evidence_numeric_claim_cannot_keep_w3k011_green() -> None:
+    case = next(item for item in load_week3_cases() if item.case_id == "W3K011")
+    scored = _score_case(
+        case,
+        _simple_result_with_evidence_value(Decimal("999999")),
+        AgentRuntimeSettings.model_validate({}),
+        expected_results=(
+            QueryResult(columns=("gmv",), rows=((Decimal("94636.23"),),)),
+        ),
+        expected_resolved_model="fixture-agent",
+    )
+
+    assert scored.final_candidate_score is not None
+    assert scored.final_candidate_score.strict_pass
+    assert scored.evidence_score is not None
+    assert not scored.evidence_score.oracle_verified_sufficient
+    assert not scored.passed
+
+
+@pytest.mark.asyncio
+async def test_fixture_execution_uses_the_handle_bound_snapshot_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = runner.__dict__["_load_protocol_snapshot"]()
+    executed: list[str] = []
+
+    class CapturingExecutor(FixtureWeek3CaseExecutor):
+        async def _execute(self, **kwargs: object) -> AgentRunResult:
+            case_id = cast(str, kwargs["case_id"])
+            executed.append(case_id)
+            return _failure(case_id)
+
+    def stale_path_loader() -> object:
+        raise AssertionError("fixture execution must not reload scripts by path")
+
+    executor = CapturingExecutor(
+        tools=cast(AgentTools, object()),
+        settings=AgentRuntimeSettings.model_validate({}),
+    )
+    monkeypatch.setattr(runner, "_load_protocol_snapshot", lambda: snapshot)
+    monkeypatch.setattr(runner, "load_fixture_scripts", stale_path_loader, raising=False)
+
+    await run_week3_evaluation(
+        mode="fixture",
+        executor=executor,
+        cases=(snapshot.cases[0],),
+        output_root=tmp_path,
+        run_id="snapshot-catalog",
+        now=lambda: datetime(2026, 9, 4, tzinfo=UTC),
+    )
+
+    assert executed == ["W3K001"]
 
 
 @pytest.mark.asyncio

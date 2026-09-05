@@ -329,7 +329,34 @@ def _strict_contract(model: type[Any], value: object) -> None:
         raise ValueError(f"invalid fixture {model.__name__} output") from error
 
 
-def _parse_fixture_script(raw: dict[str, Any]) -> FixtureScript:
+def _snapshot_sql(
+    raw_ref: object,
+    contents: Mapping[str, bytes],
+) -> tuple[Path, str]:
+    prefix = "evals/datasets/week3/"
+    if type(raw_ref) is not str or not raw_ref.startswith(prefix):
+        raise ValueError("fixture sql_ref must use the Week 3 protocol root")
+    relative = raw_ref[len(prefix) :]
+    relative_path = Path(relative)
+    if (
+        relative_path.is_absolute()
+        or relative_path.parent != Path("scripted/sql")
+        or relative_path.suffix != ".sql"
+        or any(part in {"", ".", ".."} for part in relative_path.parts)
+    ):
+        raise ValueError("fixture sql_ref must identify one candidate SQL file")
+    try:
+        content = contents[relative].decode("utf-8")
+    except (KeyError, UnicodeError):
+        raise ValueError("fixture candidate SQL snapshot is unavailable") from None
+    return WEEK3_ROOT / relative_path, content
+
+
+def _parse_fixture_script(
+    raw: dict[str, Any],
+    *,
+    snapshot_sql: Mapping[str, bytes] | None = None,
+) -> FixtureScript:
     if _contains_truth(raw):
         raise ValueError("fixture scripts cannot contain Oracle, expected, or scorer truth")
     script_id = raw.get("script_id")
@@ -352,8 +379,18 @@ def _parse_fixture_script(raw: dict[str, Any]) -> FixtureScript:
             raise ValueError("fixture step wire types are invalid")
         raw_ref = step_data.get("sql_ref")
         sql_path = None
+        sql = None
         if raw_ref is not None:
-            sql_path = _repository_file(raw_ref, directory=WEEK3_SCRIPTED_SQL_ROOT, suffix=".sql")
+            if snapshot_sql is None:
+                sql_path = _repository_file(
+                    raw_ref, directory=WEEK3_SCRIPTED_SQL_ROOT, suffix=".sql"
+                )
+                try:
+                    sql = sql_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as error:
+                    raise ValueError("candidate SQL is unavailable") from error
+            else:
+                sql_path, sql = _snapshot_sql(raw_ref, snapshot_sql)
             step_data["sql_ref"] = sql_path
         try:
             step = FixtureModelStep.model_validate(step_data)
@@ -363,9 +400,13 @@ def _parse_fixture_script(raw: dict[str, Any]) -> FixtureScript:
         purpose = step.model_purpose
         if purpose in {"action", "repair"}:
             arguments = output.get("arguments")
-            if not isinstance(arguments, dict) or "sql" in arguments or sql_path is None:
+            if (
+                not isinstance(arguments, dict)
+                or "sql" in arguments
+                or sql_path is None
+                or sql is None
+            ):
                 raise ValueError("fixture actions require one external candidate sql_ref")
-            sql = sql_path.read_text(encoding="utf-8")
             if _contains_truth(sql):
                 raise ValueError("candidate SQL cannot contain evaluation truth sentinels")
             expanded = {**output, "arguments": {**arguments, "sql": sql}}
@@ -428,6 +469,36 @@ def load_fixture_scripts() -> tuple[FixtureScript, ...]:
     actual = set(WEEK3_SCRIPTED_SQL_ROOT.rglob("*"))
     if any(path.is_symlink() or not path.is_file() for path in actual) or referenced != actual:
         raise ValueError("candidate SQL inventory has missing, symlink, or orphan files")
+    return scripts
+
+
+def _load_fixture_scripts_from_snapshot(
+    registry: bytes,
+    candidate_sql: Mapping[str, bytes],
+) -> tuple[FixtureScript, ...]:
+    """Parse the immutable script catalog solely from one handle-bound byte snapshot."""
+
+    try:
+        raw = yaml.load(registry.decode("utf-8"), Loader=_UniqueSafeLoader)
+    except (UnicodeError, yaml.YAMLError, ValueError, TypeError) as error:
+        raise ValueError("invalid Week 3 fixture scripts snapshot") from error
+    if not isinstance(raw, list) or not raw or not all(type(item) is dict for item in raw):
+        raise ValueError("Week 3 fixture scripts snapshot must be a nonempty list")
+    scripts = tuple(
+        _parse_fixture_script(cast(dict[str, Any], item), snapshot_sql=candidate_sql)
+        for item in raw
+    )
+    ids = tuple(script.script_id for script in scripts)
+    if ids != _KNOWN_IDS or len(set(ids)) != len(ids):
+        raise ValueError("fixture scripts require ordered W3K001 through W3K030 IDs")
+    referenced = {
+        step.sql_ref.relative_to(WEEK3_ROOT).as_posix()
+        for script in scripts
+        for step in script.steps
+        if step.sql_ref is not None
+    }
+    if referenced != set(candidate_sql):
+        raise ValueError("candidate SQL snapshot has missing or orphan files")
     return scripts
 
 

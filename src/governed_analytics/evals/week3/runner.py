@@ -42,6 +42,7 @@ from governed_analytics.evals.week3.models import (
     BudgetConfiguration,
     BudgetScore,
     CandidateScore,
+    FixtureScript,
     FrozenExpectedResult,
     SafeEvidenceRef,
     SafeProfileTraceMetadata,
@@ -67,12 +68,11 @@ from governed_analytics.evals.week3.scorers import (
     score_candidate,
     score_evidence,
     score_tool_trace,
+    validated_evidence_by_purpose,
 )
 from governed_analytics.evals.week3.suites import (
-    WEEK3_HELDOUT_REGISTRY,
-    WEEK3_KNOWN_REGISTRY,
     WEEK3_ROOT,
-    load_fixture_scripts,
+    _load_fixture_scripts_from_snapshot,
 )
 from governed_analytics.models.agent_fixtures import AgentScripts, ScriptedAgentModel
 from governed_analytics.pricing import ModelPricing
@@ -103,6 +103,7 @@ _EXPECTED_STEMS = tuple(
 class _ProtocolSnapshot:
     cases: tuple[Week3EvaluationCase, ...]
     expected_results: tuple[tuple[str, EvalQueryResult], ...]
+    execution_catalog: _FixtureExecutionCatalog
     overall_manifest_sha256: str
     known_cohort_sha256: str
     heldout_cohort_sha256: str
@@ -197,48 +198,61 @@ class _ExecutionSpec:
     max_execute_calls: int | None
 
 
-def _load_execution_specs() -> dict[str, _ExecutionSpec]:
-    """Read only script refs and eval budget overrides; never load expected/Oracle data."""
-    result: dict[str, _ExecutionSpec] = {}
-    try:
-        documents = (
-            yaml.safe_load(WEEK3_KNOWN_REGISTRY.read_text(encoding="utf-8")),
-            yaml.safe_load(WEEK3_HELDOUT_REGISTRY.read_text(encoding="utf-8")),
-        )
-        for document in documents:
-            if not isinstance(document, list):
-                raise ValueError
-            for item in document:
-                if not isinstance(item, dict):
-                    raise ValueError
-                case_id, script_ref = item.get("case_id"), item.get("script_ref")
-                if type(case_id) is not str or type(script_ref) is not str:
-                    raise ValueError
-                raw_budget = item.get("budget_overrides")
-                max_tools = max_execute = None
-                if raw_budget is not None:
-                    if not isinstance(raw_budget, dict):
-                        raise ValueError
-                    max_tools = raw_budget.get("max_tool_calls")
-                    max_execute = raw_budget.get("max_execute_calls")
-                    if max_tools is not None and type(max_tools) is not int:
-                        raise ValueError
-                    if max_execute is not None and type(max_execute) is not int:
-                        raise ValueError
-                result[case_id] = _ExecutionSpec(script_ref, max_tools, max_execute)
-    except (OSError, UnicodeError, yaml.YAMLError, ValueError):
-        raise Week3RunError("fixture execution registry is unavailable") from None
-    if len(result) != 40:
-        raise Week3RunError("fixture execution registry is incomplete")
-    return result
+@dataclass(frozen=True, slots=True)
+class _FixtureExecutionCatalog:
+    specs: tuple[tuple[str, _ExecutionSpec], ...]
+    scripts: tuple[FixtureScript, ...]
+
+    def spec(self, case_id: str) -> _ExecutionSpec:
+        matches = tuple(spec for candidate, spec in self.specs if candidate == case_id)
+        if len(matches) != 1:
+            raise Week3RunError("fixture case is unknown")
+        return matches[0]
+
+    def script(self, script_ref: str) -> FixtureScript:
+        matches = tuple(script for script in self.scripts if script.script_id == script_ref)
+        if len(matches) != 1:
+            raise Week3RunError("fixture script reference is invalid")
+        return matches[0]
 
 
-def _script_library(question: str, script_ref: str) -> AgentScripts:
-    scripts = {item.script_id: item for item in load_fixture_scripts()}
-    try:
-        script = scripts[script_ref]
-    except KeyError:
-        raise Week3RunError("fixture script reference is invalid") from None
+def _execution_catalog(
+    cases: tuple[Week3EvaluationCase, ...],
+    scripts: tuple[FixtureScript, ...],
+) -> _FixtureExecutionCatalog:
+    script_ids = {script.script_id for script in scripts}
+    if len(cases) != 40 or any(case.script_ref not in script_ids for case in cases):
+        raise Week3RunError("fixture execution catalog is incomplete")
+    return _FixtureExecutionCatalog(
+        specs=tuple(
+            (
+                case.case_id,
+                _ExecutionSpec(
+                    script_ref=case.script_ref,
+                    max_tool_calls=(
+                        None
+                        if case.budget_overrides is None
+                        else case.budget_overrides.max_tool_calls
+                    ),
+                    max_execute_calls=(
+                        None
+                        if case.budget_overrides is None
+                        else case.budget_overrides.max_execute_calls
+                    ),
+                ),
+            )
+            for case in cases
+        ),
+        scripts=scripts,
+    )
+
+
+def _script_library(
+    question: str,
+    script_ref: str,
+    catalog: _FixtureExecutionCatalog,
+) -> AgentScripts:
+    script = catalog.script(script_ref)
     purposes: dict[str, list[object]] = {}
     for step in script.steps:
         purposes.setdefault(step.model_purpose, []).append(dict(step.output))
@@ -304,19 +318,23 @@ class FixtureWeek3CaseExecutor(_BaseWeek3Executor):
 
     def __init__(self, *, tools: AgentTools, settings: AgentRuntimeSettings) -> None:
         super().__init__(tools=tools, settings=settings, pricing=_fixture_pricing())
-        self._specs = _load_execution_specs()
+        self._catalog: _FixtureExecutionCatalog | None = None
+
+    def bind_execution_catalog(self, catalog: _FixtureExecutionCatalog) -> None:
+        if self._catalog is not None and self._catalog != catalog:
+            raise Week3RunError("fixture executor is already bound to another snapshot")
+        self._catalog = catalog
 
     async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
-        try:
-            spec = self._specs[case_id]
-        except KeyError:
-            raise Week3RunError("fixture case is unknown") from None
+        if self._catalog is None:
+            raise Week3RunError("fixture executor is not bound to a protocol snapshot")
+        spec = self._catalog.spec(case_id)
         limits = BudgetLimits.from_settings(self.settings)
         if spec.max_tool_calls is not None:
             limits = replace(limits, max_tool_calls=spec.max_tool_calls)
         if spec.max_execute_calls is not None:
             limits = replace(limits, max_execute_calls=spec.max_execute_calls)
-        model = ScriptedAgentModel(_script_library(question, spec.script_ref))
+        model = ScriptedAgentModel(_script_library(question, spec.script_ref, self._catalog))
         return await self._execute(case_id=case_id, question=question, model=model, limits=limits)
 
 
@@ -634,7 +652,18 @@ def _load_protocol_snapshot() -> _ProtocolSnapshot:
             files[f"scripted/sql/{name}"] = _snapshot_protocol_file(sql_fd, name)
 
         cases = _snapshot_cases(files)
+        scripts = _load_fixture_scripts_from_snapshot(
+            files["scripted/scripts.yaml"],
+            {
+                name: content
+                for name, content in files.items()
+                if name.startswith("scripted/sql/")
+            },
+        )
+        execution_catalog = _execution_catalog(cases, scripts)
         dependencies = _script_dependencies(files)
+        if set(dependencies) != {script.script_id for script in scripts}:
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
         referenced_sql = set().union(*dependencies.values())
         if referenced_sql != {f"scripted/sql/{name}" for name in sql_names}:
             raise Week3RunError("Week 3 protocol snapshot is unavailable")
@@ -686,6 +715,7 @@ def _load_protocol_snapshot() -> _ProtocolSnapshot:
         return _ProtocolSnapshot(
             cases=cases,
             expected_results=tuple(expected_results),
+            execution_catalog=execution_catalog,
             overall_manifest_sha256=overall,
             known_cohort_sha256=known_hash,
             heldout_cohort_sha256=heldout_hash,
@@ -819,54 +849,26 @@ def _safe_validation_refs(result: AgentRunResult) -> tuple[SafeValidationRef, ..
 def _evidence_refs(
     result: AgentRunResult, required_purposes: tuple[str, ...]
 ) -> tuple[SafeEvidenceRef, ...]:
-    if len({item.evidence_id for item in result.evidence}) != len(
-        result.evidence
-    ) or not execute_linkage_is_bijective(
-        result.observations,
-        result.observation_validations,
-        result.safe_trace.tool_calls,
-    ):
-        return ()
-    observations = {item.observation_id: item for item in result.observations}
-    refs = []
-    represented: set[str] = set()
-    validations = {item.observation_id: item for item in result.observation_validations}
-    for evidence in result.evidence:
-        observation = observations.get(evidence.observation_id)
-        validation = validations.get(evidence.observation_id)
-        purpose = (
-            None
-            if observation is None
-            else (
-                observation.hypothesis_id
-                if observation.hypothesis_id in required_purposes
-                else observation.purpose
-            )
+    verified = validated_evidence_by_purpose(
+        required_purposes=required_purposes,
+        answer_contract=result.answer_contract,
+        evidence=result.evidence,
+        observations=result.observations,
+        validations=result.observation_validations,
+        tool_calls=result.safe_trace.tool_calls,
+    )
+    return tuple(
+        SafeEvidenceRef(
+            evidence_id=items[0].evidence_id,
+            observation_id=items[0].observation_id,
+            purpose=purpose,
+            contract_id=items[0].contract_id,
+            hypothesis_id=items[0].hypothesis_id,
+            query_id=items[0].query_id,
         )
-        if (
-            evidence.verified
-            and observation is not None
-            and validation is not None
-            and validation.valid
-            and observation.contract_id == evidence.contract_id == validation.contract_id
-            and observation.hypothesis_id == evidence.hypothesis_id
-            and observation.query_id == evidence.query_id
-            and restore_query_result(observation) is not None
-            and purpose in required_purposes
-            and purpose not in represented
-        ):
-            represented.add(purpose)
-            refs.append(
-                SafeEvidenceRef(
-                    evidence_id=evidence.evidence_id,
-                    observation_id=evidence.observation_id,
-                    purpose=purpose,
-                    contract_id=evidence.contract_id,
-                    hypothesis_id=evidence.hypothesis_id,
-                    query_id=evidence.query_id,
-                )
-            )
-    return tuple(refs)
+        for purpose, items in verified
+        if items
+    )
 
 
 def _expected_execute_triples(case: Week3EvaluationCase) -> tuple[tuple[str, str, str], ...]:
@@ -921,6 +923,7 @@ def _suite_score(case: Week3EvaluationCase, result: AgentRunResult) -> SuiteScor
     if case.case_id == "W3K029":
         evidence = score_evidence(
             required_purposes=("confirm_decline",),
+            answer_contract=result.answer_contract,
             evidence=result.evidence,
             observations=result.observations,
             validations=result.observation_validations,
@@ -985,6 +988,7 @@ def _score_case(
     )
     evidence = score_evidence(
         required_purposes=purposes,
+        answer_contract=result.answer_contract,
         evidence=result.evidence,
         observations=result.observations,
         validations=result.observation_validations,
@@ -1251,6 +1255,10 @@ async def run_week3_evaluation(
         for case in source_cases
     ):
         raise Week3RunError("evaluation cases do not match the frozen protocol")
+    if mode == "fixture":
+        bind_catalog = getattr(executor, "bind_execution_catalog", None)
+        if bind_catalog is not None:
+            bind_catalog(snapshot.execution_catalog)
     active = tuple(case for case in source_cases if mode in case.modes)
     if not active:
         raise Week3RunError("no cases are enabled for this mode")

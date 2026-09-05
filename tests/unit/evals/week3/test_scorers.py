@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from governed_analytics.agent.contracts import (
     ActionType,
     AgentRunResult,
+    AnswerContract,
+    ColumnContract,
     EvidenceItem,
     Observation,
+    ObservationContract,
     ObservationValidation,
+    ResultShape,
     SafeTrace,
     ToolCallTrace,
 )
@@ -18,6 +24,30 @@ from governed_analytics.evals.week3.scorers import (
     score_evidence,
     score_tool_trace,
 )
+
+
+def _simple_answer_contract() -> AnswerContract:
+    return AnswerContract(
+        answer_contract_id="simple-answer",
+        required_hypotheses=("metric_value",),
+        observation_contracts=(
+            ObservationContract(
+                contract_id="metric_value_contract",
+                hypothesis_id="metric_value",
+                columns=(
+                    ColumnContract(
+                        name="gmv",
+                        data_type="decimal",
+                        role="metric",
+                        unit="cny",
+                    ),
+                ),
+                shape=ResultShape.SCALAR,
+                min_rows=1,
+                max_rows=1,
+            ),
+        ),
+    )
 
 
 def _candidate_history() -> AgentRunResult:
@@ -235,12 +265,15 @@ def test_evidence_rejects_orphan_duplicate_and_trace_metadata_mismatch() -> None
         hypothesis_id="metric_value",
         contract_id="metric_value_contract",
         query_id="b" * 64,
-        claim_key="metric_value",
+        claim_key="gmv",
         stance="supports",
+        numeric_value=Decimal("2"),
+        unit="cny",
         verified=True,
     )
     score = score_evidence(
         required_purposes=("metric_value_contract",),
+        answer_contract=_simple_answer_contract(),
         evidence=(evidence,),
         observations=result.observations,
         validations=result.observation_validations,
@@ -252,6 +285,7 @@ def test_evidence_rejects_orphan_duplicate_and_trace_metadata_mismatch() -> None
     assert (
         score_evidence(
             required_purposes=("metric_value_contract",),
+            answer_contract=_simple_answer_contract(),
             evidence=(orphan,),
             observations=result.observations,
             validations=result.observation_validations,
@@ -262,6 +296,7 @@ def test_evidence_rejects_orphan_duplicate_and_trace_metadata_mismatch() -> None
     assert (
         score_evidence(
             required_purposes=("metric_value_contract",),
+            answer_contract=_simple_answer_contract(),
             evidence=(evidence, evidence),
             observations=result.observations,
             validations=result.observation_validations,
@@ -272,6 +307,7 @@ def test_evidence_rejects_orphan_duplicate_and_trace_metadata_mismatch() -> None
     assert (
         score_evidence(
             required_purposes=("metric_value_contract",),
+            answer_contract=_simple_answer_contract(),
             evidence=(evidence,),
             observations=(),
             validations=(),
@@ -284,6 +320,7 @@ def test_evidence_rejects_orphan_duplicate_and_trace_metadata_mismatch() -> None
     assert (
         score_evidence(
             required_purposes=("metric_value_contract",),
+            answer_contract=_simple_answer_contract(),
             evidence=(evidence,),
             observations=result.observations,
             validations=result.observation_validations,
@@ -291,3 +328,135 @@ def test_evidence_rejects_orphan_duplicate_and_trace_metadata_mismatch() -> None
         ).verified_count
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"claim_key": "net_gmv"},
+        {"dimensions": (("region", "north"),)},
+        {"stance": "refutes"},
+        {"numeric_value": Decimal("999999")},
+        {"unit": "usd"},
+    ),
+)
+def test_evidence_claim_projection_must_match_the_linked_result(
+    changes: dict[str, object],
+) -> None:
+    result = _candidate_history()
+    evidence = EvidenceItem(
+        evidence_id="evidence-1",
+        observation_id="observation-2",
+        hypothesis_id="metric_value",
+        contract_id="metric_value_contract",
+        query_id="b" * 64,
+        claim_key="gmv",
+        stance="supports",
+        numeric_value=Decimal("2"),
+        unit="cny",
+        verified=True,
+    ).model_copy(update=changes)
+
+    score = score_evidence(
+        required_purposes=("metric_value_contract",),
+        answer_contract=_simple_answer_contract(),
+        evidence=(evidence,),
+        observations=result.observations,
+        validations=result.observation_validations,
+        tool_calls=result.safe_trace.tool_calls,
+    )
+
+    assert score.verified_count == 0
+    assert not score.oracle_verified_sufficient
+
+
+def test_evidence_requires_the_complete_attribution_claim_multiset() -> None:
+    query_id = "e" * 64
+    observation = Observation(
+        observation_id="observation-region",
+        tool_name=ActionType.EXECUTE_SQL,
+        purpose="region_contribution",
+        ok=True,
+        hypothesis_id="region_contribution",
+        contract_id="region_contribution",
+        query_id=query_id,
+        columns=("region", "gmv_loss"),
+        row_count=2,
+        payload={
+            "query_id": query_id,
+            "columns": ("region", "gmv_loss"),
+            "rows": (("north", "10.00"), ("south", "20.00")),
+            "row_count": 2,
+            "row_limit": 500,
+            "possibly_truncated": False,
+        },
+    )
+    validation = ObservationValidation(
+        observation_id=observation.observation_id,
+        contract_id="region_contribution",
+        validation_fingerprint="f" * 64,
+        valid=True,
+    )
+    trace = ToolCallTrace(
+        tool_name=ActionType.EXECUTE_SQL,
+        purpose="region_contribution",
+        safe_arguments=(
+            ("contract_id", "region_contribution"),
+            ("hypothesis_id", "region_contribution"),
+        ),
+        query_id=query_id,
+        columns=observation.columns,
+        row_count=observation.row_count,
+    )
+    answer_contract = AnswerContract(
+        answer_contract_id="attribution-answer",
+        required_hypotheses=("region_contribution",),
+        observation_contracts=(
+            ObservationContract(
+                contract_id="region_contribution",
+                hypothesis_id="region_contribution",
+                columns=(
+                    ColumnContract(name="region", data_type="string", role="dimension"),
+                    ColumnContract(
+                        name="gmv_loss",
+                        data_type="decimal",
+                        role="metric",
+                        unit="cny",
+                    ),
+                ),
+                shape=ResultShape.TABLE,
+                min_rows=1,
+                max_rows=10,
+                key_columns=("region",),
+            ),
+        ),
+    )
+    claims = tuple(
+        EvidenceItem(
+            evidence_id=f"evidence-{region}",
+            observation_id=observation.observation_id,
+            hypothesis_id="region_contribution",
+            contract_id="region_contribution",
+            query_id=query_id,
+            claim_key="gmv_loss",
+            dimensions=(("region", region),),
+            stance="supports",
+            numeric_value=Decimal(value),
+            unit="cny",
+            verified=True,
+        )
+        for region, value in (("north", "10.00"), ("south", "20.00"))
+    )
+    def is_sufficient(items: tuple[EvidenceItem, ...]) -> bool:
+        return score_evidence(
+            required_purposes=("region_contribution",),
+            answer_contract=answer_contract,
+            evidence=items,
+            observations=(observation,),
+            validations=(validation,),
+            tool_calls=(trace,),
+        ).oracle_verified_sufficient
+
+    assert is_sufficient(claims)
+    assert not is_sufficient(claims[:1])
+    assert not is_sufficient((*claims, claims[0]))
