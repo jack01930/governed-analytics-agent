@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import stat
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -14,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from governed_analytics.agent.ports import AgentTools
 from governed_analytics.agent.tool_registry import ToolRegistry
 from governed_analytics.config import AgentRuntimeSettings, DatabaseSettings, ModelSettings
-from governed_analytics.evals.cli import _atomic_write_text
+from governed_analytics.evals.cli import _atomic_write_text, _open_directory_nofollow
 from governed_analytics.evals.pricing import ModelPricing, load_model_pricing
 from governed_analytics.evals.week3.models import Week3RunReport
 from governed_analytics.evals.week3.runner import (
@@ -63,7 +66,7 @@ def _run_week3(
         artifact: Week3RunArtifact | None = None
         primary: BaseException | None = None
         runner_started = False
-        cleanup_failed = False
+        cleanup_control: BaseException | None = None
         try:
             database = DatabaseSettings()  # type: ignore[call-arg]
             engine = create_async_database_engine(database)
@@ -101,13 +104,18 @@ def _run_week3(
         if client is not None:
             try:
                 await client.close()
-            except BaseException:
-                cleanup_failed = True
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as error:
+                cleanup_control = error
+            except Exception:
+                pass
         if engine is not None:
             try:
                 await engine.dispose()
-            except BaseException:
-                cleanup_failed = True
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as error:
+                if cleanup_control is None:
+                    cleanup_control = error
+            except Exception:
+                pass
         if primary is not None:
             if isinstance(primary, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                 raise primary
@@ -118,8 +126,8 @@ def _run_week3(
                 if runner_started
                 else "Week 3 runtime initialization failed"
             ) from None
-        if cleanup_failed:
-            raise Week3RunError("Week 3 resource cleanup failed")
+        if cleanup_control is not None:
+            raise cleanup_control
         if artifact is None:
             raise Week3RunError("Week 3 evaluation failed")
         return artifact
@@ -136,51 +144,127 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
-def _reject_symlink_components(path: Path) -> None:
-    absolute = path.absolute()
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current /= part
+def _fd_bytes(file_fd: int) -> bytes:
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(file_fd, 8192):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@dataclass
+class _ValidatedReport:
+    report_path: Path
+    report_dir: Path
+    directory_fd: int
+    file_fd: int
+    directory_identity: tuple[int, int]
+    file_identity: tuple[int, int, int]
+    expected_bytes: bytes
+
+    def verify(self) -> None:
         try:
-            mode = current.lstat().st_mode
+            directory_status = os.fstat(self.directory_fd)
+            if (directory_status.st_dev, directory_status.st_ino) != self.directory_identity:
+                raise OSError
+            path_fd = _open_directory_nofollow(self.report_dir, create_missing=False)
+            try:
+                path_status = os.fstat(path_fd)
+                if (path_status.st_dev, path_status.st_ino) != self.directory_identity:
+                    raise OSError
+            finally:
+                os.close(path_fd)
+            held_before = os.fstat(self.file_fd)
+            held_identity = (held_before.st_dev, held_before.st_ino, held_before.st_size)
+            if not stat.S_ISREG(held_before.st_mode) or held_identity != self.file_identity:
+                raise OSError
+            leaf_status = os.stat("report.json", dir_fd=self.directory_fd, follow_symlinks=False)
+            leaf_identity = (leaf_status.st_dev, leaf_status.st_ino, leaf_status.st_size)
+            if not stat.S_ISREG(leaf_status.st_mode) or leaf_identity != self.file_identity:
+                raise OSError
+            if _fd_bytes(self.file_fd) != self.expected_bytes:
+                raise OSError
+            held_after = os.fstat(self.file_fd)
+            if (held_after.st_dev, held_after.st_ino, held_after.st_size) != self.file_identity:
+                raise OSError
         except OSError:
-            raise Week3RunError("Week 3 report artifact is unavailable") from None
-        if stat.S_ISLNK(mode):
-            raise Week3RunError("Week 3 report artifact is unavailable")
+            raise OSError("Week 3 report artifact is unavailable") from None
+
+    def close(self) -> None:
+        file_fd, directory_fd = self.file_fd, self.directory_fd
+        self.file_fd = -1
+        self.directory_fd = -1
+        if file_fd >= 0:
+            with suppress(OSError):
+                os.close(file_fd)
+        if directory_fd >= 0:
+            with suppress(OSError):
+                os.close(directory_fd)
 
 
-def _validated_report_path(
+def _open_validated_report(
     artifact: Week3RunArtifact,
     *,
     mode: Literal["fixture", "live"],
-) -> Path:
+) -> _ValidatedReport:
+    directory_fd = -1
+    file_fd = -1
     try:
         report = Week3RunReport.model_validate(
             artifact.report.model_dump(exclude_computed_fields=True), strict=True
         )
         if report.mode != mode or report.report_scope != "canonical":
             raise ValueError
-        _reject_symlink_components(artifact.report_dir)
-        _reject_symlink_components(artifact.report_json)
-        report_dir = artifact.report_dir.resolve(strict=True)
-        report_json = artifact.report_json.resolve(strict=True)
+        report_dir = Path(os.path.abspath(os.fspath(artifact.report_dir)))
+        report_json = Path(os.path.abspath(os.fspath(artifact.report_json)))
         if report_json.name != "report.json" or report_json.parent != report_dir:
             raise ValueError
-        status = report_json.stat()
-        if not stat.S_ISREG(status.st_mode):
+        directory_fd = _open_directory_nofollow(report_dir, create_missing=False)
+        directory_status = os.fstat(directory_fd)
+        file_fd = os.open(
+            "report.json",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError
+        stored_bytes = _fd_bytes(file_fd)
+        after = os.fstat(file_fd)
+        file_identity = (before.st_dev, before.st_ino, before.st_size)
+        if file_identity != (after.st_dev, after.st_ino, after.st_size):
             raise ValueError
         stored = json.loads(
-            report_json.read_text(encoding="utf-8"),
+            stored_bytes.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
         )
         if stored != report.model_dump(mode="json"):
             raise ValueError
-        return report_json
+        validated = _ValidatedReport(
+            report_path=report_json,
+            report_dir=report_dir,
+            directory_fd=directory_fd,
+            file_fd=file_fd,
+            directory_identity=(directory_status.st_dev, directory_status.st_ino),
+            file_identity=file_identity,
+            expected_bytes=stored_bytes,
+        )
+        directory_fd = -1
+        file_fd = -1
+        validated.verify()
+        return validated
     except Week3RunError:
         raise
     except Exception:
         raise Week3RunError("Week 3 report artifact is unavailable") from None
+    finally:
+        if file_fd >= 0:
+            with suppress(OSError):
+                os.close(file_fd)
+        if directory_fd >= 0:
+            with suppress(OSError):
+                os.close(directory_fd)
 
 
 def run_week3_command(
@@ -229,11 +313,19 @@ def run_week3_command(
         except Week3RunError:
             raise Week3CliError("Live Week 3 evaluation failed") from None
     if report_path_file is not None:
+        validated: _ValidatedReport | None = None
         try:
-            report_path = _validated_report_path(artifact, mode=mode)
-            _atomic_write_text(report_path_file, f"{report_path}\n")
+            validated = _open_validated_report(artifact, mode=mode)
+            _atomic_write_text(
+                report_path_file,
+                f"{validated.report_path}\n",
+                publication_guard=validated.verify,
+            )
         except (OSError, Week3RunError):
             raise Week3CliError("Week 3 report pointer publication failed") from None
+        finally:
+            if validated is not None:
+                validated.close()
     return artifact
 
 

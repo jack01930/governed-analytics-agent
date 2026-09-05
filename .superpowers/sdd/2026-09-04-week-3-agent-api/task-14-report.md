@@ -467,3 +467,52 @@ exit 0
 除宿主机 `make db-up` 端口碰撞外，全部功能与安全离线门禁通过，已达到“可向用户申请一次固定 case/预算 Week3 live 授权”的技术条件；这不是授权。本阶段没有运行 DeepSeek/live/API、没有产生模型费用，提交后停止。
 
 提交前再次运行 `make check`：Ruff、mypy 通过，1641 tests passed in 43.92s。
+
+## Phase B Fix round 1
+
+### RED / mutation
+
+先加入 report leaf 换位、pointer parent rename/recreate、路径 alias 并发和成功 run 后 cleanup 失败回归，在旧实现上运行：
+
+```text
+uv run pytest tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py -q
+6 failed, 28 passed in 6.21s
+```
+
+失败分别证明：`sub/../pointer` 与 canonical path 使用不同线程锁；父目录在 native replace 时被换绑仍返回成功；
+Week3 在验证后关闭 report handle，普通文件或 symlink 替换不会阻止 pointer 发布；普通 client/engine cleanup
+异常会把已成功生成的不可覆盖 artifact 改判为失败。
+
+### 修复
+
+- pointer parent 现在通过逐组件 `dir_fd` + `O_NOFOLLOW` 打开并持续持有，绑定请求父路径、目录
+  `(st_dev, st_ino)` 与规范 target name；线程锁以该三元组为 key，因此 lexical alias 串行。
+- 写入在取锁后、replace 前、replace 后和返回前重验“请求父路径 → held directory FD”的 identity。父目录
+  rename/recreate 固定失败；post-publication 校验失败时仅在 target 仍为本次 owned inode/bytes 时撤回 pointer。
+- Week3 report validation 持有 report directory FD 与 `report.json` FD，读取前后绑定 regular file identity/size，
+  从 held FD 解析 JSON 并与 runner artifact 精确比较。pointer replace 前后通过 publication guard 重验 held file、
+  leaf directory entry、内容与 report directory 路径绑定；普通文件/symlink 换位均固定脱敏失败且不留下 pointer。
+- 成功 runner artifact 不再因普通 client/engine cleanup 异常被改判失败；仍按 client → engine 尽力清理。
+  `CancelledError`、`KeyboardInterrupt`、`SystemExit` 在其他资源清理后继续传播，runner primary 仍优先保留。
+- 评测文档明确“非 execute 行为用例无数据库调用”，并说明 ProfileTool 会执行受控聚合 SQL；项目计划
+  同步到 2026-09-05，标记离线门禁已完成、`db-up` 环境端口碰撞以及 live 尚未授权。
+
+### GREEN / verification
+
+```text
+uv run pytest tests/unit/evals/week3/test_cli.py tests/unit/evals/test_week2_cli.py tests/unit/test_makefile.py tests/unit/test_ci_workflow.py -q
+52 passed in 0.97s
+
+uv run ruff check src/governed_analytics/evals/cli.py src/governed_analytics/evals/week3/cli.py tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py
+All checks passed!
+
+uv run mypy src/governed_analytics/evals/cli.py src/governed_analytics/evals/week3/cli.py tests/unit/evals/test_week2_cli.py tests/unit/evals/week3/test_cli.py
+Success: no issues found in 4 source files
+
+make check
+All checks passed!
+Success: no issues found in 158 source files
+1651 passed in 43.74s
+```
+
+本轮按要求未重跑数据库/eval 门禁，未访问 network/live/API，未修改 production API/SSE 或 ledger。

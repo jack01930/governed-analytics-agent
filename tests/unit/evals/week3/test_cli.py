@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,14 +14,20 @@ from governed_analytics.config import AgentRuntimeSettings, ModelSettings
 from governed_analytics.evals import cli
 from governed_analytics.evals.pricing import ModelPricing
 from governed_analytics.evals.week3 import cli as week3_cli
+from governed_analytics.evals.week3.models import Week3RunReport
 from governed_analytics.evals.week3.runner import Week3RunArtifact, Week3RunError
 
 
 def _artifact(path: Path) -> Week3RunArtifact:
+    report = SimpleNamespace(
+        mode="fixture",
+        report_scope="canonical",
+        model_dump=lambda **_kwargs: {},
+    )
     return cast(
         Week3RunArtifact,
         SimpleNamespace(
-            report=SimpleNamespace(mode="fixture", report_scope="canonical"),
+            report=report,
             report_dir=path.parent,
             report_json=path,
             report_markdown=path.with_suffix(".md"),
@@ -370,9 +378,9 @@ def test_week3_report_pointer_uses_exact_returned_artifact_not_decoys(
     artifact = _artifact(returned_report)
     monkeypatch.setattr(week3_cli, "_run_week3", lambda **_kwargs: artifact)
     monkeypatch.setattr(
-        week3_cli,
-        "_validated_report_path",
-        lambda returned, *, mode: returned.report_json.resolve(),
+        Week3RunReport,
+        "model_validate",
+        lambda *_args, **_kwargs: artifact.report,
     )
 
     assert (
@@ -391,6 +399,207 @@ def test_week3_report_pointer_uses_exact_returned_artifact_not_decoys(
     )
     assert pointer.read_text(encoding="utf-8") == f"{returned_report.resolve()}\n"
     assert decoy.resolve().as_posix() not in pointer.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("replacement", ("regular", "symlink"))
+def test_week3_report_swap_after_validation_never_publishes_pointer(
+    replacement: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report_path = tmp_path / "run" / "report.json"
+    report_path.parent.mkdir()
+    report_path.write_text("{}", encoding="utf-8")
+    artifact = _artifact(report_path)
+    monkeypatch.setattr(week3_cli, "_run_week3", lambda **_kwargs: artifact)
+    monkeypatch.setattr(
+        Week3RunReport,
+        "model_validate",
+        lambda *_args, **_kwargs: artifact.report,
+    )
+    original = cli._atomic_write_text
+
+    def swap_then_publish(
+        path: Path,
+        contents: str,
+        *,
+        publication_guard: Callable[[], None] | None = None,
+    ) -> None:
+        report_path.unlink()
+        if replacement == "regular":
+            report_path.write_text("foreign", encoding="utf-8")
+        else:
+            referent = tmp_path / "foreign.json"
+            referent.write_text("{}", encoding="utf-8")
+            report_path.symlink_to(referent)
+        original(path, contents, publication_guard=publication_guard)
+
+    monkeypatch.setattr(week3_cli, "_atomic_write_text", swap_then_publish)
+    pointer = tmp_path / "pointer.txt"
+
+    assert cli.main(
+        [
+            "week3",
+            "--dataset",
+            "tiny",
+            "--mode",
+            "fixture",
+            "--report-path-file",
+            str(pointer),
+        ]
+    ) == 2
+    assert capsys.readouterr().err.strip() == "Week 3 report pointer publication failed"
+    assert not pointer.exists()
+
+
+@pytest.mark.parametrize("replacement", ("regular", "symlink"))
+def test_week3_report_swap_immediately_after_pointer_replace_is_rolled_back(
+    replacement: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report_path = tmp_path / "run" / "report.json"
+    report_path.parent.mkdir()
+    report_path.write_text("{}", encoding="utf-8")
+    artifact = _artifact(report_path)
+    monkeypatch.setattr(week3_cli, "_run_week3", lambda **_kwargs: artifact)
+    monkeypatch.setattr(
+        Week3RunReport,
+        "model_validate",
+        lambda *_args, **_kwargs: artifact.report,
+    )
+    pointer = tmp_path / "pointer.txt"
+    original_replace = os.replace
+
+    def replace_then_swap_source(*args: object, **kwargs: object) -> None:
+        original_replace(*args, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("dst_dir_fd") is not None and args[1] == pointer.name:
+            report_path.unlink()
+            if replacement == "regular":
+                report_path.write_text("foreign", encoding="utf-8")
+            else:
+                referent = tmp_path / "foreign.json"
+                referent.write_text("{}", encoding="utf-8")
+                report_path.symlink_to(referent)
+
+    monkeypatch.setattr(os, "replace", replace_then_swap_source)
+
+    assert cli.main(
+        [
+            "week3",
+            "--dataset",
+            "tiny",
+            "--mode",
+            "fixture",
+            "--report-path-file",
+            str(pointer),
+        ]
+    ) == 2
+    assert capsys.readouterr().err.strip() == "Week 3 report pointer publication failed"
+    assert not pointer.exists()
+
+
+def test_week3_success_is_not_relabelled_failed_by_resource_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    artifact = _artifact(Path("report.json"))
+
+    class Engine:
+        async def dispose(self) -> None:
+            events.append("engine.dispose")
+            raise RuntimeError("dispose detail")
+
+    class Client:
+        async def close(self) -> None:
+            events.append("client.close")
+            raise RuntimeError("close detail")
+
+    async def successful_run(**_kwargs: object) -> Week3RunArtifact:
+        events.append("run")
+        return artifact
+
+    monkeypatch.setattr(week3_cli, "create_async_database_engine", lambda _settings: Engine())
+    monkeypatch.setattr(week3_cli, "DatabaseSettings", lambda: object())
+    monkeypatch.setattr(week3_cli, "_build_tools", lambda _engine: object())
+    monkeypatch.setattr(week3_cli, "run_week3_evaluation", successful_run)
+    monkeypatch.setattr(week3_cli, "LiveWeek3CaseExecutor", lambda **_kwargs: object())
+    monkeypatch.setattr(week3_cli, "OpenAICompatibleAgentModel", lambda *_args: object())
+    monkeypatch.setattr(week3_cli, "AsyncOpenAI", lambda **_kwargs: Client())
+
+    result = week3_cli._run_week3(
+        mode="live",
+        runtime_settings=AgentRuntimeSettings(),
+        model_settings=cast(
+            ModelSettings,
+            SimpleNamespace(
+                model_api_key=SimpleNamespace(get_secret_value=lambda: "opaque"),
+                model_base_url="https://example.invalid",
+                model_name="requested-model",
+            ),
+        ),
+        pricing=cast(
+            ModelPricing,
+            SimpleNamespace(requested_model="requested-model", resolved_model="resolved-model"),
+        ),
+    )
+
+    assert result is artifact
+    assert events == ["run", "client.close", "engine.dispose"]
+
+
+@pytest.mark.parametrize("control", (asyncio.CancelledError, SystemExit))
+def test_week3_cleanup_control_flow_propagates_after_other_resources_are_cleaned(
+    control: type[BaseException],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Engine:
+        async def dispose(self) -> None:
+            events.append("engine.dispose")
+
+    class Client:
+        async def close(self) -> None:
+            events.append("client.close")
+            raise control()
+
+    async def successful_run(**_kwargs: object) -> Week3RunArtifact:
+        events.append("run")
+        return _artifact(Path("report.json"))
+
+    monkeypatch.setattr(week3_cli, "create_async_database_engine", lambda _settings: Engine())
+    monkeypatch.setattr(week3_cli, "DatabaseSettings", lambda: object())
+    monkeypatch.setattr(week3_cli, "_build_tools", lambda _engine: object())
+    monkeypatch.setattr(week3_cli, "run_week3_evaluation", successful_run)
+    monkeypatch.setattr(week3_cli, "LiveWeek3CaseExecutor", lambda **_kwargs: object())
+    monkeypatch.setattr(week3_cli, "OpenAICompatibleAgentModel", lambda *_args: object())
+    monkeypatch.setattr(week3_cli, "AsyncOpenAI", lambda **_kwargs: Client())
+
+    with pytest.raises(control):
+        week3_cli._run_week3(
+            mode="live",
+            runtime_settings=AgentRuntimeSettings(),
+            model_settings=cast(
+                ModelSettings,
+                SimpleNamespace(
+                    model_api_key=SimpleNamespace(get_secret_value=lambda: "opaque"),
+                    model_base_url="https://example.invalid",
+                    model_name="requested-model",
+                ),
+            ),
+            pricing=cast(
+                ModelPricing,
+                SimpleNamespace(
+                    requested_model="requested-model",
+                    resolved_model="resolved-model",
+                ),
+            ),
+        )
+
+    assert events == ["run", "client.close", "engine.dispose"]
 
 
 def test_atomic_pointer_concurrent_writers_publish_one_complete_value(tmp_path: Path) -> None:

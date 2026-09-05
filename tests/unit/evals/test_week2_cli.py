@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -223,3 +225,77 @@ def test_atomic_pointer_rejects_precreated_temporary_symlink(
         cli._atomic_write_text(tmp_path / "summary.json", "owned")
 
     assert referent.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_atomic_pointer_aliases_share_one_thread_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "pointer.txt"
+    alias = tmp_path / "unused" / ".." / "pointer.txt"
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    entries: list[str] = []
+    original = cli._atomic_write_text_locked
+
+    def blocked(binding: object, contents: str, **kwargs: object) -> None:
+        entries.append(contents)
+        if contents == "first":
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        original(binding, contents, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "_atomic_write_text_locked", blocked)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(cli._atomic_write_text, target, "first")
+        assert first_entered.wait(timeout=5)
+        second = pool.submit(cli._atomic_write_text, alias, "second")
+        assert not second.done()
+        assert entries == ["first"]
+        release_first.set()
+        first.result(timeout=5)
+        second.result(timeout=5)
+
+    assert entries == ["first", "second"]
+    assert target.read_text(encoding="utf-8") == "second"
+
+
+def test_atomic_pointer_fails_if_requested_parent_is_rebound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "pointers"
+    parent.mkdir()
+    moved = tmp_path / "moved"
+    target = parent / "pointer.txt"
+    original_replace = os.replace
+
+    def replace_after_parent_rebind(*args: object, **kwargs: object) -> None:
+        parent.rename(moved)
+        parent.mkdir()
+        original_replace(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", replace_after_parent_rebind)
+
+    with pytest.raises(OSError, match="atomic evaluation pointer unavailable"):
+        cli._atomic_write_text(target, "owned")
+
+    assert not target.exists()
+
+
+def test_atomic_pointer_alias_writers_remain_complete_across_repeated_runs(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "pointer.txt"
+    alias = tmp_path / "spare" / ".." / "pointer.txt"
+    values = ("A" * 4096, "B" * 4096)
+
+    for _ in range(12):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = (
+                pool.submit(cli._atomic_write_text, target, values[0]),
+                pool.submit(cli._atomic_write_text, alias, values[1]),
+            )
+            for future in futures:
+                future.result(timeout=5)
+        assert target.read_text(encoding="utf-8") in values

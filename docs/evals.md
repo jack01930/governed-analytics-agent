@@ -74,7 +74,8 @@ first/final 的 result、alias/output contract、production validation、executi
 `numerator/denominator/rate`；无适用项时 denominator 为 0、rate 为 N/A，绝不以总 40 例代替。
 
 fixture executor 为每个 case 新建 scripted model session、预算、trace 与 context，但 40 例共享一个调用方拥有的
-只读 PostgreSQL engine/tool registry。非 Execute 工具不执行 SQL；报告只保留受限 trace metadata、验证和 evidence
+只读 PostgreSQL engine/tool registry。非 execute 行为用例无数据库调用；ProfileTool 会通过受控工具边界执行聚合
+SQL。报告只保留受限 trace metadata、验证和 evidence
 引用、计数、成本与安全终态，不包含 question、prompt、SQL、参数、raw rows、payload、endpoint、key 或价格来源。
 fixture 的全绿只证明 harness、tools、数据库治理、预算与 scorer 的一致性，不证明模型质量或语言泛化。
 

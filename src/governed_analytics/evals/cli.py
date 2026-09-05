@@ -11,8 +11,9 @@ import re
 import stat
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
@@ -31,7 +32,15 @@ from governed_analytics.models.protocols import EvaluationSqlGenerator, SqlGener
 
 _PRICING_PATH = "data/pricing/deepseek-v4-flash-2026-09-01.yaml"
 _POINTER_THREAD_LOCKS_GUARD = threading.Lock()
-_POINTER_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_POINTER_THREAD_LOCKS: dict[tuple[int, int, str], threading.Lock] = {}
+
+
+@dataclass(frozen=True)
+class _PointerParent:
+    directory_fd: int
+    target_name: str
+    requested_parent: Path
+    identity: tuple[int, int]
 
 
 class _CliArgumentError(ValueError):
@@ -68,10 +77,9 @@ def _failure(message: str) -> int:
     return 2
 
 
-def _open_pointer_parent(path: Path) -> tuple[int, str]:
-    absolute = path.absolute()
-    name = absolute.name
-    if not name or name in {".", ".."}:
+def _open_directory_nofollow(path: Path, *, create_missing: bool) -> int:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if not absolute.is_absolute():
         raise OSError("atomic evaluation pointer unavailable")
     flags = (
         os.O_RDONLY
@@ -81,19 +89,78 @@ def _open_pointer_parent(path: Path) -> tuple[int, str]:
     )
     current_fd = os.open(absolute.anchor, flags)
     try:
-        for part in absolute.parent.parts[1:]:
+        for part in absolute.parts[1:]:
+            child_fd = -1
             try:
                 child_fd = os.open(part, flags, dir_fd=current_fd)
             except FileNotFoundError:
+                if not create_missing:
+                    raise
                 os.mkdir(part, mode=0o700, dir_fd=current_fd)
                 child_fd = os.open(part, flags, dir_fd=current_fd)
-            old_fd, current_fd = current_fd, child_fd
+            old_fd = current_fd
+            current_fd = child_fd
             os.close(old_fd)
-        return current_fd, name
+        return current_fd
     except BaseException:
         with suppress(OSError):
             os.close(current_fd)
         raise
+
+
+def _open_pointer_parent(path: Path) -> _PointerParent:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    name = absolute.name
+    if not name or name in {".", ".."}:
+        raise OSError("atomic evaluation pointer unavailable")
+    directory_fd = _open_directory_nofollow(absolute.parent, create_missing=True)
+    status = os.fstat(directory_fd)
+    return _PointerParent(
+        directory_fd=directory_fd,
+        target_name=name,
+        requested_parent=absolute.parent,
+        identity=(status.st_dev, status.st_ino),
+    )
+
+
+def _verify_pointer_parent(parent: _PointerParent) -> None:
+    try:
+        held_status = os.fstat(parent.directory_fd)
+        if (held_status.st_dev, held_status.st_ino) != parent.identity:
+            raise OSError
+        check_fd = _open_directory_nofollow(parent.requested_parent, create_missing=False)
+        try:
+            check_status = os.fstat(check_fd)
+            if (check_status.st_dev, check_status.st_ino) != parent.identity:
+                raise OSError
+        finally:
+            os.close(check_fd)
+    except OSError:
+        raise OSError("atomic evaluation pointer unavailable") from None
+
+
+def _close_pointer_parent(parent: _PointerParent) -> None:
+    with suppress(OSError):
+        os.close(parent.directory_fd)
+
+
+def _unlink_owned_pointer(
+    parent: _PointerParent,
+    identity: tuple[int, int, int] | None,
+    expected_bytes: bytes,
+) -> None:
+    if identity is None:
+        return
+    try:
+        if (
+            _file_identity_at(parent.directory_fd, parent.target_name) == identity
+            and _file_bytes_at(parent.directory_fd, parent.target_name) == expected_bytes
+        ):
+            os.unlink(parent.target_name, dir_fd=parent.directory_fd)
+            with suppress(OSError):
+                os.fsync(parent.directory_fd)
+    except OSError:
+        pass
 
 
 def _file_identity_at(directory_fd: int, name: str) -> tuple[int, int, int] | None:
@@ -123,7 +190,12 @@ def _file_bytes_at(directory_fd: int, name: str) -> bytes:
         os.close(file_fd)
 
 
-def _atomic_write_text_locked(path: str | Path, contents: str) -> None:
+def _atomic_write_text_locked(
+    parent: _PointerParent,
+    contents: str,
+    *,
+    publication_guard: Callable[[], None] | None = None,
+) -> None:
     """Atomically replace one local pointer without following path symlinks.
 
     Once rename has exposed and revalidated the exact staged inode, a parent
@@ -131,13 +203,15 @@ def _atomic_write_text_locked(path: str | Path, contents: str) -> None:
     paid evaluation merely to repair that ambiguity would be less safe than
     accepting the already visible, byte-complete pointer.
     """
-    directory_fd = -1
+    directory_fd = parent.directory_fd
     lock_fd = -1
     temporary_name: str | None = None
     temporary_identity: tuple[int, int, int] | None = None
     expected_bytes = contents.encode("utf-8")
+    published_identity: tuple[int, int, int] | None = None
     try:
-        directory_fd, target_name = _open_pointer_parent(Path(path))
+        _verify_pointer_parent(parent)
+        target_name = parent.target_name
         lock_digest = sha256(target_name.encode("utf-8")).hexdigest()[:24]
         lock_name = f".eval-pointer-{lock_digest}.lock"
         lock_fd = os.open(
@@ -170,6 +244,9 @@ def _atomic_write_text_locked(path: str | Path, contents: str) -> None:
             os.fsync(stream.fileno())
             status = os.fstat(stream.fileno())
             temporary_identity = (status.st_dev, status.st_ino, status.st_size)
+        _verify_pointer_parent(parent)
+        if publication_guard is not None:
+            publication_guard()
         if _file_identity_at(directory_fd, target_name) != original_identity:
             raise OSError("atomic evaluation pointer unavailable")
         try:
@@ -186,11 +263,15 @@ def _atomic_write_text_locked(path: str | Path, contents: str) -> None:
             ):
                 raise
         temporary_name = None
+        published_identity = temporary_identity
         if (
             _file_identity_at(directory_fd, target_name) != temporary_identity
             or _file_bytes_at(directory_fd, target_name) != expected_bytes
         ):
             raise OSError("atomic evaluation pointer unavailable")
+        _verify_pointer_parent(parent)
+        if publication_guard is not None:
+            publication_guard()
         try:
             os.fsync(directory_fd)
         except OSError:
@@ -199,12 +280,14 @@ def _atomic_write_text_locked(path: str | Path, contents: str) -> None:
                 or _file_bytes_at(directory_fd, target_name) != expected_bytes
             ):
                 raise OSError("atomic evaluation pointer unavailable") from None
+        _verify_pointer_parent(parent)
         if (
             _file_identity_at(directory_fd, target_name) != temporary_identity
             or _file_bytes_at(directory_fd, target_name) != expected_bytes
         ):
             raise OSError("atomic evaluation pointer unavailable")
     except OSError:
+        _unlink_owned_pointer(parent, published_identity, expected_bytes)
         raise OSError("atomic evaluation pointer unavailable") from None
     finally:
         if temporary_name is not None and directory_fd >= 0:
@@ -216,17 +299,32 @@ def _atomic_write_text_locked(path: str | Path, contents: str) -> None:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             with suppress(OSError):
                 os.close(lock_fd)
-        if directory_fd >= 0:
-            with suppress(OSError):
-                os.close(directory_fd)
 
 
-def _atomic_write_text(path: str | Path, contents: str) -> None:
-    key = str(Path(path).absolute())
-    with _POINTER_THREAD_LOCKS_GUARD:
-        thread_lock = _POINTER_THREAD_LOCKS.setdefault(key, threading.Lock())
-    with thread_lock:
-        _atomic_write_text_locked(path, contents)
+def _atomic_write_text(
+    path: str | Path,
+    contents: str,
+    *,
+    publication_guard: Callable[[], None] | None = None,
+) -> None:
+    parent: _PointerParent | None = None
+    try:
+        parent = _open_pointer_parent(Path(path))
+        key = (*parent.identity, parent.target_name)
+        with _POINTER_THREAD_LOCKS_GUARD:
+            thread_lock = _POINTER_THREAD_LOCKS.setdefault(key, threading.Lock())
+        with thread_lock:
+            _verify_pointer_parent(parent)
+            _atomic_write_text_locked(
+                parent,
+                contents,
+                publication_guard=publication_guard,
+            )
+    except OSError:
+        raise OSError("atomic evaluation pointer unavailable") from None
+    finally:
+        if parent is not None:
+            _close_pointer_parent(parent)
 
 
 def _week2_summary(report: Week2RunReport) -> str:
