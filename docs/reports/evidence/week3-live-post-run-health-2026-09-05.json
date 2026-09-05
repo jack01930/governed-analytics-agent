@@ -1,0 +1,18 @@
+{
+  "run_id": "week3-20260905T094825Z-41ef87d5",
+  "temporal_scope": "post_run_only",
+  "generation_request_sent": false,
+  "credential_or_endpoint_persisted": false,
+  "http_checks": {
+    "checked_at_utc": "2026-09-05T10:02:54Z",
+    "models_http_status": 200,
+    "target_model_present": true,
+    "balance_http_status": 200,
+    "account_available": true
+  },
+  "sdk_models_check": {
+    "checked_at_utc": "2026-09-05T10:03:14.418114Z",
+    "models_list_ok": true,
+    "target_model_present": true
+  }
+}

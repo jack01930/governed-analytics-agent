@@ -1,9 +1,9 @@
 {
   "schema_version": "governed-analytics-live-evidence-manifest-v2",
   "created_at": "2026-09-04T00:03:54+08:00",
-  "updated_at": "2026-09-04T07:49:28+08:00",
+  "updated_at": "2026-09-05T18:03:14+08:00",
   "source_git_head": "3667995a5583b4deb628c0db8c95fe2151a2426c",
-  "latest_source_git_head": "dd7895ae2b110e630e9d76084abfaa4f4b0f255b",
+  "latest_source_git_head": "55f2e93250a60b57f30a9bdea727d48b08df6d0a",
   "archive_commit": "recorded by the Git commit containing this manifest",
   "redacted": true,
   "redaction_policy": "always exclude credentials, authorization data, environment values and full provider responses; Week 1 raw evidence retains generated SQL over synthetic data, while Week 2 evidence also excludes generated SQL, actual query results and API endpoints",
@@ -76,6 +76,7 @@
   ],
   "derived_files": [
     {"path":"week-1-live-baselines.json","bytes":9348,"sha256":"4253e1295188d41fb7512e2370814a3dc71430d539ce5074aa63666036405189"},
-    {"path":"week-1-live-baselines.md","bytes":2929,"sha256":"640b63f853268bbc1a1f4f2abf4293c35cc595c2e357b89ee9d5cb27e1948559"}
+    {"path":"week-1-live-baselines.md","bytes":2929,"sha256":"640b63f853268bbc1a1f4f2abf4293c35cc595c2e357b89ee9d5cb27e1948559"},
+    {"path":"week3-live-post-run-health-2026-09-05.json","bytes":508,"sha256":"868bdff4ac62643b69efab3dfa87154d4e85b166ac91a950ddd3f79a98cc38d7"}
   ]
 }
