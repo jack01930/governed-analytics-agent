@@ -658,3 +658,68 @@ Success: no issues found in 158 source files
 ```
 
 本轮未运行 DB eval、network/live/API，未修改 production API/SSE、progress 或 ledger。
+
+## 最终离线证据刷新
+
+本节只记录 controller 已完成的最终 exact rerun 结果，并从以下两个固定文件读取最终证据；本次文档刷新没有
+重跑任何命令：
+
+- `artifacts/evals/week2/week2-fixture-summary.json`
+- `artifacts/evals/week3/fixture-report-path.txt` 指向的 `report.json`
+
+最终命令结果：
+
+```text
+make check
+All checks passed!
+Success: no issues found in 158 source files
+1667 passed
+
+make db-up
+exit 0
+
+make migrate
+exit 0
+
+make data-tiny
+scale=tiny dataset=a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2
+
+make data-verify
+verification succeeded
+
+make test-integration
+86 passed
+
+uv run governed-eval baseline --dataset tiny --mode fixture
+exit 0
+
+uv run governed-eval week2 --dataset tiny --mode fixture --summary-file artifacts/evals/week2/week2-fixture-summary.json
+exit 0
+
+uv run governed-eval week3 --dataset tiny --mode fixture --report-path-file artifacts/evals/week3/fixture-report-path.txt
+exit 0
+```
+
+最终证据绑定：
+
+- Week 2 run ID：`dee16d4ccca44b37ae991f2d508cb9fd`
+- Week 2 suite manifest：`ec5e210d8be4391903904ef65f4c1dcd5b8c7d0898a020f61e4486054ad0277d`
+- Week 2 safety：20/20，rate 1
+- Week 3 run ID：`week3-20260905T075938Z-deace820`
+- Week 3 generated at：`2026-09-05T07:59:38.423298Z`
+- Week 3 report：`/Users/a0000/Projects/Agent-soft/.worktrees/week3-agent-api/artifacts/evals/week3/fixture/20260905T075938Z-week3-20260905T075938Z-deace820/report.json`
+- Week 3 overall/known/heldout/executed manifest：分别为
+  `c0ec7ff77b5927210fdeda1648e32ecc71f3819d6724b0eea5092a262bb4e577`、
+  `01b9b184b42bde3e710124eea0861ac032ae3ebdd0dfee0e9048174ec932af88`、
+  `a8da032f4ea0b1c09eefc65ba11e44c84a06ec94afc867d53b1b621a36511cb5`、
+  `44291f95af7daab1dd0b96cbe6fb1377ed0efbf44cc228a7330bb46779587f53`
+- Week 3 指标保持 canonical 40/40、known 30/30、heldout 10/10、known behavior 10/10、known simple
+  15/15、known attribution 1/1、tool 40/40、evidence 27/27、budget 40/40、natural refusal 10/10、
+  repair 1/2、valid Execute 37/41；first/final 六项的适用分母均为 26，其中 result、alias contract、
+  production validation、execution、strict 均 26/26，truncated occurrence 均 0/26。
+
+环境事实：首次 `make db-up` 曾因原有健康容器 `feat-week-1-data-baseline-db-1` 占用 127.0.0.1:5432
+失败；最终 exact rerun 返回 0 并启动 Week 3 容器，但它未发布 host port，后续 host URL gates 实际仍使用
+`feat-week-1-data-baseline-db-1`。原容器没有被停止或重启。Week 3 direct exact 首次因 isolated worktree
+没有 `DATABASE_URL` 失败；随后创建 ignored `.env`，仅配置 local DB 与 fixture gates、不含模型 key，原命令不变
+重跑成功。整个最终证据过程未运行 live/DeepSeek，也未创建 API client 或产生模型费用。
