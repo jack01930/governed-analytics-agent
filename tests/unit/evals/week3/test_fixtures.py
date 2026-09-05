@@ -53,6 +53,7 @@ def test_successful_freeze_publishes_exactly_once_as_a_directory(
     names = tuple(f"W3K{index:03d}.json" for index in range(1, 20))
 
     async def write_complete_staging(staging: Path) -> tuple[str, ...]:
+        assert staging.stat().st_mode & 0o777 == 0o700
         for name in names:
             (staging / name).write_text("{}", encoding="utf-8")
         return names
@@ -97,6 +98,63 @@ def test_atomic_publish_preserves_target_created_at_publication_boundary(
 
     assert (output / "racer-owned.txt").read_text(encoding="utf-8") == "preserve"
     assert not tuple(tmp_path.glob(".week3-expected-*"))
+
+
+def test_pre_publish_source_swap_preserves_foreign_and_owned_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "expected"
+    owned_alias = tmp_path / "owned-staging-alias"
+
+    async def swap_staging(staging: Path) -> tuple[str, ...]:
+        (staging / "owned.txt").write_text("owned", encoding="utf-8")
+        staging.rename(owned_alias)
+        staging.mkdir(mode=0o700)
+        (staging / "foreign.txt").write_text("foreign", encoding="utf-8")
+        return ("W3K011.json",)
+
+    def publish_must_not_run(_staging: Path, _destination: Path) -> None:
+        raise AssertionError("foreign staging reached publication")
+
+    monkeypatch.setattr(fixtures, "_freeze_to_staging", swap_staging)
+    monkeypatch.setattr(fixtures, "_publish_staged_directory", publish_must_not_run)
+    with pytest.raises(RuntimeError, match=r"^Week 3 staging directory identity changed$"):
+        freeze_week3_expected(dataset="tiny", output_root=output)
+
+    assert not output.exists()
+    assert (owned_alias / "owned.txt").read_text(encoding="utf-8") == "owned"
+    foreign = next(tmp_path.glob(".week3-expected-*"))
+    assert (foreign / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+
+
+def test_collision_cleanup_does_not_delete_source_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "expected"
+    owned_alias = tmp_path / "owned-staging-alias"
+    publish = fixtures._publish_staged_directory
+
+    async def write_owned(staging: Path) -> tuple[str, ...]:
+        (staging / "owned.txt").write_text("owned", encoding="utf-8")
+        return ("W3K011.json",)
+
+    def swap_source_then_collide(staging: Path, destination: Path) -> None:
+        staging.rename(owned_alias)
+        staging.mkdir(mode=0o700)
+        (staging / "foreign.txt").write_text("foreign", encoding="utf-8")
+        destination.mkdir()
+        (destination / "racer.txt").write_text("racer", encoding="utf-8")
+        publish(staging, destination)
+
+    monkeypatch.setattr(fixtures, "_freeze_to_staging", write_owned)
+    monkeypatch.setattr(fixtures, "_publish_staged_directory", swap_source_then_collide)
+    with pytest.raises(FileExistsError):
+        freeze_week3_expected(dataset="tiny", output_root=output)
+
+    assert (output / "racer.txt").read_text(encoding="utf-8") == "racer"
+    assert (owned_alias / "owned.txt").read_text(encoding="utf-8") == "owned"
+    foreign = next(tmp_path.glob(".week3-expected-*"))
+    assert (foreign / "foreign.txt").read_text(encoding="utf-8") == "foreign"
 
 
 @pytest.mark.parametrize("symlink_kind", ["external_parent", "oracle_root", "oracle_leaf"])

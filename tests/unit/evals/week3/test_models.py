@@ -26,6 +26,24 @@ def test_expected_result_uses_eval_query_result_and_is_frozen() -> None:
         frozen.oracle_query_id = "b" * 64
 
 
+@pytest.mark.parametrize(
+    "non_finite",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ],
+)
+def test_expected_result_recursively_rejects_non_finite_numbers(non_finite: object) -> None:
+    result = QueryResult(columns=("gmv",), rows=(({"nested": [non_finite]},),))
+
+    with pytest.raises(ValidationError, match="finite"):
+        FrozenExpectedResult(oracle_query_id="a" * 64, result=result)
+
+
 def test_budget_overrides_require_a_coherent_tool_ceiling() -> None:
     assert BudgetOverrides(max_tool_calls=3, max_execute_calls=2).max_tool_calls == 3
     assert BudgetOverrides(max_tool_calls=3) == BudgetOverrides(

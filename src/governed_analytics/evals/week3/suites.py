@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import re
 import stat
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from hashlib import sha256
@@ -185,19 +185,71 @@ def _thaw(value: object) -> object:
     return value
 
 
+def _normalize_truth_text(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
+def _truth_separator(character: str) -> bool:
+    category = unicodedata.category(character)
+    return (
+        character == "_"
+        or character.isspace()
+        or category.startswith(("P", "Z"))
+        or category == "Cf"
+    )
+
+
+_TRUTH_PATTERNS = tuple(
+    "".join(character for character in _normalize_truth_text(key) if character.isalnum())
+    for key in sorted(_TRUTH_KEYS)
+)
+
+
+def _matches_truth_pattern(text: str, pattern: str) -> bool:
+    for start, character in enumerate(text):
+        if character != pattern[0] or (start > 0 and text[start - 1].isalnum()):
+            continue
+        position = start
+        pattern_position = 0
+        while position < len(text) and pattern_position < len(pattern):
+            if text[position] == pattern[pattern_position]:
+                position += 1
+                pattern_position += 1
+            elif pattern_position > 0 and _truth_separator(text[position]):
+                position += 1
+            else:
+                break
+        if pattern_position == len(pattern) and (
+            position == len(text) or not text[position].isalnum()
+        ):
+            return True
+    return False
+
+
+def _contains_truth_text(text: str) -> bool:
+    normalized = _normalize_truth_text(text)
+    return any(_matches_truth_pattern(normalized, pattern) for pattern in _TRUTH_PATTERNS)
+
+
 def _key_tokens(key: str) -> tuple[str, ...]:
-    snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
-    normalized = re.sub(r"[^A-Za-z0-9]+", "_", snake).strip("_").casefold()
-    return tuple(item for item in normalized.split("_") if item)
-
-
-_TRUTH_SENTINELS = frozenset(" ".join(_key_tokens(key)) for key in _TRUTH_KEYS)
+    normalized = _normalize_truth_text(key)
+    tokens: list[str] = []
+    current: list[str] = []
+    for character in normalized:
+        if character.isalnum():
+            current.append(character)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tuple(tokens)
 
 
 def _truth_key(key: str) -> bool:
     tokens = _key_tokens(key)
     return (
-        key.casefold() in _TRUTH_KEYS
+        _contains_truth_text(key)
         or "oracle" in tokens
         or "scorer" in tokens
         or "expected" in tokens
@@ -210,7 +262,7 @@ def _contains_truth(value: object, *, parent_key: str | None = None) -> bool:
         for key, item in value.items():
             if type(key) is not str:
                 return True
-            normalized = key.casefold()
+            normalized = _normalize_truth_text(key)
             if normalized == "expected_evidence":
                 if _contains_truth(item, parent_key=normalized):
                     return True
@@ -224,8 +276,7 @@ def _contains_truth(value: object, *, parent_key: str | None = None) -> bool:
         return any(_contains_truth(item, parent_key=parent_key) for item in value)
     if not isinstance(value, str):
         return False
-    normalized_value = " ".join(_key_tokens(value))
-    return any(sentinel in normalized_value for sentinel in _TRUTH_SENTINELS)
+    return _contains_truth_text(value)
 
 
 def _strict_contract(model: type[Any], value: object) -> None:

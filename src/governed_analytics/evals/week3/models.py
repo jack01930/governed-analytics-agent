@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -20,6 +22,30 @@ from governed_analytics.evals.models import QueryResult
 EvalQueryResult = QueryResult
 Week3Cohort = Literal["known", "heldout"]
 Week3Suite = Literal["behavior", "simple", "attribution", "repair", "budget", "policy"]
+
+
+def _contains_non_finite_number(value: object, seen: set[int]) -> bool:
+    if type(value) is float:
+        return not math.isfinite(value)
+    if isinstance(value, Decimal):
+        return not value.is_finite()
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        return any(
+            _contains_non_finite_number(key, seen)
+            or _contains_non_finite_number(item, seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        identity = id(value)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        return any(_contains_non_finite_number(item, seen) for item in value)
+    return False
 
 
 class _FrozenWireModel(BaseModel):
@@ -55,6 +81,12 @@ class ExpectedObservation(_FrozenWireModel):
 class FrozenExpectedResult(_FrozenWireModel):
     oracle_query_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     result: EvalQueryResult
+
+    @model_validator(mode="after")
+    def _validate_finite_numbers(self) -> FrozenExpectedResult:
+        if _contains_non_finite_number(self.result.rows, set()):
+            raise ValueError("frozen expected results require finite numbers")
+        return self
 
 
 class BudgetOverrides(_FrozenWireModel):

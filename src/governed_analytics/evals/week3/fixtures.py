@@ -12,6 +12,7 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import Enum
@@ -41,6 +42,13 @@ _ORACLE_STEMS = tuple(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _DirectoryIdentity:
+    device: int
+    inode: int
+    mode: int
+
+
 def _require_real_directory(path: Path) -> None:
     current = Path(path.anchor) if path.is_absolute() else Path()
     for part in path.parts[1:] if path.is_absolute() else path.parts:
@@ -49,6 +57,57 @@ def _require_real_directory(path: Path) -> None:
             raise ValueError("Week 3 output paths cannot contain symlinks")
     if not path.is_dir():
         raise ValueError("Week 3 expected output parent must be a real directory")
+
+
+def _directory_identity(path: Path) -> _DirectoryIdentity:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        raise RuntimeError("Week 3 staging directory identity changed") from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError("Week 3 staging directory identity changed")
+    return _DirectoryIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+    )
+
+
+def _validate_directory_identity(
+    path: Path,
+    expected: _DirectoryIdentity,
+    *,
+    parent: Path,
+    parent_identity: _DirectoryIdentity,
+) -> None:
+    try:
+        _require_real_directory(parent)
+    except ValueError:
+        raise RuntimeError("Week 3 staging directory identity changed") from None
+    if _directory_identity(parent) != parent_identity or _directory_identity(path) != expected:
+        raise RuntimeError("Week 3 staging directory identity changed")
+
+
+def _clean_owned_staging(
+    staging: Path,
+    identity: _DirectoryIdentity,
+    *,
+    parent: Path,
+    parent_identity: _DirectoryIdentity,
+) -> None:
+    try:
+        _validate_directory_identity(
+            staging,
+            identity,
+            parent=parent,
+            parent_identity=parent_identity,
+        )
+    except RuntimeError:
+        return
+    try:
+        shutil.rmtree(staging)
+    except OSError:
+        return
 
 
 def _oracle_inventory() -> tuple[Path, ...]:
@@ -249,17 +308,38 @@ def freeze_week3_expected(
         raise FileExistsError("Week 3 expected output already exists; refusing overwrite")
     parent = output_root.parent
     _require_real_directory(parent)
+    parent_identity = _directory_identity(parent)
     _oracle_inventory()
     staging = Path(tempfile.mkdtemp(prefix=".week3-expected-", dir=parent))
+    staging_identity = _directory_identity(staging)
     published = False
     try:
+        if stat.S_IMODE(staging_identity.mode) != 0o700:
+            raise RuntimeError("Week 3 staging directory identity changed")
         names = asyncio.run(_freeze_to_staging(staging))
+        _validate_directory_identity(
+            staging,
+            staging_identity,
+            parent=parent,
+            parent_identity=parent_identity,
+        )
         _publish_staged_directory(staging, output_root)
+        _validate_directory_identity(
+            output_root,
+            staging_identity,
+            parent=parent,
+            parent_identity=parent_identity,
+        )
         published = True
         return tuple(output_root / name for name in names)
     except BaseException:
-        if not published and staging.exists():
-            shutil.rmtree(staging)
+        if not published:
+            _clean_owned_staging(
+                staging,
+                staging_identity,
+                parent=parent,
+                parent_identity=parent_identity,
+            )
         raise
 
 
