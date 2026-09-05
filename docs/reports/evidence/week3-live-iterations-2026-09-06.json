@@ -1585,6 +1585,145 @@
         "numerator": 26,
         "rate": "1"
       }
+    },
+    {
+      "all_model_identity_complete": true,
+      "artifact_verification_passed": true,
+      "budget_metric": {
+        "denominator": 36,
+        "numerator": 36,
+        "rate": "1"
+      },
+      "calls_with_missing_usage": 0,
+      "candidate_metrics": {
+        "final_alias_contract": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "final_execution": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "final_production_validation": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "final_result": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "final_strict": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "final_truncated": {
+          "denominator": 26,
+          "numerator": 0,
+          "rate": "0"
+        },
+        "first_alias_contract": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "first_execution": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "first_production_validation": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "first_result": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "first_strict": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "first_truncated": {
+          "denominator": 26,
+          "numerator": 0,
+          "rate": "0"
+        }
+      },
+      "case_count": 36,
+      "evidence_metric": {
+        "denominator": 26,
+        "numerator": 25,
+        "rate": "0.9615384615384615384615384615"
+      },
+      "execute_calls": 34,
+      "failing_cases": [
+        {
+          "budget_conformant": true,
+          "case_id": "W3K001",
+          "final_candidate_score": null,
+          "model_identity_complete": true,
+          "stop_reason": "missing_required_fields"
+        },
+        {
+          "budget_conformant": true,
+          "case_id": "W3H007",
+          "final_candidate_score": {
+            "answer_contract_validated": false,
+            "execution_succeeded": false,
+            "output_contract_conformant": false,
+            "possibly_truncated": false,
+            "result_score": "0",
+            "strict_pass": false
+          },
+          "model_identity_complete": true,
+          "stop_reason": "missing_required_fields"
+        }
+      ],
+      "generated_at_utc": "2026-09-05T18:04:13.164196Z",
+      "heldout_passed": 9,
+      "implementation_commit": "d64d7a8",
+      "known_passed": 25,
+      "ledger_cost_cny": "1.386811223952",
+      "ledger_tools_match_trace": true,
+      "ledger_usage_matches_trace": true,
+      "llm_calls": 120,
+      "model_errors": {},
+      "model_input_tokens": 392428,
+      "model_output_tokens": 24128,
+      "natural_refusal_metric": {
+        "denominator": 10,
+        "numerator": 9,
+        "rate": "0.9"
+      },
+      "passed": 34,
+      "report_json": "artifacts/evals/week3/live/20260905T180413Z-week3-20260905T180413Z-9122c0d4/report.json",
+      "report_sha256": "00f5d9de2a9d4a44385a4c655e3a885940de562fe6fc039e129eb9ee11a10500",
+      "run_id": "week3-20260905T180413Z-9122c0d4",
+      "scoring_failures": 0,
+      "stop_counts": {
+        "answer_complete": 25,
+        "missing_required_fields": 6,
+        "sensitive_data_request": 2,
+        "unsafe_request": 1,
+        "unsupported_analysis": 1,
+        "unsupported_data_domain": 1
+      },
+      "tool_calls": 84,
+      "tool_errors": {},
+      "usage_estimate_cny": "1.386811223952",
+      "valid_execute": {
+        "denominator": 34,
+        "numerator": 34,
+        "rate": "1"
+      }
     }
   ]
 }
