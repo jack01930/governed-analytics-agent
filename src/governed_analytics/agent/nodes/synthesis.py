@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 
 from langgraph.runtime import Runtime
@@ -119,6 +120,8 @@ async def synthesize(
             purpose="synthesis",
             system_prompt=(
                 "Synthesize only from verified evidence IDs and return the bound final answer."
+                " Include every evidence_id exactly once, keep answer to one short sentence, "
+                "and set result_summary to null; the application renders the verified values."
             ),
             user_payload={
                 "query": state["normalized_query"],
@@ -126,7 +129,15 @@ async def synthesize(
                 "evidence_gaps": state["evidence_gaps"],
             },
             output_type=FinalAnswer,
-            max_output_tokens=900,
+            # Evidence IDs are long hashes; full attribution cannot fit in 900 tokens.
+            # Reserve a byte-based upper estimate, capped independently of task cost limits.
+            max_output_tokens=min(
+                4096,
+                max(
+                    900,
+                    400 + len(json.dumps([item.evidence_id for item in state["evidence"]])),
+                ),
+            ),
         )
         invocation = await context.model_invoker.invoke(request, FinalAnswer)
         valid = _valid_synthesis(state, invocation.result.output)

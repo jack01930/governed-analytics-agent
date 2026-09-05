@@ -753,7 +753,8 @@ async def test_simple_metric_runs_real_registry_path_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_attribution_checks_decline_then_three_dimensions() -> None:
+@pytest.mark.parametrize("dimension_rows", [1, 10])
+async def test_attribution_checks_decline_then_three_dimensions(dimension_rows: int) -> None:
     actions = (
         execute_action(
             "gmv_comparison",
@@ -788,8 +789,16 @@ async def test_attribution_checks_decline_then_three_dimensions() -> None:
             (("80", "100", "-0.2"),),
             query_id="1" * 64,
         ),
-        query_result(("region", "gmv_loss"), (("north", "12"),), query_id="2" * 64),
-        query_result(("sku", "gmv_loss"), (("sku-1", "9"),), query_id="3" * 64),
+        query_result(
+            ("region", "gmv_loss"),
+            tuple((f"region-{i:02d}", str(20 - i)) for i in range(dimension_rows)),
+            query_id="2" * 64,
+        ),
+        query_result(
+            ("sku", "gmv_loss"),
+            tuple((f"sku-{i:02d}", str(20 - i)) for i in range(dimension_rows)),
+            query_id="3" * 64,
+        ),
         query_result(
             ("segment", "previous_gmv", "current_gmv", "delta"),
             (("vip", "100", "80", "-20"),),
@@ -802,7 +811,7 @@ async def test_attribution_checks_decline_then_three_dimensions() -> None:
         actions=actions,
         synthesis_output=synthesis(),
     )
-    context, _, _, _, _ = context_for(scripts, results)
+    context, _, model, _, _ = context_for(scripts, results)
 
     result = await run_agent(run_id="attribution-1", query=ATTRIBUTION_QUERY, context=context)
 
@@ -818,6 +827,11 @@ async def test_attribution_checks_decline_then_three_dimensions() -> None:
     assert result.governance.tool_calls == 6
     assert result.governance.execute_calls == 4
     assert result.governance.repair_count == 0
+    request = next(call for call in model.calls if call.purpose == "synthesis")
+    assert request.max_output_tokens <= 4096
+    if dimension_rows == 10:
+        assert len(evidence_ids_from_request(request)) > 20
+        assert request.max_output_tokens >= len(json.dumps(evidence_ids_from_request(request)))
 
 
 @pytest.mark.asyncio
@@ -3459,6 +3473,10 @@ async def test_plan_request_supplies_the_hypothesis_contract_needed_for_executio
                 return await self.delegate.invoke(request, output_type)
             plan = simple_plan()
             rules = request.model_dump(mode="json")["user_payload"].get("planning_contract", {})
+            metrics = request.model_dump(mode="json")["user_payload"]["metrics"]
+            paid = next(item for item in metrics if item["metric_id"] == "paid_gmv")
+            assert paid["name_zh"] == "已支付交易额"
+            assert paid["name_en"] == "Paid GMV"
             plan["hypotheses"] = rules.get(
                 "simple_hypotheses", ({"hypothesis_id": "h1", "kind": "metric_value"},)
             )

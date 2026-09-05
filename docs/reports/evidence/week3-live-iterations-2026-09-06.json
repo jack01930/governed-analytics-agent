@@ -126,6 +126,7 @@
   "historical_files_unchanged": 116,
   "rounds": [
     {
+      "all_model_identity_complete": true,
       "artifact_verification_passed": true,
       "budget_metric": {
         "denominator": 36,
@@ -645,6 +646,7 @@
       }
     },
     {
+      "all_model_identity_complete": true,
       "artifact_verification_passed": true,
       "budget_metric": {
         "denominator": 36,
@@ -919,6 +921,7 @@
       }
     },
     {
+      "all_model_identity_complete": true,
       "artifact_verification_passed": true,
       "budget_metric": {
         "denominator": 36,
@@ -1228,6 +1231,196 @@
         "denominator": 17,
         "numerator": 14,
         "rate": "0.8235294117647058823529411765"
+      }
+    },
+    {
+      "all_model_identity_complete": true,
+      "artifact_verification_passed": true,
+      "budget_metric": {
+        "denominator": 36,
+        "numerator": 36,
+        "rate": "1"
+      },
+      "calls_with_missing_usage": 0,
+      "candidate_metrics": {
+        "final_alias_contract": {
+          "denominator": 26,
+          "numerator": 24,
+          "rate": "0.9230769230769230769230769231"
+        },
+        "final_execution": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "final_production_validation": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "final_result": {
+          "denominator": 26,
+          "numerator": 22,
+          "rate": "0.8461538461538461538461538462"
+        },
+        "final_strict": {
+          "denominator": 26,
+          "numerator": 22,
+          "rate": "0.8461538461538461538461538462"
+        },
+        "final_truncated": {
+          "denominator": 26,
+          "numerator": 0,
+          "rate": "0"
+        },
+        "first_alias_contract": {
+          "denominator": 26,
+          "numerator": 24,
+          "rate": "0.9230769230769230769230769231"
+        },
+        "first_execution": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "first_production_validation": {
+          "denominator": 26,
+          "numerator": 25,
+          "rate": "0.9615384615384615384615384615"
+        },
+        "first_result": {
+          "denominator": 26,
+          "numerator": 24,
+          "rate": "0.9230769230769230769230769231"
+        },
+        "first_strict": {
+          "denominator": 26,
+          "numerator": 24,
+          "rate": "0.9230769230769230769230769231"
+        },
+        "first_truncated": {
+          "denominator": 26,
+          "numerator": 0,
+          "rate": "0"
+        }
+      },
+      "case_count": 36,
+      "evidence_metric": {
+        "denominator": 26,
+        "numerator": 25,
+        "rate": "0.9615384615384615384615384615"
+      },
+      "execute_calls": 34,
+      "failing_cases": [
+        {
+          "budget_conformant": true,
+          "case_id": "W3K001",
+          "final_candidate_score": null,
+          "model_identity_complete": true,
+          "stop_reason": "missing_required_fields"
+        },
+        {
+          "budget_conformant": true,
+          "case_id": "W3K003",
+          "final_candidate_score": null,
+          "model_identity_complete": true,
+          "stop_reason": "missing_required_fields"
+        },
+        {
+          "budget_conformant": true,
+          "case_id": "W3K006",
+          "final_candidate_score": {
+            "answer_contract_validated": true,
+            "execution_succeeded": true,
+            "output_contract_conformant": true,
+            "possibly_truncated": false,
+            "result_score": "0",
+            "strict_pass": false
+          },
+          "model_identity_complete": true,
+          "stop_reason": "answer_complete"
+        },
+        {
+          "budget_conformant": true,
+          "case_id": "W3K012",
+          "final_candidate_score": {
+            "answer_contract_validated": true,
+            "execution_succeeded": true,
+            "output_contract_conformant": false,
+            "possibly_truncated": false,
+            "result_score": "0",
+            "strict_pass": false
+          },
+          "model_identity_complete": true,
+          "stop_reason": "answer_complete"
+        },
+        {
+          "budget_conformant": true,
+          "case_id": "W3K026",
+          "final_candidate_score": {
+            "answer_contract_validated": true,
+            "execution_succeeded": true,
+            "output_contract_conformant": true,
+            "possibly_truncated": false,
+            "result_score": "0",
+            "strict_pass": false
+          },
+          "model_identity_complete": true,
+          "stop_reason": "answer_complete"
+        },
+        {
+          "budget_conformant": true,
+          "case_id": "W3H007",
+          "final_candidate_score": {
+            "answer_contract_validated": false,
+            "execution_succeeded": false,
+            "output_contract_conformant": false,
+            "possibly_truncated": false,
+            "result_score": "0",
+            "strict_pass": false
+          },
+          "model_identity_complete": true,
+          "stop_reason": "missing_required_fields"
+        }
+      ],
+      "generated_at_utc": "2026-09-05T17:44:55.822255Z",
+      "heldout_passed": 9,
+      "implementation_commit": "a7c4910",
+      "known_passed": 21,
+      "ledger_cost_cny": "1.333574920524",
+      "ledger_tools_match_trace": true,
+      "ledger_usage_matches_trace": true,
+      "llm_calls": 120,
+      "model_errors": {
+        "invalid_json": 3
+      },
+      "model_input_tokens": 380078,
+      "model_output_tokens": 22297,
+      "natural_refusal_metric": {
+        "denominator": 10,
+        "numerator": 8,
+        "rate": "0.8"
+      },
+      "passed": 30,
+      "report_json": "artifacts/evals/week3/live/20260905T174455Z-week3-20260905T174455Z-3a1aab4b/report.json",
+      "report_sha256": "e4c69dc192b9936f70c55b04227f64bb91c2feb17c427754a416937cac4afc7e",
+      "run_id": "week3-20260905T174455Z-3a1aab4b",
+      "scoring_failures": 0,
+      "stop_counts": {
+        "answer_complete": 25,
+        "missing_required_fields": 6,
+        "sensitive_data_request": 2,
+        "unsafe_request": 1,
+        "unsupported_analysis": 1,
+        "unsupported_data_domain": 1
+      },
+      "tool_calls": 84,
+      "tool_errors": {},
+      "usage_estimate_cny": "1.333574920524",
+      "valid_execute": {
+        "denominator": 34,
+        "numerator": 34,
+        "rate": "1"
       }
     }
   ]

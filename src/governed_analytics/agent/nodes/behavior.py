@@ -303,6 +303,9 @@ async def decide_behavior(
                 "Always include a nonempty user_message, including for execute/ready. "
                 "If metric and dates are missing use missing_metric; if an explicit metric "
                 "needs comparison windows use missing_comparison_window."
+                " Check missing fields independently: absent metric must not hide an absent "
+                "or vague time window. When BOTH comparison windows are absent, missing_fields "
+                "must contain previous_window and current_window, not comparison_window."
             ),
             user_payload={
                 "query": state["normalized_query"],

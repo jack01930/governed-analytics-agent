@@ -437,6 +437,8 @@ async def retrieve_context(
 def _metric_prompt(metric: MetricInfo) -> Mapping[str, JsonValue]:
     return {
         "metric_id": metric.metric_id,
+        "name_zh": metric.name_zh,
+        "name_en": metric.name_en,
         "version": metric.version,
         "description": metric.description,
         "expression_sql": metric.expression_sql,
