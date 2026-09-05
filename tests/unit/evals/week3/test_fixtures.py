@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,123 @@ import pytest
 from governed_analytics.evals.week3 import fixtures
 from governed_analytics.evals.week3.fixtures import freeze_week3_expected
 from governed_analytics.evals.week3.suites import WEEK3_ORACLE_ROOT
+
+
+def _open_fd_count() -> int:
+    fd_root = Path("/dev/fd")
+    if not fd_root.is_dir():
+        fd_root = Path("/proc/self/fd")
+    return len(os.listdir(fd_root))
+
+
+def _close_if_open(file_descriptor: int) -> None:
+    try:
+        os.fstat(file_descriptor)
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+    else:
+        os.close(file_descriptor)
+
+
+@pytest.mark.parametrize(
+    "failing_positions",
+    [(1,), (2,), (1, 2)],
+    ids=["directory-fails", "parent-fails", "both-fail"],
+)
+def test_owned_staging_close_tracks_each_fd_and_recovers_without_growth(
+    failing_positions: tuple[int, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    baseline = _open_fd_count()
+    owned = fixtures._create_owned_staging(tmp_path)
+    fixtures._clean_owned_staging(owned)
+    assert not owned.directory_fd_closed
+    assert not owned.parent_fd_closed
+    assert not owned.closed
+    real_close = os.close
+    attempted: list[int] = []
+
+    def failing_close(file_descriptor: int) -> None:
+        if len(attempted) < 2:
+            attempted.append(file_descriptor)
+            if len(attempted) in failing_positions:
+                raise OSError(
+                    errno.EBADF,
+                    f"injected descriptor close failure {len(attempted)}",
+                )
+        real_close(file_descriptor)
+
+    monkeypatch.setattr(os, "close", failing_close)
+    with pytest.raises(OSError, match="injected descriptor close failure") as error:
+        owned.close()
+
+    assert attempted == [owned.directory_fd, owned.parent_fd]
+    assert f"failure {min(failing_positions)}" in str(error.value)
+    assert owned.directory_fd_closed is (1 not in failing_positions)
+    assert owned.parent_fd_closed is (2 not in failing_positions)
+    assert not owned.closed
+
+    monkeypatch.setattr(os, "close", real_close)
+    owned.close()
+    owned.close()
+
+    assert owned.directory_fd_closed
+    assert owned.parent_fd_closed
+    assert owned.closed
+    assert _open_fd_count() == baseline
+
+
+@pytest.mark.parametrize(
+    "failing_positions",
+    [(1,), (2,), (1, 2)],
+    ids=["directory-fails", "parent-fails", "both-fail"],
+)
+def test_owned_staging_creation_rollback_cleans_identity_despite_close_errors(
+    failing_positions: tuple[int, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    baseline = _open_fd_count()
+    real_close = os.close
+    real_validate = fixtures._validate_owned_staging
+    opened: list[int] = []
+    attempted: list[int] = []
+    open_directory = fixtures._open_directory_no_follow
+
+    def tracking_open(path: Path) -> int:
+        file_descriptor = open_directory(path)
+        opened.append(file_descriptor)
+        return file_descriptor
+
+    def fail_validation(_owned: Any, *, require_path: bool = True) -> None:
+        del require_path
+        raise RuntimeError("injected construction failure")
+
+    def failing_close(file_descriptor: int) -> None:
+        if len(attempted) < 2:
+            attempted.append(file_descriptor)
+            if len(attempted) in failing_positions:
+                raise OSError(errno.EBADF, "injected descriptor close failure")
+        real_close(file_descriptor)
+
+    monkeypatch.setattr(fixtures, "_open_directory_no_follow", tracking_open)
+    monkeypatch.setattr(fixtures, "_validate_owned_staging", fail_validation)
+    monkeypatch.setattr(os, "close", failing_close)
+    try:
+        with pytest.raises(RuntimeError, match=r"^injected construction failure$"):
+            fixtures._create_owned_staging(tmp_path)
+
+        assert attempted == [opened[1], opened[0]]
+        assert not tuple(tmp_path.glob(".week3-expected-*"))
+    finally:
+        monkeypatch.setattr(os, "close", real_close)
+        monkeypatch.setattr(fixtures, "_validate_owned_staging", real_validate)
+        for file_descriptor in opened:
+            _close_if_open(file_descriptor)
+
+    assert _open_fd_count() == baseline
 
 
 def test_freezer_accepts_only_tiny_before_database_access(tmp_path: Path) -> None:

@@ -12,6 +12,7 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
@@ -58,14 +59,34 @@ class _OwnedStaging:
     parent_identity: _DirectoryIdentity
     directory_fd: int
     parent_fd: int
-    closed: bool = False
+    directory_fd_closed: bool = False
+    parent_fd_closed: bool = False
+
+    @property
+    def closed(self) -> bool:
+        return self.directory_fd_closed and self.parent_fd_closed
 
     def close(self) -> None:
         if self.closed:
             return
-        os.close(self.directory_fd)
-        os.close(self.parent_fd)
-        self.closed = True
+        first_error: OSError | None = None
+        if not self.directory_fd_closed:
+            try:
+                os.close(self.directory_fd)
+            except OSError as error:
+                first_error = error
+            else:
+                self.directory_fd_closed = True
+        if not self.parent_fd_closed:
+            try:
+                os.close(self.parent_fd)
+            except OSError as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                self.parent_fd_closed = True
+        if first_error is not None:
+            raise first_error
 
 
 def _require_real_directory(path: Path) -> None:
@@ -163,15 +184,21 @@ def _create_owned_staging(parent: Path) -> _OwnedStaging:
         _validate_owned_staging(owned)
         return owned
     except BaseException:
-        if directory_fd is not None:
-            os.close(directory_fd)
-        os.close(parent_fd)
-        if staging is not None and created_identity is not None:
+        try:
+            if directory_fd is not None:
+                with suppress(OSError):
+                    os.close(directory_fd)
+        finally:
             try:
-                if _directory_identity(staging) == created_identity:
-                    shutil.rmtree(staging)
-            except (OSError, RuntimeError):
-                pass
+                with suppress(OSError):
+                    os.close(parent_fd)
+            finally:
+                if staging is not None and created_identity is not None:
+                    try:
+                        if _directory_identity(staging) == created_identity:
+                            shutil.rmtree(staging)
+                    except (OSError, RuntimeError):
+                        pass
         raise
 
 

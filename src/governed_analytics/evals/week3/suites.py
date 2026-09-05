@@ -186,7 +186,15 @@ def _thaw(value: object) -> object:
 
 
 def _normalize_truth_text(text: str) -> str:
-    return unicodedata.normalize("NFKC", text).casefold()
+    # Normalize each source code point independently. Whole-string NFKC would
+    # compose an inserted combining mark with its preceding ASCII letter and
+    # turn that separator into a different alphanumeric character. Keeping the
+    # original code-point boundary makes explicit marks visible to the matcher,
+    # while still folding compatibility forms such as fullwidth ASCII. It also
+    # avoids broadening matches to ordinary precomposed accented words.
+    return "".join(
+        unicodedata.normalize("NFKC", character).casefold() for character in text
+    )
 
 
 def _truth_separator(character: str) -> bool:

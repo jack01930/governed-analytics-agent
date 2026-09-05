@@ -249,8 +249,14 @@ def test_truth_isolation_rejects_separator_and_unicode_disguises(
 
 @pytest.mark.parametrize(
     "separator",
-    ["\u034f", "\ufe0f", "\u2060\u034f\ufe0f\u200b"],
-    ids=["combining-grapheme-joiner", "variation-selector", "mixed-default-ignorable"],
+    ["\u0300", "\u0301", "\u034f", "\ufe0f", "\u2060\u034f\ufe0f\u200b"],
+    ids=[
+        "combining-grave-accent",
+        "combining-acute-accent",
+        "combining-grapheme-joiner",
+        "variation-selector",
+        "mixed-default-ignorable",
+    ],
 )
 @pytest.mark.parametrize(
     "surface", ["mapping_key", "mapping_value", "purpose", "raw_sql", "expanded_action"]
@@ -275,7 +281,10 @@ def test_truth_isolation_skips_all_non_alnum_inside_every_pattern_and_surface(
     assert suites._contains_truth(value)
 
 
-@pytest.mark.parametrize("separator", ["\u034f", "\ufe0f", "\u2060\u034f\ufe0f\u200b"])
+@pytest.mark.parametrize(
+    "separator",
+    ["\u0300", "\u0301", "\u034f", "\ufe0f", "\u2060\u034f\ufe0f\u200b"],
+)
 def test_candidate_sql_unicode_marks_fail_with_fixed_redacted_error(
     separator: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -291,6 +300,23 @@ def test_candidate_sql_unicode_marks_fail_with_fixed_redacted_error(
         ValueError, match=r"^candidate SQL cannot contain evaluation truth sentinels$"
     ):
         load_fixture_scripts()
+
+
+@pytest.mark.parametrize("truth_key", sorted(suites._TRUTH_KEYS))
+def test_truth_isolation_does_not_expand_to_precomposed_accented_words(
+    truth_key: str,
+) -> None:
+    compact = "".join(character for character in truth_key if character.isalnum())
+    accent_at = next(
+        index for index, character in enumerate(compact) if character in {"a", "e", "o"}
+    )
+    accented = (
+        compact[:accent_at]
+        + {"a": "á", "e": "é", "o": "ó"}[compact[accent_at]]
+        + compact[accent_at + 1 :]
+    )
+
+    assert not suites._contains_truth(accented)
 
 
 def test_truth_isolation_uses_alphanumeric_boundaries_without_false_positive(
