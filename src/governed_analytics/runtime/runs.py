@@ -678,8 +678,55 @@ class AnalysisRunner:
                 await self._ensure_running(run_id, owner_token)
                 context: AgentContext | None = None
                 result: AgentRunResult | None = None
+                candidate: object | None = None
+                timeout: TimeoutContext | None = None
                 try:
-                    context = self._context_factory(run_id, owner_token)
+                    timeout = self._timeout_factory(self._timeout_seconds)
+                    async with timeout:
+                        # The factory creates BudgetLedger synchronously. Keeping it as
+                        # the first operation after timeout entry leaves no scheduling
+                        # gap between the two running-time deadlines.
+                        try:
+                            context = self._context_factory(run_id, owner_token)
+                        except asyncio.CancelledError:
+                            if _task_is_cancelling():
+                                raise
+                            result = self._failure_result(
+                                run_id,
+                                context,
+                                status=FinalStatus.INTERNAL_ERROR,
+                                reason=StopReason.INTERNAL_ERROR,
+                            )
+                        except Exception:
+                            result = self._failure_result(
+                                run_id,
+                                context,
+                                status=FinalStatus.INTERNAL_ERROR,
+                                reason=StopReason.INTERNAL_ERROR,
+                            )
+                        await self._events.emit(
+                            run_id,
+                            "runtime",
+                            "run.started",
+                            {"status": "running"},
+                            owner_token=owner_token,
+                        )
+                        if result is None:
+                            candidate = await self._agent_executor(
+                                run_id=run_id,
+                                query=query,
+                                context=context,
+                            )
+                except TimeoutError:
+                    expired = _timeout_expired(timeout)
+                    result = self._failure_result(
+                        run_id,
+                        context,
+                        status=(
+                            FinalStatus.EXECUTION_FAILED if expired else FinalStatus.INTERNAL_ERROR
+                        ),
+                        reason=(StopReason.TASK_TIMEOUT if expired else StopReason.INTERNAL_ERROR),
+                    )
                 except asyncio.CancelledError:
                     if _task_is_cancelling():
                         raise
@@ -696,54 +743,8 @@ class AnalysisRunner:
                         status=FinalStatus.INTERNAL_ERROR,
                         reason=StopReason.INTERNAL_ERROR,
                     )
-                if result is None:
-                    timeout: TimeoutContext | None = None
-                    try:
-                        timeout = self._timeout_factory(self._timeout_seconds)
-                        async with timeout:
-                            await self._events.emit(
-                                run_id,
-                                "runtime",
-                                "run.started",
-                                {"status": "running"},
-                                owner_token=owner_token,
-                            )
-                            candidate = await self._agent_executor(
-                                run_id=run_id,
-                                query=query,
-                                context=context,
-                            )
-                    except TimeoutError:
-                        expired = _timeout_expired(timeout)
-                        result = self._failure_result(
-                            run_id,
-                            context,
-                            status=(
-                                FinalStatus.EXECUTION_FAILED
-                                if expired
-                                else FinalStatus.INTERNAL_ERROR
-                            ),
-                            reason=(
-                                StopReason.TASK_TIMEOUT if expired else StopReason.INTERNAL_ERROR
-                            ),
-                        )
-                    except asyncio.CancelledError:
-                        if _task_is_cancelling():
-                            raise
-                        result = self._failure_result(
-                            run_id,
-                            context,
-                            status=FinalStatus.INTERNAL_ERROR,
-                            reason=StopReason.INTERNAL_ERROR,
-                        )
-                    except Exception:
-                        result = self._failure_result(
-                            run_id,
-                            context,
-                            status=FinalStatus.INTERNAL_ERROR,
-                            reason=StopReason.INTERNAL_ERROR,
-                        )
-                    else:
+                else:
+                    if result is None:
                         result = self._validated_result(run_id, candidate, context)
                 self._terminalizing.add(run_id)
                 try:

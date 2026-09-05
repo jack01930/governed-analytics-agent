@@ -380,9 +380,13 @@ async def test_running_deadline_covers_blocked_run_started_event() -> None:
     events = BlockingStartedEventStore(clock=clock.now)
     timeout_factory = ControlledTimeoutFactory()
     contexts: list[AgentContext] = []
+    timeout_entered_when_context_created: list[bool] = []
     executor_calls: list[str] = []
 
     def make_context(_run_id: str, _owner_token: object) -> AgentContext:
+        timeout_entered_when_context_created.append(
+            len(timeout_factory.contexts) == 1 and timeout_factory.contexts[0].entered.is_set()
+        )
         context = context_for(clock)
         contexts.append(context)
         return context
@@ -408,6 +412,7 @@ async def test_running_deadline_covers_blocked_run_started_event() -> None:
         running = await runs.get("run-1")
         assert running.lifecycle_status is RunLifecycleStatus.RUNNING
         assert len(contexts) == 1
+        assert timeout_entered_when_context_created == [True]
         assert contexts[0].budget.snapshot.deadline_monotonic == 60.0
         assert len(timeout_factory.contexts) == 1
         assert timeout_factory.contexts[0].entered.is_set()
@@ -466,6 +471,15 @@ async def test_internal_timeout_error_is_not_reported_as_task_timeout(source: st
         assert terminal.final_status is FinalStatus.INTERNAL_ERROR
         assert terminal.stop_reason is StopReason.INTERNAL_ERROR
         assert all(not timeout.expired() for timeout in timeout_factory.contexts)
+        snapshot = await events.replay_snapshot(
+            "run-1",
+            high_water_mark=await events.high_water_mark("run-1"),
+        )
+        assert [event.type for event in snapshot] == [
+            "run.created",
+            "run.started",
+            "run.terminal",
+        ]
     finally:
         await runner.shutdown()
 
