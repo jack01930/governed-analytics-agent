@@ -10,14 +10,15 @@
 
 本报告只读取本次命令写入的两个精确指针/摘要，没有按时间或目录搜索历史报告：
 
-- Week 3 run ID：`week3-20260905T075938Z-deace820`
-- Week 3 生成时间：`2026-09-05T07:59:38.423298Z`（Asia/Shanghai `2026-09-05 15:59:38`）
-- Week 3 report：`/Users/a0000/Projects/Agent-soft/.worktrees/week3-agent-api/artifacts/evals/week3/fixture/20260905T075938Z-week3-20260905T075938Z-deace820/report.json`
+- Week 3 run ID：`week3-20260905T084029Z-2e326b40`
+- Week 3 生成时间：`2026-09-05T08:40:29.373421Z`（Asia/Shanghai `2026-09-05 16:40:29`）
+- Week 3 report：`/Users/a0000/Projects/Agent-soft/.worktrees/week3-agent-api/artifacts/evals/week3/fixture/20260905T084029Z-week3-20260905T084029Z-2e326b40/report.json`
 - overall manifest：`c0ec7ff77b5927210fdeda1648e32ecc71f3819d6724b0eea5092a262bb4e577`
 - known cohort：`01b9b184b42bde3e710124eea0861ac032ae3ebdd0dfee0e9048174ec932af88`
 - heldout cohort：`a8da032f4ea0b1c09eefc65ba11e44c84a06ec94afc867d53b1b621a36511cb5`
 - executed fixture manifest：`44291f95af7daab1dd0b96cbe6fb1377ed0efbf44cc228a7330bb46779587f53`
-- Week 2 fixture run ID：`dee16d4ccca44b37ae991f2d508cb9fd`
+- baseline fixture run ID：`ad906828dace4ffda760a6cd7be148ec`
+- Week 2 fixture run ID：`5cb95110dcb4477598285928b3773782`
 - Week 2 suite manifest：`ec5e210d8be4391903904ef65f4c1dcd5b8c7d0898a020f61e4486054ad0277d`
 
 ## 总体与 cohort
@@ -98,25 +99,36 @@ task、thread 或 engine residue。报告与本分析不含 SQL、raw rows、pro
 
 Week 2 本次 fixture 独立保持 static safety 20/20（summary rate 1），不进入任何 Week 3 JSON 或分母。
 
+## 最终 Important 修复
+
+最终证据运行在 HEAD `5eee13f`，并包含四项已关闭的 Important 修复：
+
+- `225e477`：修复终态预算覆盖并收紧内部导出。
+- `5b61c9d`：收紧 run task timeout 的起点。
+- `5da2206`：将 context 构造纳入 task timeout。
+- `5eee13f`：修复 Week 3 publication evidence 验真并绑定冻结 script snapshot。
+
 ## 运行门禁与环境说明
 
-- `make check`：1667/1667 unit tests，Ruff 与 mypy 通过。
+- `make check`：Ruff 通过，mypy 覆盖 158 个 source files，1683/1683 unit tests 通过。
 - `make migrate`、`make data-tiny`、`make data-verify`：通过；tiny dataset ID 为
   `a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2`。
 - `make test-integration`：86/86 通过。
-- baseline fixture、Week 2 fixture summary、Week 3 fixture pointer：最终均在本地只读数据库环境下通过。
-- 首次 `make db-up` 因原有健康容器 `feat-week-1-data-baseline-db-1` 占用 127.0.0.1:5432 而失败。最终 exact
-  rerun 返回 0 并启动 Week 3 容器，但该容器未发布 host port；后续使用 host URL 的门禁实际仍连接
-  `feat-week-1-data-baseline-db-1`。没有停止或重启原容器。
+- baseline fixture、Week 2 fixture summary、Week 3 fixture pointer：最终均在本地只读数据库环境下通过；run ID
+  分别为 `ad906828dace4ffda760a6cd7be148ec`、`5cb95110dcb4477598285928b3773782`、
+  `week3-20260905T084029Z-2e326b40`。
+- `make db-up` 返回 2，因为健康的 `feat-week-1-data-baseline-db-1` 已占用 127.0.0.1:5432。本 worktree
+  的容器当前为 Created 且未发布 host port；没有停止、重启或清理任一容器。后续 host URL 门禁实际连接
+  `feat-week-1-data-baseline-db-1`。
 - Week 3 direct exact 命令首次因 isolated worktree 没有 `DATABASE_URL` 而失败；随后创建 ignored `.env`，其中
   仅包含 local DB 与 fixture gate 配置、不含任何模型 key，并以完全相同的原命令重跑成功。
 
 ## 结论与限制
 
-最终 exact 离线命令均成功；上述容器端口拓扑和 isolated worktree `.env` 是环境事实，不改变 Agent graph、工具、
-只读数据库治理、评分、预算、报告、API/SSE 与 Week 1/2 回归已满足离线技术条件。因此可以向用户申请一次、
-固定 case/预算的 Week 3 live 授权。这里的“可以申请”不是授权本身；本次没有运行 DeepSeek/live/API，也没有
-产生模型费用。
+除 `make db-up` 的既有健康容器端口碰撞外，后续 exact 离线门禁均成功；上述容器拓扑和 isolated worktree
+`.env` 是环境事实，不改变 Agent graph、工具、只读数据库治理、评分、预算、报告、API/SSE 与 Week 1/2 回归
+已满足离线技术条件。因此可以向用户申请一次、固定 case/预算的 Week 3 live 授权。这里的“可以申请”不是授权
+本身；本次没有运行 DeepSeek/live/API/network，也没有产生模型费用。
 
 首次 live 仍可能暴露真实语言理解、规划、工具选择、structured output、repair 和 resolved-model/usage 完整性问题。
 fixture 40/40 不应与 Week 2 live 或 Week 1 裸基线做提升差值，也不能作为生产质量结论。

@@ -673,10 +673,10 @@ Success: no issues found in 158 source files
 make check
 All checks passed!
 Success: no issues found in 158 source files
-1667 passed
+1683 passed
 
 make db-up
-exit 0
+exit 2: healthy feat-week-1-data-baseline-db-1 already owns 127.0.0.1:5432
 
 make migrate
 exit 0
@@ -691,7 +691,7 @@ make test-integration
 86 passed
 
 uv run governed-eval baseline --dataset tiny --mode fixture
-exit 0
+exit 0; run_id=ad906828dace4ffda760a6cd7be148ec
 
 uv run governed-eval week2 --dataset tiny --mode fixture --summary-file artifacts/evals/week2/week2-fixture-summary.json
 exit 0
@@ -702,12 +702,13 @@ exit 0
 
 最终证据绑定：
 
-- Week 2 run ID：`dee16d4ccca44b37ae991f2d508cb9fd`
+- baseline run ID：`ad906828dace4ffda760a6cd7be148ec`
+- Week 2 run ID：`5cb95110dcb4477598285928b3773782`
 - Week 2 suite manifest：`ec5e210d8be4391903904ef65f4c1dcd5b8c7d0898a020f61e4486054ad0277d`
 - Week 2 safety：20/20，rate 1
-- Week 3 run ID：`week3-20260905T075938Z-deace820`
-- Week 3 generated at：`2026-09-05T07:59:38.423298Z`
-- Week 3 report：`/Users/a0000/Projects/Agent-soft/.worktrees/week3-agent-api/artifacts/evals/week3/fixture/20260905T075938Z-week3-20260905T075938Z-deace820/report.json`
+- Week 3 run ID：`week3-20260905T084029Z-2e326b40`
+- Week 3 generated at：`2026-09-05T08:40:29.373421Z`
+- Week 3 report：`/Users/a0000/Projects/Agent-soft/.worktrees/week3-agent-api/artifacts/evals/week3/fixture/20260905T084029Z-week3-20260905T084029Z-2e326b40/report.json`
 - Week 3 overall/known/heldout/executed manifest：分别为
   `c0ec7ff77b5927210fdeda1648e32ecc71f3819d6724b0eea5092a262bb4e577`、
   `01b9b184b42bde3e710124eea0861ac032ae3ebdd0dfee0e9048174ec932af88`、
@@ -718,8 +719,12 @@ exit 0
   repair 1/2、valid Execute 37/41；first/final 六项的适用分母均为 26，其中 result、alias contract、
   production validation、execution、strict 均 26/26，truncated occurrence 均 0/26。
 
-环境事实：首次 `make db-up` 曾因原有健康容器 `feat-week-1-data-baseline-db-1` 占用 127.0.0.1:5432
-失败；最终 exact rerun 返回 0 并启动 Week 3 容器，但它未发布 host port，后续 host URL gates 实际仍使用
-`feat-week-1-data-baseline-db-1`。原容器没有被停止或重启。Week 3 direct exact 首次因 isolated worktree
+最终证据对应 HEAD `5eee13f`，包含四项已关闭 Important：`225e477` 修复终态预算覆盖并收紧内部导出，
+`5b61c9d` 收紧 run task timeout 起点，`5da2206` 将 context 构造纳入 task timeout，`5eee13f` 修复
+Week 3 publication evidence 验真并绑定冻结 script snapshot。
+
+环境事实：`make db-up` 返回 2，因为健康的 `feat-week-1-data-baseline-db-1` 已占用 127.0.0.1:5432；
+本 worktree 容器当前为 Created，未发布 host port，也未被清理。后续 host URL gates 实际仍使用
+`feat-week-1-data-baseline-db-1`，期间没有停止或重启容器。Week 3 direct exact 首次因 isolated worktree
 没有 `DATABASE_URL` 失败；随后创建 ignored `.env`，仅配置 local DB 与 fixture gates、不含模型 key，原命令不变
-重跑成功。整个最终证据过程未运行 live/DeepSeek，也未创建 API client 或产生模型费用。
+重跑成功。整个最终证据过程未运行 live/DeepSeek/API/network，也未创建 API client 或产生模型费用。
