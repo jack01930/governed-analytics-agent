@@ -223,3 +223,72 @@ Success: no issues found in 156 source files
 - same-tick child exception、hostile owned 显式回收、cooperative owned、borrowed Task/Future 及真实 SSE lease/thread/engine 检查全部保持通过。
 - fail-before-create 回归不依赖 task name 或 coroutine 私有 metadata；异常路径无 pending Task、无未 await coroutine warning。
 - 未修改/提交 production API/SSE、Phase B 文件或 controller `progress.md`；Fix2 后停止等待 review。
+
+## Phase A Fix round 3
+
+### RED / mutation
+
+先加入带 prose/provider prefix 的 credential assignment、GRANT/COPY 多语句、`ON ALL TABLES IN SCHEMA`、quoted-semicolon 与 trailing-comment 矩阵：
+
+```text
+uv run pytest tests/integration/api/test_api_sse.py -q -k 'safe_output_oracle'
+.F
+1 failed, 1 passed, 12 deselected in 1.20s
+```
+
+首个失败为 `OPENAIAPIKEY` label/assignment 未拒绝；同一 mutation 已预先包含 parsed key/value、generic pair value、`safe_arguments` value 与 raw comment。
+
+加入 credential suffix 机制后再次运行，失败推进到 SQL 矩阵：
+
+```text
+uv run pytest tests/integration/api/test_api_sse.py -q -k 'safe_output_oracle'
+.F
+1 failed, 1 passed, 12 deselected in 1.17s
+```
+
+此时 credential 全矩阵已通过，SQL 类别中的新增 statement-boundary 变体仍被放行，证明整串 GRANT/COPY fullmatch 不足。
+
+### GREEN
+
+- assignment scanner 对 NFKC 后的每个 `:`/`=` delimiter 检查其前缀是否以 credential lexeme 结尾；compound lexeme 使用边界化 compact suffix，单词 label 使用末 token，覆盖 `Use APIKey`、`please use token`、`OPENAIAPIKEY`、provider prefix、mixed/acronym/fullwidth/casefold。没有 assignment 的正常 prose 保持可接受。
+- SQL scanner 使用 sqlglot PostgreSQL `Tokenizer` 获得真实 semicolon token，再按原字符串 offset 分句；quoted semicolon 不分句，line/block comment 中的 semicolon 不分句，trailing comment 保持在下一片段并由安全 normalize 去除。
+- 每个 statement 独立分类：query/CTE 继续进入生产 `validate_sql()`；GRANT/COPY 先走 anchored common structure，失败后只有出现 SQL 特征关键词结构才 fail closed，故 `ON ALL TABLES IN SCHEMA`、GRANT+DROP 与双 COPY 均拒绝，而 `grant access to the cached model` 仍允许。
+- command 分句只使用 tokenizer，不调用 sqlglot parser 的 fallback `Command`，测试同时断言 sqlglot logger、stdout、stderr 均为空；所有拒绝仍为固定 `_SAFE_OUTPUT_ERROR`。
+- Fix1/Fix2 的 owned/borrowed handle、same-tick exception、hostile release/reclaim 全部保留并纳入聚焦复验。
+
+### 验证
+
+```text
+uv run pytest tests/integration/api/test_api_sse.py -q -k 'safe_output_oracle or deadline or borrowed or caller_cancellation or hostile or owned_handle'
+...........
+11 passed, 3 deselected in 1.30s
+
+uv run ruff check tests/integration/api/test_api_sse.py
+All checks passed!
+
+uv run mypy tests/integration/api/test_api_sse.py
+Success: no issues found in 1 source file
+
+DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest tests/integration/agent/test_graph.py tests/integration/api/test_api_sse.py -q
+.................
+17 passed in 2.19s
+
+DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest tests/integration/api/test_api_sse.py tests/integration/agent/test_graph.py -q
+.................
+17 passed in 2.16s
+
+PYTHONASYNCIODEBUG=1 PYTHONWARNINGS=error DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest --asyncio-debug -o asyncio_default_fixture_loop_scope=function tests/integration/agent/test_graph.py tests/integration/api/test_api_sse.py -q
+.................
+17 passed in 2.39s
+
+make check
+All checks passed!
+Success: no issues found in 156 source files
+1610 passed in 43.97s
+```
+
+### 残留检查
+
+- credential 与 SQL 新矩阵覆盖 parsed/raw/pair 边界，failure traceback 继续由 redaction helper 验证不含 operand。
+- asyncio debug + warnings-as-errors 无未观察 exception、未 await coroutine 或 pending-task warning；hostile dependency 仅在测试显式 release 后 reclaim。
+- 未修改/提交 production API/SSE、Phase B 文件或 controller ledger；Fix3 后停止等待 scoped review。

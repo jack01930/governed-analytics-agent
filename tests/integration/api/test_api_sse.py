@@ -20,6 +20,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlglot import Tokenizer, TokenType
+from sqlglot.errors import TokenError
 from sse_starlette.event import ServerSentEvent
 
 import governed_analytics.api.dependencies as dependencies
@@ -1119,7 +1121,7 @@ def _is_forbidden_field_name(value: object) -> bool:
         normalized in _FORBIDDEN_KEYS
         or normalized.endswith("_sql")
         or normalized.startswith("sql_")
-        or _is_credential_label(normalized)
+        or _has_credential_label_suffix(normalized)
     )
 
 
@@ -1158,17 +1160,39 @@ def _is_credential_label(value: str) -> bool:
     )
 
 
+def _has_credential_label_suffix(value: str) -> bool:
+    normalized = _normalize_sensitive_label(value)
+    parts = tuple(part for part in normalized.split("_") if part)
+    if parts and parts[-1] in {
+        "authorization",
+        "bearer",
+        "credential",
+        "credentials",
+        "password",
+        "secret",
+        "token",
+    }:
+        return True
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
+    return any(
+        compact.endswith(label)
+        for label in ("apikey", "clientsecret", "databasepassword", "accesstoken")
+    )
+
+
 def _contains_credential_assignment(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value)
     if re.search(r"(?i)(?<![\w-])bearer\s+\S+", normalized):
         return True
-    for match in re.finditer(r"(?<!\w)([\w .\\/\-]{1,80}?)\s*[:=]", normalized):
-        if _is_credential_label(match.group(1)):
+    for delimiter in re.finditer(r"[:=]", normalized):
+        if _has_credential_label_suffix(normalized[: delimiter.start()]):
             return True
     return False
 
 
 _SQL_QUERY_HEAD = re.compile(r"^(?:select|with|values)\b", re.IGNORECASE)
+_SQL_GRANT_HEAD = re.compile(r"^grant\s+", re.IGNORECASE)
+_SQL_COPY_HEAD = re.compile(r"^copy\s+", re.IGNORECASE)
 _SQL_GRANT_STRUCTURE = re.compile(
     r"^grant\s+(?:"
     r"(?:(?:all(?:\s+privileges)?|select|insert|update|delete|truncate|references|"
@@ -1213,16 +1237,33 @@ _SQL_COMMAND_STRUCTURE = re.compile(
 )
 
 
-def _is_sql_statement(value: str) -> bool:
+def _split_sql_statements(value: str) -> tuple[str, ...]:
+    tokens = Tokenizer(dialect="postgres").tokenize(value)
+    statements: list[str] = []
+    start = 0
+    for token in tokens:
+        if token.token_type != TokenType.SEMICOLON:
+            continue
+        statements.append(value[start : token.start])
+        start = token.end + 1
+    statements.append(value[start:])
+    return tuple(statements)
+
+
+def _is_single_sql_statement(value: str) -> bool:
     normalized = _normalize_sql_text(value).strip()
-    if normalized.endswith(";"):
-        normalized = normalized[:-1].rstrip()
     if not normalized:
         return False
     if _SQL_GRANT_STRUCTURE.fullmatch(normalized):
         return True
+    if _SQL_GRANT_HEAD.match(normalized):
+        return bool(re.search(r"\bon\b.+\bto\b", normalized, re.IGNORECASE | re.DOTALL))
     if _SQL_COPY_STRUCTURE.fullmatch(normalized):
         return True
+    if _SQL_COPY_HEAD.match(normalized):
+        return bool(
+            re.search(r"\b(?:to|from)\b", normalized, re.IGNORECASE | re.DOTALL)
+        )
     if _SQL_COMMAND_STRUCTURE.match(normalized):
         return True
     if not _SQL_QUERY_HEAD.match(normalized):
@@ -1235,6 +1276,20 @@ def _is_sql_statement(value: str) -> bool:
             SqlRejectionCode.INVALID_SQL,
         }
     return True
+
+
+def _is_sql_statement(value: str) -> bool:
+    try:
+        statements = _split_sql_statements(value)
+    except TokenError:
+        normalized = _normalize_sql_text(value).strip()
+        return bool(
+            _SQL_QUERY_HEAD.match(normalized)
+            or _SQL_GRANT_HEAD.match(normalized)
+            or _SQL_COPY_HEAD.match(normalized)
+            or _SQL_COMMAND_STRUCTURE.match(normalized)
+        )
+    return any(_is_single_sql_statement(statement) for statement in statements)
 
 
 def _assert_safe_string(value: str) -> None:
@@ -1613,11 +1668,17 @@ def test_sse_safe_output_oracle_scans_parsed_string_leaves() -> None:
     )
 
 
-def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None:
+def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     database = _oracle_database()
     credential_labels = (
         "APIKey",
         "APIKEY",
+        "OPENAIAPIKEY",
+        "providerAPIKey",
+        "provider.api_key",
         "apiKey",
         "api key",
         "api/key",
@@ -1667,13 +1728,48 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
             _sse_payloads(iter((raw_comment, "")), database)
         _assert_failure_is_redacted(raw_failure, (assignment, raw_comment))
 
+    prefixed_assignments = (
+        "Use APIKey=opaque-prefixed-api-key",
+        "please use token=opaque-prefixed-token",
+        "OPENAIAPIKEY=opaque-openai-key",
+        "providerAPIKey=opaque-provider-key",
+        "provider.api_key=opaque-provider-dot-key",
+        "\uff2f\uff30\uff25\uff2e\uff21\uff29\uff21\uff30\uff29\uff2b\uff25\uff39"
+        "\uff1dopaque-fullwidth-provider-key",
+    )
+    for assignment in prefixed_assignments:
+        candidates = (
+            {"status": assignment},
+            [["status", assignment]],
+            {"safe_arguments": [["contract_id", assignment]]},
+        )
+        for candidate in candidates:
+            serialized = json.dumps(candidate)
+            with pytest.raises(AssertionError) as failure:
+                _assert_serialized_output_has_no_secrets_or_sql(serialized, database)
+            _assert_failure_is_redacted(failure, (assignment, serialized))
+        raw_comment = f": {assignment}"
+        with pytest.raises(AssertionError) as raw_failure:
+            _sse_payloads(iter((raw_comment, "")), database)
+        _assert_failure_is_redacted(raw_failure, (assignment, raw_comment))
+
     sql_categories = (
-        ("query", ("SELECT 1", "VALUES (1)")),
+        (
+            "query",
+            (
+                "SELECT 1",
+                "SELECT ';' AS marker",
+                "SELECT 1 /* audit; marker */",
+                "SELECT 1; -- trailing comment",
+                "VALUES (1)",
+            ),
+        ),
         (
             "cte",
             (
                 "WITH exposed AS (SELECT 1) SELECT * FROM exposed",
                 "WITH exposed(value) AS (VALUES (1)) SELECT value FROM exposed",
+                "WITH marker AS (SELECT ';' AS value) SELECT value FROM marker",
             ),
         ),
         (
@@ -1699,8 +1795,11 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
             (
                 "GRANT SELECT ON orders TO analyst",
                 "GRANT ALL PRIVILEGES ON TABLE orders TO analyst",
+                "GRANT SELECT ON ALL TABLES IN SCHEMA public TO analyst",
                 "GRANT SELECT, UPDATE ON TABLE orders TO analyst WITH GRANT OPTION",
                 "GRANT analyst_role TO report_user WITH ADMIN OPTION;",
+                "GRANT SELECT ON orders TO analyst; /* trailing; comment */",
+                "GRANT SELECT ON orders TO analyst; DROP TABLE audit_log",
             ),
         ),
         (
@@ -1709,6 +1808,8 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
                 "COPY orders TO STDOUT",
                 "COPY orders (order_id) TO STDOUT",
                 "COPY (SELECT * FROM orders) TO STDOUT",
+                "COPY (SELECT ';' AS marker FROM orders) TO STDOUT",
+                "COPY orders TO STDOUT; COPY audit_log TO STDOUT",
             ),
         ),
     )
@@ -1725,6 +1826,10 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
                 with pytest.raises(AssertionError) as failure:
                     _assert_serialized_output_has_no_secrets_or_sql(serialized, database)
                 _assert_failure_is_redacted(failure, (statement, serialized))
+            raw_comment = f": {statement}"
+            with pytest.raises(AssertionError) as raw_failure:
+                _sse_payloads(iter((raw_comment, "")), database)
+            _assert_failure_is_redacted(raw_failure, (statement, raw_comment))
 
     unsafe_raw_lines = (
         ": apiKey=opaque-comment-value",
@@ -1751,6 +1856,11 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
             json.dumps({"status": prose}),
             database,
         )
+    captured = capsys.readouterr()
+    _safe_output_require(captured.out == "" and captured.err == "")
+    _safe_output_require(
+        not any(record.name.startswith("sqlglot") for record in caplog.records)
+    )
 
 
 async def _late_success_after_cancellation(
