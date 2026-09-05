@@ -349,7 +349,8 @@ def score_tool_trace(
     sequence_ok = True
     if ActionType.EXECUTE_SQL in required_tools:
         sequence_ok = (
-            ActionType.METRIC_LOOKUP in positions
+            ActionType.EXECUTE_SQL in positions
+            and ActionType.METRIC_LOOKUP in positions
             and ActionType.SCHEMA_LOOKUP in positions
             and positions[ActionType.METRIC_LOOKUP] < positions[ActionType.SCHEMA_LOOKUP]
             and positions[ActionType.SCHEMA_LOOKUP] < positions[ActionType.EXECUTE_SQL]

@@ -1000,3 +1000,34 @@ async def test_full_canonical_scoring_failure_report_remains_publishable(
     assert all(not case.suite_score.conformant for case in artifact.report.cases)
     assert len(list((artifact.report_dir / "cases").glob("*.json"))) == 40
     assert "Scoring failures: 40" in artifact.report_markdown.read_text()
+
+
+@pytest.mark.asyncio
+async def test_all_cases_can_publish_lookup_only_early_failures_without_scoring_errors(
+    tmp_path: Path,
+) -> None:
+    class Executor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            return _failure(case_id).model_copy(
+                update={
+                    "governance": GovernanceSnapshot(tool_calls=2),
+                    "safe_trace": SafeTrace(
+                        tool_calls=tuple(
+                            ToolCallTrace(tool_name=tool, purpose=tool.value, safe_arguments=())
+                            for tool in (ActionType.METRIC_LOOKUP, ActionType.SCHEMA_LOOKUP)
+                        )
+                    ),
+                }
+            )
+
+    artifact = await run_week3_evaluation(
+        mode="fixture",
+        executor=Executor(),
+        output_root=tmp_path,
+        run_id="lookup-only-failures",
+    )
+    assert artifact.report.case_count == 40
+    assert artifact.report.passed_count == 0
+    assert all(case.scoring_failure is None for case in artifact.report.cases)
+    assert all(case.error_type is None for case in artifact.report.cases)
+    assert sum(case.observed_tool_calls for case in artifact.report.cases) == 80

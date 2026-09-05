@@ -47,3 +47,21 @@
 - 运行新 live 前，对历史 Week3 两轮和 Week2 引用证据的 78 个文件记录逐字节 SHA-256，运行后再次比对。
 
 新的完整 live 及历史对比另行记录，避免混入历史报告的原始结论。
+
+## 新 live 后补充的工具评分边界修复
+
+`febc12f` 上的新完整 run `week3-20260905T165012Z-f2e463b7` 实际保留了 25 条评分异常的原始 trace，
+由此发现此前离线覆盖遗漏了“Metric 和 Schema 均已查询、Execute 尚未发生”的终止路径。
+`score_tool_trace` 检查了前两项存在，却没有检查 Execute 存在，就读取 `positions[EXECUTE_SQL]`。
+
+新增三种 lookup 前缀的测试在修改前得到 2 通过、1 失败，精确复现 `KeyError: execute_sql`。
+补丁增加 Execute 存在性检查。补充完整 40-case lookup-only 失败发布回归；最终 `make check` 为
+1720 项单元测试通过，`make test-integration` 为 86 项通过。
+
+本轮 25 条异常均保存了相同的 Metric/Schema-only 工具路径，后续直接使用公开安全工具 trace 离线复测，
+25 条均得到不合规结果且没有异常。此操作不是恢复完整 AgentRunResult，不重算或覆盖正式 live 报告。
+该补丁在本轮 live 后落地，尚未追加付费 live；不能把本轮 25 条 scoring failure 改写成 0。
+
+本次还确认：结构校验失败的响应可能带有 usage，runtime 预算账本则执行 fail-closed 预留记账，不增加已结算
+usage。因此两条发生 plan 结构修复的用例被现有 Live executor 的 usage 一致性门禁转成 `internal_error`。
+新的报告保留了两套 usage 和 build_plan 节点失败 trace，但这处 runtime 结算/身份门禁仍待后续单独修复。

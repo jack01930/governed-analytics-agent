@@ -447,6 +447,7 @@ def test_evidence_requires_the_complete_attribution_claim_multiset() -> None:
         )
         for region, value in (("north", "10.00"), ("south", "20.00"))
     )
+
     def is_sufficient(items: tuple[EvidenceItem, ...]) -> bool:
         return score_evidence(
             required_purposes=("region_contribution",),
@@ -460,3 +461,23 @@ def test_evidence_requires_the_complete_attribution_claim_multiset() -> None:
     assert is_sufficient(claims)
     assert not is_sufficient(claims[:1])
     assert not is_sufficient((*claims, claims[0]))
+
+
+@pytest.mark.parametrize("lookup_count", (0, 1, 2))
+def test_tool_sequence_without_execute_is_nonconformant_not_an_exception(lookup_count: int) -> None:
+    tools = (ActionType.METRIC_LOOKUP, ActionType.SCHEMA_LOOKUP)
+    trace = tuple(
+        ToolCallTrace(tool_name=name, purpose=name.value, safe_arguments=())
+        for name in tools[:lookup_count]
+    )
+    score = score_tool_trace(
+        required_tools=(*tools, ActionType.EXECUTE_SQL),
+        forbidden_tools=(),
+        tool_calls=trace,
+        required_execute_triples=(
+            ("metric_value_contract", "metric_value_contract", "metric_value"),
+        ),
+    )
+    assert not score.required_present
+    assert not score.sequence_conformant
+    assert not score.conformant
