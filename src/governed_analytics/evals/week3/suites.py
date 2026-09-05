@@ -7,9 +7,10 @@ import stat
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
@@ -185,44 +186,80 @@ def _thaw(value: object) -> object:
     return value
 
 
-def _normalize_truth_text(text: str) -> str:
-    # Normalize each source code point independently. Whole-string NFKC would
-    # compose an inserted combining mark with its preceding ASCII letter and
-    # turn that separator into a different alphanumeric character. Keeping the
-    # original code-point boundary makes explicit marks visible to the matcher,
-    # while still folding compatibility forms such as fullwidth ASCII. It also
-    # avoids broadening matches to ordinary precomposed accented words.
+@dataclass(frozen=True, slots=True)
+class _TruthUnit:
+    value: str
+    kind: Literal["literal", "separator", "barrier"]
+
+    @property
+    def is_literal(self) -> bool:
+        return self.kind == "literal"
+
+    @property
+    def is_separator(self) -> bool:
+        return self.kind == "separator"
+
+    @property
+    def preserves_alnum_boundary(self) -> bool:
+        return self.kind != "separator"
+
+
+def _normalize_truth_text(text: str) -> tuple[_TruthUnit, ...]:
+    units: list[_TruthUnit] = []
+    for source in text:
+        if not source.isalnum():
+            # Marks, format characters, punctuation and whitespace explicitly
+            # present in the input remain skippable separators. Do not NFKC-map
+            # compatibility symbols into literals without their source class.
+            units.append(_TruthUnit(source, kind="separator"))
+            continue
+        folded = unicodedata.normalize("NFKC", source).casefold()
+        # Every unit retains that it came from an alphanumeric source. Folded
+        # alphanumerics are literals; any mark or punctuation introduced by the
+        # fold is therefore a hard barrier rather than a skippable separator.
+        units.extend(
+            _TruthUnit(
+                character,
+                kind="literal" if character.isalnum() else "barrier",
+            )
+            for character in folded
+        )
+    return tuple(units)
+
+
+def _fold_truth_key(text: str) -> str:
     return "".join(
         unicodedata.normalize("NFKC", character).casefold() for character in text
     )
 
 
-def _truth_separator(character: str) -> bool:
-    return not character.isalnum()
-
-
 _TRUTH_PATTERNS = tuple(
-    "".join(character for character in _normalize_truth_text(key) if character.isalnum())
+    "".join(unit.value for unit in _normalize_truth_text(key) if unit.is_literal)
     for key in sorted(_TRUTH_KEYS)
 )
 
 
-def _matches_truth_pattern(text: str, pattern: str) -> bool:
-    for start, character in enumerate(text):
-        if character != pattern[0] or (start > 0 and text[start - 1].isalnum()):
+def _matches_truth_pattern(text: tuple[_TruthUnit, ...], pattern: str) -> bool:
+    for start, unit in enumerate(text):
+        if (
+            not unit.is_literal
+            or unit.value != pattern[0]
+            or (start > 0 and text[start - 1].preserves_alnum_boundary)
+        ):
             continue
         position = start
         pattern_position = 0
         while position < len(text) and pattern_position < len(pattern):
-            if text[position] == pattern[pattern_position]:
+            unit = text[position]
+            if unit.is_literal and unit.value == pattern[pattern_position]:
                 position += 1
                 pattern_position += 1
-            elif pattern_position > 0 and _truth_separator(text[position]):
+            elif pattern_position > 0 and unit.is_separator:
                 position += 1
             else:
                 break
         if pattern_position == len(pattern) and (
-            position == len(text) or not text[position].isalnum()
+            position == len(text) or not text[position].preserves_alnum_boundary
         ):
             return True
     return False
@@ -237,9 +274,9 @@ def _key_tokens(key: str) -> tuple[str, ...]:
     normalized = _normalize_truth_text(key)
     tokens: list[str] = []
     current: list[str] = []
-    for character in normalized:
-        if character.isalnum():
-            current.append(character)
+    for unit in normalized:
+        if unit.is_literal:
+            current.append(unit.value)
         elif current:
             tokens.append("".join(current))
             current = []
@@ -264,7 +301,7 @@ def _contains_truth(value: object, *, parent_key: str | None = None) -> bool:
         for key, item in value.items():
             if type(key) is not str:
                 return True
-            normalized = _normalize_truth_text(key)
+            normalized = _fold_truth_key(key)
             if normalized == "expected_evidence":
                 if _contains_truth(item, parent_key=normalized):
                     return True

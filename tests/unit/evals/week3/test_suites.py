@@ -319,6 +319,65 @@ def test_truth_isolation_does_not_expand_to_precomposed_accented_words(
     assert not suites._contains_truth(accented)
 
 
+_CASEFOLD_MARK_DISGUISES = {
+    "expected_result_path": "expecẗedresultpath",
+    "expected_rows": "expectedroẘs",
+    "expected_sql": "expecẗedsql",
+    "oracle_sql_path": "oracŀesqlpath",
+    "oracle_query_id": "oraclequeryİd",
+    "scorer_truth": "scorertrutẖ",
+    "ground_truth": "groundtrutẖ",
+}
+
+
+@pytest.mark.parametrize(
+    "disguised",
+    [
+        "expecẗedresultpath",
+        "expectedroẘs",
+        "groundtrutẖ",
+        "oraclequeryİd",
+    ],
+)
+def test_truth_isolation_keeps_marks_expanded_from_alnum_as_hard_barriers(
+    disguised: str,
+) -> None:
+    assert not suites._contains_truth(disguised)
+
+
+def test_truth_normalization_distinguishes_folded_barriers_from_input_separators() -> None:
+    units = suites._normalize_truth_text("İi\u0301")
+
+    assert [(unit.value, unit.kind) for unit in units] == [
+        ("i", "literal"),
+        ("\u0307", "barrier"),
+        ("i", "literal"),
+        ("\u0301", "separator"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "surface", ["mapping_key", "mapping_value", "purpose", "raw_sql", "expanded_action"]
+)
+@pytest.mark.parametrize("truth_key", sorted(suites._TRUTH_KEYS))
+def test_truth_isolation_does_not_match_casefold_mark_alnum_on_any_surface(
+    truth_key: str, surface: str
+) -> None:
+    disguised = _CASEFOLD_MARK_DISGUISES[truth_key]
+    if surface == "mapping_key":
+        value: object = {disguised: "safe"}
+    elif surface == "mapping_value":
+        value = {"safe": disguised}
+    elif surface == "purpose":
+        value = {"model_purpose": disguised}
+    elif surface == "raw_sql":
+        value = f"select 1 -- {disguised}"
+    else:
+        value = {"arguments": {"sql": f"select 1 -- {disguised}"}}
+
+    assert not suites._contains_truth(value)
+
+
 def test_truth_isolation_uses_alphanumeric_boundaries_without_false_positive(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
