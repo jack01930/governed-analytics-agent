@@ -453,12 +453,40 @@ class _SpyEngine:
         await self._delegate.dispose()
 
 
+@dataclass(slots=True)
+class _OwnedTaskHandle:
+    task: asyncio.Task[object] | None = None
+    reclaimed: bool = False
+
+    def bind(self, task: asyncio.Task[object]) -> None:
+        _safe_output_require(self.task is None)
+        self.task = task
+
+    async def reclaim(self) -> None:
+        _safe_output_require(self.task is not None)
+        assert self.task is not None
+        await asyncio.gather(self.task, return_exceptions=True)
+        self.reclaimed = True
+
+
+async def _cancel_owned_task[T](task: asyncio.Task[T]) -> None:
+    task.cancel()
+    try:
+        await asyncio.sleep(0)
+    finally:
+        if task.done():
+            _observe_background_task(task)
+        else:
+            task.add_done_callback(_observe_background_task)
+
+
 async def _await_with_deadline[T](
     operation: Awaitable[T],
     *,
     seconds: float,
     failure_message: str,
     owned_task_name: str = "sse-test-deadline",
+    owned_task_handle: _OwnedTaskHandle | None = None,
 ) -> T:
     loop = asyncio.get_running_loop()
     expires_at = loop.time() + seconds
@@ -467,10 +495,14 @@ async def _await_with_deadline[T](
         async def await_owned_operation() -> T:
             return await operation
 
-        task: asyncio.Future[T] = asyncio.create_task(
+        owned_task = asyncio.create_task(
             await_owned_operation(), name=owned_task_name
         )
+        if owned_task_handle is not None:
+            owned_task_handle.bind(cast(asyncio.Task[object], owned_task))
+        task: asyncio.Future[T] = owned_task
     else:
+        _safe_output_require(owned_task_handle is None)
         task = cast(asyncio.Future[T], operation)
     try:
         done, _ = await asyncio.wait(
@@ -481,14 +513,12 @@ async def _await_with_deadline[T](
         if task.done():
             _observe_background_task(task)
         elif owned:
-            task.cancel()
-            task.add_done_callback(_observe_background_task)
+            await _cancel_owned_task(cast(asyncio.Task[T], task))
         raise
     if task in done and loop.time() <= expires_at:
         return await task
     if not task.done() and owned:
-        task.cancel()
-        task.add_done_callback(_observe_background_task)
+        await _cancel_owned_task(cast(asyncio.Task[T], task))
     elif task.done():
         _observe_background_task(task)
     raise AssertionError(failure_message)
@@ -773,10 +803,14 @@ async def _blocking_cleanup_fault_probe() -> bool:
     stream = _BlockingCloseLines()
     current = asyncio.current_task()
     pending_before = _pending_tasks(current)
-    cleanup: asyncio.Task[object] | None = None
+    cleanup_handle = _OwnedTaskHandle()
     observed = False
     try:
-        await _collect_sse_lines(stream, cleanup_seconds=0.02)
+        await _collect_sse_lines(
+            stream,
+            cleanup_seconds=0.02,
+            cleanup_task_handle=cleanup_handle,
+        )
     except AssertionError as failure:
         await _await_with_deadline(
             stream.wait_for_cancellations(1),
@@ -784,29 +818,26 @@ async def _blocking_cleanup_fault_probe() -> bool:
             failure_message=_GATE_DEADLINE_ERROR,
         )
         introduced = _pending_tasks(current) - pending_before
-        named_cleanup = tuple(task for task in introduced if task.get_name() == "sse-test-cleanup")
+        cleanup = cleanup_handle.task
         observed = (
             str(failure) == _CLEANUP_DEADLINE_ERROR
             and stream.cancellations == 1
             and len(introduced) == 1
-            and len(named_cleanup) == 1
-            and not named_cleanup[0].done()
+            and cleanup is not None
+            and cleanup in introduced
+            and cleanup.get_name() == "sse-test-cleanup"
+            and not cleanup.done()
             and stream.close_started.is_set()
             and not stream.close_finished.is_set()
             and stream.active_leases == 1
         )
-        if named_cleanup:
-            cleanup = named_cleanup[0]
     finally:
         stream._release_gate.set()
-        if cleanup is not None:
-            await _await_with_deadline(
-                asyncio.gather(cleanup, return_exceptions=True),
-                seconds=_GATE_DEADLINE_SECONDS,
-                failure_message=_CLEANUP_DEADLINE_ERROR,
-            )
+        if cleanup_handle.task is not None:
+            await cleanup_handle.reclaim()
     return (
         observed
+        and cleanup_handle.reclaimed
         and stream.close_finished.is_set()
         and stream.active_leases == 0
         and _pending_tasks(current) == pending_before
@@ -821,12 +852,14 @@ async def _close_with_deadline(
     close: Callable[[], Awaitable[object]],
     *,
     seconds: float,
+    owned_task_handle: _OwnedTaskHandle | None = None,
 ) -> None:
     await _await_with_deadline(
         close(),
         seconds=seconds,
         failure_message=_CLEANUP_DEADLINE_ERROR,
         owned_task_name="sse-test-cleanup",
+        owned_task_handle=owned_task_handle,
     )
 
 
@@ -834,6 +867,7 @@ async def _collect_sse_lines(
     lines: AsyncIterator[str],
     *,
     cleanup_seconds: float = _CLEANUP_DEADLINE_SECONDS,
+    cleanup_task_handle: _OwnedTaskHandle | None = None,
 ) -> tuple[str, ...]:
     collected: list[str] = []
     try:
@@ -845,6 +879,7 @@ async def _collect_sse_lines(
             await _close_with_deadline(
                 cast(Callable[[], Awaitable[object]], close),
                 seconds=cleanup_seconds,
+                owned_task_handle=cleanup_task_handle,
             )
     return tuple(collected)
 
@@ -1112,9 +1147,10 @@ def _is_credential_label(value: str) -> bool:
 
 
 def _contains_credential_assignment(value: str) -> bool:
-    if re.search(r"(?i)(?<![\w-])bearer\s+\S+", value):
+    normalized = unicodedata.normalize("NFKC", value)
+    if re.search(r"(?i)(?<![\w-])bearer\s+\S+", normalized):
         return True
-    for match in re.finditer(r"(?<!\w)([\w .\\/\-]{1,80}?)\s*[:=]", value):
+    for match in re.finditer(r"(?<!\w)([\w .\\/\-]{1,80}?)\s*[:=]", normalized):
         if _is_credential_label(match.group(1)):
             return True
     return False
@@ -1127,10 +1163,11 @@ _SQL_COMMAND_STRUCTURE = re.compile(
     r"update\s+\S+\s+set\b|"
     r"delete\s+from\s+\S+|"
     r"merge\s+into\s+\S+|"
-    r"grant\s+\S+(?:\s*,\s*\S+)*\s+on\s+\S+\s+to\s+\S+|"
-    r"revoke\s+\S+(?:\s*,\s*\S+)*\s+on\s+\S+\s+from\s+\S+|"
-    r"copy\s+\S+\s+(?:to|from)\s+\S+|"
-    r"create\s+(?:or\s+replace\s+)?(?:materialized\s+)?"
+    r"grant\s+.+\s+(?:on\s+(?:table\s+)?\S+\s+)?to\s+\S+|"
+    r"revoke\s+.+\s+(?:on\s+(?:table\s+)?\S+\s+)?from\s+\S+|"
+    r"copy\s+(?:\([^;]+\)|\S+)\s+(?:to|from)\s+\S+|"
+    r"create\s+(?:(?:or\s+replace|temp(?:orary)?|unlogged)\s+)*"
+    r"(?:materialized\s+)?"
     r"(?:table|view|index|schema|database|role|function|procedure|type|extension)\b|"
     r"alter\s+(?:table|view|index|schema|database|role|function|procedure|type)\b|"
     r"drop\s+(?:table|view|materialized\s+view|index|schema|database|role|function|"
@@ -1143,7 +1180,7 @@ _SQL_COMMAND_STRUCTURE = re.compile(
 )
 
 
-def _is_complete_sql_statement(value: str) -> bool:
+def _is_sql_statement(value: str) -> bool:
     normalized = _normalize_sql_text(value).strip().rstrip(";").strip()
     if not normalized:
         return False
@@ -1164,7 +1201,7 @@ def _is_complete_sql_statement(value: str) -> bool:
 def _assert_safe_string(value: str) -> None:
     _safe_output_require(not _is_credential_label(value))
     _safe_output_require(not _contains_credential_assignment(value))
-    _safe_output_require(not _is_complete_sql_statement(value))
+    _safe_output_require(not _is_sql_statement(value))
 
 
 def _assert_safe_tree(value: object, *, path: tuple[str, ...] = ()) -> None:
@@ -1565,29 +1602,75 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
                 _assert_serialized_output_has_no_secrets_or_sql(serialized, database)
             _assert_failure_is_redacted(failure, (label, opaque_value, serialized))
 
-    sql_statements = (
-        "SELECT 1",
-        "VALUES (1)",
-        "GRANT SELECT ON orders TO analyst",
-        "COPY orders TO STDOUT",
-        "DELETE FROM audit_log",
-        "UPDATE audit_log SET message = 'unsafe'",
-        "INSERT INTO audit_log(message) VALUES ('unsafe')",
-        "CREATE TABLE unsafe_log(id integer)",
-        "WITH exposed AS (SELECT 1) SELECT * FROM exposed",
+    unicode_assignments = (
+        "\uff41\uff50\uff49Key\uff1dopaque-fullwidth-equals",
+        "clientSecret\uff1aopaque-fullwidth-colon",
     )
-    for index, statement in enumerate(sql_statements):
-        candidates = (
-            {statement: f"safe-{index}"},
-            {"status": statement},
-            [["status", statement]],
-            {"safe_arguments": [["contract_id", statement]]},
-        )
-        for candidate in candidates:
-            serialized = json.dumps(candidate)
-            with pytest.raises(AssertionError) as failure:
-                _assert_serialized_output_has_no_secrets_or_sql(serialized, database)
-            _assert_failure_is_redacted(failure, (statement, serialized))
+    for assignment in unicode_assignments:
+        serialized = json.dumps({"status": assignment})
+        with pytest.raises(AssertionError) as failure:
+            _assert_serialized_output_has_no_secrets_or_sql(serialized, database)
+        _assert_failure_is_redacted(failure, (assignment, serialized))
+        raw_comment = f": {assignment}"
+        with pytest.raises(AssertionError) as raw_failure:
+            _sse_payloads(iter((raw_comment, "")), database)
+        _assert_failure_is_redacted(raw_failure, (assignment, raw_comment))
+
+    sql_categories = (
+        ("query", ("SELECT 1", "VALUES (1)")),
+        (
+            "cte",
+            (
+                "WITH exposed AS (SELECT 1) SELECT * FROM exposed",
+                "WITH exposed(value) AS (VALUES (1)) SELECT value FROM exposed",
+            ),
+        ),
+        (
+            "dml",
+            (
+                "DELETE FROM audit_log",
+                "UPDATE audit_log SET message = 'unsafe'",
+                "INSERT INTO audit_log(message) VALUES ('unsafe')",
+            ),
+        ),
+        (
+            "ddl",
+            (
+                "CREATE TABLE unsafe_log(id integer)",
+                "CREATE TEMP TABLE unsafe_log(id integer)",
+                "ALTER TABLE audit_log ADD COLUMN unsafe integer",
+                "DROP TABLE audit_log",
+                "TRUNCATE TABLE audit_log",
+            ),
+        ),
+        (
+            "grant",
+            (
+                "GRANT SELECT ON orders TO analyst",
+                "GRANT ALL PRIVILEGES ON TABLE orders TO analyst",
+            ),
+        ),
+        (
+            "copy",
+            (
+                "COPY orders TO STDOUT",
+                "COPY (SELECT * FROM orders) TO STDOUT",
+            ),
+        ),
+    )
+    for category_index, (_category, statements) in enumerate(sql_categories):
+        for statement in statements:
+            candidates = (
+                {statement: f"safe-{category_index}"},
+                {"status": statement},
+                [["status", statement]],
+                {"safe_arguments": [["contract_id", statement]]},
+            )
+            for candidate in candidates:
+                serialized = json.dumps(candidate)
+                with pytest.raises(AssertionError) as failure:
+                    _assert_serialized_output_has_no_secrets_or_sql(serialized, database)
+                _assert_failure_is_redacted(failure, (statement, serialized))
 
     unsafe_raw_lines = (
         ": apiKey=opaque-comment-value",
@@ -1769,6 +1852,38 @@ async def test_await_deadline_owns_coroutines_across_all_completion_paths() -> N
 
 
 @pytest.mark.asyncio
+async def test_await_deadline_exposes_and_reclaims_owned_hostile_coroutine() -> None:
+    current = asyncio.current_task()
+    pending_before = _pending_tasks(current)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    handle = _OwnedTaskHandle()
+
+    with pytest.raises(AssertionError) as deadline_failure:
+        await _await_with_deadline(
+            _late_success_after_cancellation(started, release, finished),
+            seconds=0.01,
+            failure_message=_SSE_DEADLINE_ERROR,
+            owned_task_handle=handle,
+        )
+    _safe_output_require(str(deadline_failure.value) == _SSE_DEADLINE_ERROR)
+    _safe_output_require(started.is_set())
+    owned_task = handle.task
+    _safe_output_require(owned_task is not None)
+    assert owned_task is not None
+    _safe_output_require(not owned_task.done())
+    _safe_output_require(owned_task.get_name() == "sse-test-deadline")
+    _safe_output_require(not finished.is_set())
+
+    release.set()
+    await handle.reclaim()
+    _safe_output_require(owned_task.done())
+    _safe_output_require(finished.is_set())
+    _safe_output_require(_pending_tasks(current) == pending_before)
+
+
+@pytest.mark.asyncio
 async def test_await_deadline_never_takes_ownership_of_borrowed_task_or_future() -> None:
     current = asyncio.current_task()
     pending_before = _pending_tasks(current)
@@ -1861,6 +1976,49 @@ async def test_await_deadline_never_takes_ownership_of_borrowed_task_or_future()
     _safe_output_require(
         close_borrowed.get_name() == "borrowed-close-task" and not close_borrowed.cancelled()
     )
+    await asyncio.sleep(0)
+    _safe_output_require(_pending_tasks(current) == pending_before)
+
+
+@pytest.mark.asyncio
+async def test_borrowed_future_survives_real_deadline_and_caller_cancellation() -> None:
+    loop = asyncio.get_running_loop()
+    current = asyncio.current_task()
+    pending_before = _pending_tasks(current)
+
+    deadline_future: asyncio.Future[str] = loop.create_future()
+    with pytest.raises(AssertionError) as deadline_failure:
+        await _await_with_deadline(
+            deadline_future,
+            seconds=0.01,
+            failure_message=_SSE_DEADLINE_ERROR,
+        )
+    _safe_output_require(str(deadline_failure.value) == _SSE_DEADLINE_ERROR)
+    _safe_output_require(not deadline_future.done() and not deadline_future.cancelled())
+    deadline_future.set_result("released-by-owner")
+    _safe_output_require(await deadline_future == "released-by-owner")
+
+    cancellation_future: asyncio.Future[str] = loop.create_future()
+    borrower = asyncio.create_task(
+        _await_with_deadline(
+            cancellation_future,
+            seconds=1.0,
+            failure_message=_SSE_DEADLINE_ERROR,
+        ),
+        name="borrowed-future-caller",
+    )
+    await asyncio.sleep(0)
+    borrower.cancel()
+    borrower_result = await asyncio.gather(borrower, return_exceptions=True)
+    _safe_output_require(
+        len(borrower_result) == 1
+        and isinstance(borrower_result[0], asyncio.CancelledError)
+    )
+    _safe_output_require(not cancellation_future.done() and not cancellation_future.cancelled())
+    cancellation_future.set_result("released-by-owner")
+    _safe_output_require(await cancellation_future == "released-by-owner")
+    _safe_output_require(not hasattr(deadline_future, "set_name"))
+    _safe_output_require(not hasattr(cancellation_future, "set_name"))
     await asyncio.sleep(0)
     _safe_output_require(_pending_tasks(current) == pending_before)
 
