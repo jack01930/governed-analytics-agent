@@ -28,6 +28,7 @@ from governed_analytics.tools.contracts import QueryResult as ProductionQueryRes
 
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
+type ExecuteTriple = tuple[str, str, str]
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -239,8 +240,13 @@ def candidate_observations(
         and item.contract_id == expected_contract_id
     )
     first = result.first_candidate
-    first_history_ok = first is not None and sum(item == first for item in result.observations) == 1
-    if not first_history_ok or first not in matching:
+    first_history_ok = (
+        first is not None
+        and sum(item == first for item in result.observations) == 1
+        and bool(matching)
+        and first == matching[0]
+    )
+    if not first_history_ok:
         first = None
     counts = Counter(item.observation_id for item in result.observation_validations)
     validations = {
@@ -248,6 +254,12 @@ def candidate_observations(
         for item in result.observation_validations
         if counts[item.observation_id] == 1
     }
+    fingerprints_unique = len(
+        {item.validation_fingerprint for item in result.observation_validations}
+    ) == len(result.observation_validations)
+    linkage_ok = execute_linkage_is_bijective(
+        result.observations, result.observation_validations, result.safe_trace.tool_calls
+    )
     valid: list[Observation] = []
     for observation in matching:
         validation = validations.get(observation.observation_id)
@@ -262,6 +274,8 @@ def candidate_observations(
         )
         if (
             validation is not None
+            and fingerprints_unique
+            and linkage_ok
             and validation.valid
             and validation.contract_id == observation.contract_id
             and len(validation.validation_fingerprint) == 64
@@ -317,6 +331,7 @@ def score_tool_trace(
     forbidden_tools: tuple[ActionType, ...],
     tool_calls: tuple[ToolCallTrace, ...],
     required_purposes: tuple[str, ...] = (),
+    required_execute_triples: tuple[ExecuteTriple, ...] = (),
 ) -> ToolScore:
     names = tuple(item.tool_name for item in tool_calls)
     required_present = set(required_tools).issubset(names)
@@ -330,7 +345,26 @@ def score_tool_trace(
             and positions[ActionType.METRIC_LOOKUP] < positions[ActionType.SCHEMA_LOOKUP]
             and positions[ActionType.SCHEMA_LOOKUP] < positions[ActionType.EXECUTE_SQL]
         )
-    if required_purposes:
+    if required_execute_triples:
+        actual_triples = tuple(
+            (
+                item.purpose,
+                str(dict(item.safe_arguments).get("contract_id", "")),
+                str(dict(item.safe_arguments).get("hypothesis_id", "")),
+            )
+            for item in tool_calls
+            if item.tool_name is ActionType.EXECUTE_SQL
+        )
+        sequence_ok = sequence_ok and Counter(actual_triples) == Counter(required_execute_triples)
+        ordered_purposes = tuple(item[2] for item in actual_triples)
+        if "confirm_decline" in ordered_purposes:
+            confirm_index = ordered_purposes.index("confirm_decline")
+            sequence_ok = sequence_ok and all(
+                confirm_index < ordered_purposes.index(purpose)
+                for purpose in {"region_contribution", "sku_contribution", "segment_contribution"}
+                if purpose in ordered_purposes
+            )
+    elif required_purposes:
         execute_purposes = tuple(
             item.purpose
             if item.purpose in required_purposes
@@ -355,12 +389,64 @@ def score_tool_trace(
     )
 
 
+def _observation_trace_key(observation: Observation) -> tuple[object, ...]:
+    return (
+        observation.query_id,
+        observation.purpose,
+        observation.contract_id,
+        observation.hypothesis_id,
+        observation.columns,
+        observation.row_count,
+        observation.possibly_truncated,
+    )
+
+
+def _tool_trace_key(trace: ToolCallTrace) -> tuple[object, ...]:
+    arguments = dict(trace.safe_arguments)
+    return (
+        trace.query_id,
+        trace.purpose,
+        arguments.get("contract_id"),
+        arguments.get("hypothesis_id"),
+        trace.columns,
+        trace.row_count,
+        trace.possibly_truncated,
+    )
+
+
+def execute_linkage_is_bijective(
+    observations: tuple[Observation, ...],
+    validations: tuple[ObservationValidation, ...],
+    tool_calls: tuple[ToolCallTrace, ...],
+) -> bool:
+    successful = tuple(
+        item for item in observations if item.tool_name is ActionType.EXECUTE_SQL and item.ok
+    )
+    validation_counts = Counter(item.observation_id for item in validations)
+    if validation_counts != Counter(item.observation_id for item in successful):
+        return False
+    by_id = {item.observation_id: item for item in successful}
+    if any(by_id[item.observation_id].contract_id != item.contract_id for item in validations):
+        return False
+    if len({item.validation_fingerprint for item in validations}) != len(validations):
+        return False
+    completed_traces = tuple(
+        item
+        for item in tool_calls
+        if item.tool_name is ActionType.EXECUTE_SQL and item.safe_error is None
+    )
+    return Counter(map(_observation_trace_key, successful)) == Counter(
+        map(_tool_trace_key, completed_traces)
+    )
+
+
 def score_evidence(
     *,
     required_purposes: tuple[str, ...],
     evidence: tuple[EvidenceItem, ...],
     observations: tuple[Observation, ...] = (),
     validations: tuple[ObservationValidation, ...] = (),
+    tool_calls: tuple[ToolCallTrace, ...] = (),
 ) -> EvidenceScore:
     observation_counts = Counter(item.observation_id for item in observations)
     observation_by_id = {
@@ -374,37 +460,38 @@ def score_evidence(
         for item in validations
         if validation_counts[item.observation_id] == 1
     }
+    evidence_ids_unique = len({item.evidence_id for item in evidence}) == len(evidence)
+    links_ok = bool(observations) and (
+        len({item.validation_fingerprint for item in validations}) == len(validations)
+        and (not tool_calls or execute_linkage_is_bijective(observations, validations, tool_calls))
+    )
     verified_purposes: list[str] = []
     for item in evidence:
-        if not item.verified:
+        if not item.verified or not evidence_ids_unique:
             continue
         observation = observation_by_id.get(item.observation_id)
-        if observations:
-            validation = validation_by_id.get(item.observation_id)
-            if (
-                observation is None
-                or validation is None
-                or not validation.valid
-                or observation.contract_id != item.contract_id
-                or observation.hypothesis_id != item.hypothesis_id
-                or observation.query_id != item.query_id
-                or (
-                    observation.purpose not in required_purposes
-                    and observation.hypothesis_id not in required_purposes
-                )
-                or validation.contract_id != item.contract_id
-                or restore_query_result(observation) is None
-            ):
-                continue
-            purpose = (
-                observation.purpose
-                if observation.purpose in required_purposes
-                else observation.hypothesis_id or observation.purpose
+        validation = validation_by_id.get(item.observation_id)
+        if (
+            not links_ok
+            or observation is None
+            or validation is None
+            or not validation.valid
+            or observation.contract_id != item.contract_id
+            or observation.hypothesis_id != item.hypothesis_id
+            or observation.query_id != item.query_id
+            or (
+                observation.purpose not in required_purposes
+                and observation.hypothesis_id not in required_purposes
             )
-        else:
-            purpose = (
-                item.contract_id if item.contract_id in required_purposes else item.hypothesis_id
-            )
+            or validation.contract_id != item.contract_id
+            or restore_query_result(observation) is None
+        ):
+            continue
+        purpose = (
+            observation.purpose
+            if observation.purpose in required_purposes
+            else observation.hypothesis_id or observation.purpose
+        )
         verified_purposes.append(purpose)
     counts = Counter(verified_purposes)
     verified_count = sum(counts[purpose] >= 1 for purpose in required_purposes)
@@ -417,7 +504,9 @@ def score_evidence(
 
 
 __all__ = [
+    "ExecuteTriple",
     "candidate_observations",
+    "execute_linkage_is_bijective",
     "restore_query_result",
     "score_behavior",
     "score_candidate",

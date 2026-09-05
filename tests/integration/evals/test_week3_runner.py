@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from governed_analytics.agent.contracts import StopReason
+from governed_analytics.agent.contracts import AgentRunResult, StopReason
 from governed_analytics.agent.tool_registry import ToolRegistry
 from governed_analytics.config import AgentRuntimeSettings, DatabaseSettings
 from governed_analytics.evals.week3.runner import (
@@ -33,6 +33,20 @@ class _CountingBackend:
         return await self.backend.execute(validated, parameters)
 
 
+class _AttributingExecutor:
+    def __init__(self, executor: FixtureWeek3CaseExecutor, backend: _CountingBackend) -> None:
+        self.executor = executor
+        self.backend = backend
+        self.settings = executor.settings
+        self.calls_by_case: dict[str, int] = {}
+
+    async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+        before = len(self.backend.query_ids)
+        result = await self.executor.run_case(case_id=case_id, question=question)
+        self.calls_by_case[case_id] = len(self.backend.query_ids) - before
+        return result
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_fixture_runner_executes_all_40_cases_on_one_shared_readonly_engine(
@@ -47,10 +61,11 @@ async def test_fixture_runner_executes_all_40_cases_on_one_shared_readonly_engin
             ProfileTool(backend=counting),
             ExecuteSqlTool(backend=counting),
         )
-        executor = FixtureWeek3CaseExecutor(
+        fixture_executor = FixtureWeek3CaseExecutor(
             tools=tools,
             settings=AgentRuntimeSettings.model_validate({}),
         )
+        executor = _AttributingExecutor(fixture_executor, counting)
         artifact = await run_week3_evaluation(
             mode="fixture",
             executor=executor,
@@ -62,6 +77,14 @@ async def test_fixture_runner_executes_all_40_cases_on_one_shared_readonly_engin
 
     by_id = {case.case_id: case for case in artifact.report.cases}
     assert artifact.report.case_count == artifact.report.passed_count == 40
+    assert artifact.report.report_scope == "canonical"
+    assert artifact.report.behavior_metric.denominator == 10
+    assert artifact.report.simple_metric.denominator == 15
+    assert artifact.report.attribution_metric.denominator == 1
+    assert artifact.report.heldout_metric.denominator == 10
+    assert artifact.report.repair_metric.denominator == 2
+    assert artifact.report.candidate_metrics["first_strict"].denominator < 40
+    assert artifact.report.candidate_metrics["final_strict"].denominator < 40
     assert (
         sum(
             case.cohort == "known" and case.suite == "behavior" and case.behavior_conformant
@@ -90,6 +113,30 @@ async def test_fixture_runner_executes_all_40_cases_on_one_shared_readonly_engin
     assert by_id["W3K029"].observed_stop_reason is StopReason.EVIDENCE_PARTIAL
     assert by_id["W3K030"].observed_repair_count == 0
     assert by_id["W3K030"].observed_stop_reason is StopReason.SQL_POLICY_REJECTED
+
+    def triples(case_id: str) -> tuple[tuple[str, str | None, str | None], ...]:
+        return tuple(
+            (trace.purpose, trace.contract_id, trace.hypothesis_id)
+            for trace in by_id[case_id].safe_tool_trace
+            if trace.tool_name.value == "execute_sql"
+        )
+
+    simple = ("metric_value_contract", "metric_value_contract", "metric_value")
+    assert triples("W3K027") == (simple, simple)
+    assert triples("W3K028") == (simple, simple)
+    assert triples("W3K029") == (("gmv_comparison", "gmv_comparison", "confirm_decline"),)
+    assert triples("W3K030") == (simple,)
+    assert by_id["W3K029"].evidence_score is not None
+    assert by_id["W3K029"].evidence_score.verified_count == 1
+    assert len(by_id["W3K029"].evidence_references) == 1
+    assert by_id["W3K030"].valid_execute_count == 0
+    assert not by_id["W3K030"].evidence_references
+    assert executor.calls_by_case["W3K030"] == 0
+    for case_id, case_result in by_id.items():
+        assert executor.calls_by_case[case_id] == sum(
+            trace.tool_name.value == "execute_sql" and trace.query_id is not None
+            for trace in case_result.safe_tool_trace
+        )
     # Forty successful/contract-invalid Execute attempts reach the shared backend;
     # W3K030's dangerous statement is rejected by policy before this counter.
     assert len(counting.query_ids) == 40

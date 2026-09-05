@@ -3,16 +3,27 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
-from governed_analytics.agent.contracts import ActionType, FinalStatus, StopReason
+from governed_analytics.agent.contracts import (
+    BehaviorAction,
+    BehaviorReasonCode,
+    FinalStatus,
+    StopReason,
+)
 from governed_analytics.evals.models import QueryResult
 from governed_analytics.evals.week3.models import (
+    BehaviorScore,
     BudgetOverrides,
+    BudgetScore,
     CandidateScore,
     FrozenExpectedResult,
+    ModelIdentifier,
+    SuiteScore,
+    ToolScore,
     Week3CaseResult,
     Week3RunReport,
+    derive_executed_manifest_sha256,
 )
 
 
@@ -90,24 +101,88 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
         case_id="W3K001",
         cohort="known",
         suite="behavior",
-        passed=True,
-        first_candidate_conformant=True,
-        final_conformant=True,
-        behavior_conformant=True,
-        tools_conformant=True,
-        evidence_conformant=True,
-        budget_conformant=True,
-        observed_tools=(ActionType.EXECUTE_SQL,),
+        expected_behavior=BehaviorAction.CLARIFY,
+        expected_final_status=FinalStatus.CLARIFICATION_REQUIRED,
+        expected_stop_reason=StopReason.MISSING_REQUIRED_FIELDS,
+        observed_final_status=FinalStatus.CLARIFICATION_REQUIRED,
+        observed_stop_reason=StopReason.MISSING_REQUIRED_FIELDS,
+        suite_score=SuiteScore(suite="behavior", conformant=True),
+        behavior_score=BehaviorScore(
+            action_conformant=True,
+            reason_conformant=True,
+            missing_fields_conformant=True,
+            conformant=True,
+        ),
+        tool_score=ToolScore(
+            required_present=True, forbidden_absent=True, sequence_conformant=True, conformant=True
+        ),
+        budget_score=BudgetScore(
+            conformant=True,
+            action_loops=0,
+            llm_calls=0,
+            tool_calls=0,
+            execute_calls=0,
+            profile_calls=0,
+            repair_count=0,
+            input_tokens=0,
+            output_tokens=0,
+            committed_cost_cny=Decimal("0"),
+            soft_cap_reached=False,
+            max_action_loops=1,
+            max_llm_calls=1,
+            max_tool_calls=1,
+            max_execute_calls=1,
+            max_profile_calls=1,
+            max_repairs=1,
+            expected_repair_count=0,
+            hard_cost_cny=Decimal("1"),
+        ),
+        natural_refusal=True,
+        observed_behavior=BehaviorAction.CLARIFY,
+        observed_behavior_reason=BehaviorReasonCode.MISSING_METRIC,
     )
+    overall = "a" * 64
     report = Week3RunReport(
         mode="fixture",
-        overall_manifest_sha256="a" * 64,
+        overall_manifest_sha256=overall,
         known_cohort_sha256="b" * 64,
         heldout_cohort_sha256="c" * 64,
+        executed_manifest_sha256=derive_executed_manifest_sha256(
+            overall_manifest_sha256=overall, mode="fixture", case_ids=("W3K001",)
+        ),
+        report_scope="partial_test",
         cases=(case,),
     )
 
     assert report.case_count == report.passed_count == 1
+    with pytest.raises(ValidationError):
+        Week3CaseResult.model_validate(
+            {**case.model_dump(exclude_computed_fields=True), "passed": False}
+        )
+    for field, forged in (
+        (
+            "behavior_score",
+            BehaviorScore(
+                action_conformant=False,
+                reason_conformant=False,
+                missing_fields_conformant=False,
+                conformant=False,
+            ),
+        ),
+        (
+            "tool_score",
+            ToolScore(
+                required_present=False,
+                forbidden_absent=True,
+                sequence_conformant=True,
+                conformant=False,
+            ),
+        ),
+    ):
+        with pytest.raises(ValidationError):
+            Week3CaseResult.model_validate(
+                {**case.model_dump(exclude_computed_fields=True), field: forged}
+            )
     assert report.protocol_version == "week3-agent-evaluation-v1"
     assert (
         Week3RunReport.model_validate(
@@ -135,6 +210,14 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
             }
         )
 
+    with pytest.raises(ValidationError, match="executed manifest"):
+        Week3RunReport.model_validate(
+            {
+                **report.model_dump(exclude_computed_fields=True),
+                "executed_manifest_sha256": "0" * 64,
+            }
+        )
+
 
 def test_budget_case_uses_partial_evidence_terminal_contract() -> None:
     from governed_analytics.evals.week3.suites import load_week3_cases
@@ -145,3 +228,12 @@ def test_budget_case_uses_partial_evidence_terminal_contract() -> None:
     assert case.expected_final_status is FinalStatus.PARTIAL
     assert case.expected_stop_reason is StopReason.EVIDENCE_PARTIAL
     assert case.budget_overrides == BudgetOverrides(max_tool_calls=3)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ("sk-secret", "pk-secret", "bearer-token", "provider/model", "model id"),
+)
+def test_report_rejects_credential_shaped_or_noncanonical_model_ids(model_id: str) -> None:
+    with pytest.raises(ValidationError):
+        TypeAdapter(ModelIdentifier).validate_python(model_id)

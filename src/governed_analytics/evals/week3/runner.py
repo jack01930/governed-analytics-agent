@@ -19,6 +19,7 @@ import yaml  # type: ignore[import-untyped]
 from governed_analytics.agent.contracts import (
     ActionType,
     AgentRunResult,
+    BehaviorAction,
     FinalAnswer,
     FinalStatus,
     GovernanceSnapshot,
@@ -41,9 +42,11 @@ from governed_analytics.evals.week3.models import (
     SafeEvidenceRef,
     SafeProfileTraceMetadata,
     SafeToolTraceRef,
+    SuiteScore,
     Week3CaseResult,
     Week3EvaluationCase,
     Week3RunReport,
+    derive_executed_manifest_sha256,
 )
 from governed_analytics.evals.week3.reporting import (
     cancel_week3_report_reservation,
@@ -52,6 +55,7 @@ from governed_analytics.evals.week3.reporting import (
 )
 from governed_analytics.evals.week3.scorers import (
     candidate_observations,
+    execute_linkage_is_bijective,
     restore_query_result,
     score_behavior,
     score_candidate,
@@ -398,17 +402,51 @@ def _safe_tool_refs(result: AgentRunResult) -> tuple[SafeToolTraceRef, ...]:
     return tuple(refs)
 
 
-def _evidence_refs(result: AgentRunResult) -> tuple[SafeEvidenceRef, ...]:
+def _evidence_refs(
+    result: AgentRunResult, required_purposes: tuple[str, ...]
+) -> tuple[SafeEvidenceRef, ...]:
+    if len({item.evidence_id for item in result.evidence}) != len(
+        result.evidence
+    ) or not execute_linkage_is_bijective(
+        result.observations,
+        result.observation_validations,
+        result.safe_trace.tool_calls,
+    ):
+        return ()
     observations = {item.observation_id: item for item in result.observations}
     refs = []
+    represented: set[str] = set()
+    validations = {item.observation_id: item for item in result.observation_validations}
     for evidence in result.evidence:
         observation = observations.get(evidence.observation_id)
-        if evidence.verified and observation is not None:
+        validation = validations.get(evidence.observation_id)
+        purpose = (
+            None
+            if observation is None
+            else (
+                observation.hypothesis_id
+                if observation.hypothesis_id in required_purposes
+                else observation.purpose
+            )
+        )
+        if (
+            evidence.verified
+            and observation is not None
+            and validation is not None
+            and validation.valid
+            and observation.contract_id == evidence.contract_id == validation.contract_id
+            and observation.hypothesis_id == evidence.hypothesis_id
+            and observation.query_id == evidence.query_id
+            and restore_query_result(observation) is not None
+            and purpose in required_purposes
+            and purpose not in represented
+        ):
+            represented.add(purpose)
             refs.append(
                 SafeEvidenceRef(
                     evidence_id=evidence.evidence_id,
                     observation_id=evidence.observation_id,
-                    purpose=observation.hypothesis_id or observation.purpose,
+                    purpose=purpose,
                     contract_id=evidence.contract_id,
                     hypothesis_id=evidence.hypothesis_id,
                     query_id=evidence.query_id,
@@ -417,12 +455,97 @@ def _evidence_refs(result: AgentRunResult) -> tuple[SafeEvidenceRef, ...]:
     return tuple(refs)
 
 
+def _expected_execute_triples(case: Week3EvaluationCase) -> tuple[tuple[str, str, str], ...]:
+    special = {
+        "W3K027": (("metric_value_contract", "metric_value_contract", "metric_value"),) * 2,
+        "W3K028": (("metric_value_contract", "metric_value_contract", "metric_value"),) * 2,
+        "W3K029": (("gmv_comparison", "gmv_comparison", "confirm_decline"),),
+        "W3K030": (("metric_value_contract", "metric_value_contract", "metric_value"),),
+    }
+    if case.case_id in special:
+        return special[case.case_id]
+    triples = []
+    for expected in case.expected_observations:
+        purpose = expected.purpose
+        contract = "gmv_comparison" if purpose == "confirm_decline" else purpose
+        hypothesis = "metric_value" if purpose == "metric_value_contract" else purpose
+        triples.append((contract, contract, hypothesis))
+    return tuple(triples)
+
+
+def _suite_score(case: Week3EvaluationCase, result: AgentRunResult) -> SuiteScore:
+    if case.case_id not in {"W3K027", "W3K028", "W3K029", "W3K030"}:
+        return SuiteScore(suite=case.suite, conformant=True)
+    links_ok = execute_linkage_is_bijective(
+        result.observations, result.observation_validations, result.safe_trace.tool_calls
+    )
+    validations = {item.observation_id: item for item in result.observation_validations}
+    matching = tuple(
+        item
+        for item in result.observations
+        if item.tool_name is ActionType.EXECUTE_SQL
+        and item.purpose in {"metric_value_contract", "gmv_comparison"}
+    )
+    if case.case_id in {"W3K027", "W3K028"}:
+        first = matching[0] if matching else None
+        first_validation = None if first is None else validations.get(first.observation_id)
+        first_is_earliest = links_ok and result.first_candidate == first and len(matching) == 2
+        first_invalid = first_validation is not None and not first_validation.valid
+        valid = tuple(
+            item
+            for item in matching
+            if (validation := validations.get(item.observation_id)) and validation.valid
+        )
+        final_met = len(valid) == 1 if case.case_id == "W3K027" else not valid
+        return SuiteScore(
+            suite=case.suite,
+            first_is_earliest=first_is_earliest,
+            first_validation_invalid=first_invalid,
+            final_requirement_met=final_met,
+            conformant=first_is_earliest and first_invalid and final_met,
+        )
+    if case.case_id == "W3K029":
+        evidence = score_evidence(
+            required_purposes=("confirm_decline",),
+            evidence=result.evidence,
+            observations=result.observations,
+            validations=result.observation_validations,
+            tool_calls=result.safe_trace.tool_calls,
+        )
+        conformant = links_ok and evidence.oracle_verified_sufficient
+        return SuiteScore(
+            suite=case.suite,
+            verified_partial_evidence=conformant,
+            conformant=conformant,
+        )
+    failed = tuple(
+        item
+        for item in result.safe_trace.tool_calls
+        if item.tool_name is ActionType.EXECUTE_SQL and item.safe_error is not None
+    )
+    conformant = (
+        len(failed) == 1
+        and failed[0].safe_error in {item.value for item in SafeSqlDiagnostic}
+        and not any(
+            item.tool_name is ActionType.EXECUTE_SQL and item.ok for item in result.observations
+        )
+        and not result.evidence
+        and result.governance.repair_count == 0
+    )
+    return SuiteScore(
+        suite=case.suite,
+        policy_rejection_conformant=conformant,
+        conformant=conformant,
+    )
+
+
 def _score_case(
     case: Week3EvaluationCase,
     result: AgentRunResult,
     settings: AgentRuntimeSettings,
     *,
     expected_resolved_model: str,
+    error_override: str | None = None,
 ) -> Week3CaseResult:
     behavior = score_behavior(
         expected_action=case.expected_behavior,
@@ -435,17 +558,20 @@ def _score_case(
         else case.expected_stop_reason.value,
     )
     purposes = tuple(item.purpose for item in case.expected_observations)
+    if case.case_id == "W3K029":
+        purposes = ("confirm_decline",)
     tool = score_tool_trace(
         required_tools=case.required_tools,
         forbidden_tools=case.forbidden_tools,
         tool_calls=result.safe_trace.tool_calls,
-        required_purposes=purposes,
+        required_execute_triples=_expected_execute_triples(case),
     )
     evidence = score_evidence(
         required_purposes=purposes,
         evidence=result.evidence,
         observations=result.observations,
         validations=result.observation_validations,
+        tool_calls=result.safe_trace.tool_calls,
     )
     first_scores: list[CandidateScore] = []
     final_scores: list[CandidateScore] = []
@@ -508,29 +634,8 @@ def _score_case(
         and sum(item.output_tokens for item in result.safe_trace.model_calls)
         == governance.output_tokens
     )
-    if case.expected_observations:
-        first_conformant = None if first_score is None else first_score.strict_pass
-        final_conformant = final_score is not None and final_score.strict_pass
-        evidence_conformant: bool | None = evidence.oracle_verified_sufficient
-    else:
-        first_conformant = result.first_candidate is not None if case.suite == "repair" else None
-        valid_final_exists = any(item.valid for item in result.observation_validations)
-        final_conformant = (
-            (valid_final_exists if case.case_id == "W3K027" else not valid_final_exists)
-            if case.suite == "repair"
-            else terminal_ok
-        )
-        evidence_conformant = None
-    passed = (
-        terminal_ok
-        and behavior.conformant
-        and tool.conformant
-        and budget_ok
-        and final_conformant
-        and (evidence_conformant is not False)
-        and model_identity_complete
-    )
-    error_type = None if passed else "case_contract_failed"
+    evidence_score = evidence if purposes else None
+    suite_score = _suite_score(case, result)
     budget_score = BudgetScore(
         conformant=budget_ok,
         action_loops=governance.action_loops,
@@ -543,49 +648,50 @@ def _score_case(
         output_tokens=governance.output_tokens,
         committed_cost_cny=governance.committed_cost_cny,
         soft_cap_reached=governance.soft_cap_reached,
+        max_action_loops=limits.max_action_loops,
+        max_llm_calls=limits.max_llm_calls,
+        max_tool_calls=limits.max_tool_calls,
+        max_execute_calls=limits.max_execute_calls,
+        max_profile_calls=limits.max_profile_calls,
+        max_repairs=limits.max_repairs,
+        expected_repair_count=case.expected_repair_count,
+        hard_cost_cny=limits.hard_cost_cny,
     )
     return Week3CaseResult(
         case_id=case.case_id,
         cohort=case.cohort,
         suite=case.suite,
-        passed=passed,
-        first_candidate_conformant=first_conformant,
-        final_conformant=final_conformant,
-        behavior_conformant=behavior.conformant,
-        tools_conformant=tool.conformant,
-        evidence_conformant=evidence_conformant,
-        budget_conformant=budget_ok,
+        expected_behavior=BehaviorAction(case.expected_behavior),
+        expected_missing_fields=case.expected_missing_fields,
+        expected_final_status=case.expected_final_status,
+        expected_stop_reason=cast(StopReason, case.expected_stop_reason),
+        suite_score=suite_score,
         observed_behavior=None if result.behavior is None else result.behavior.action,
         observed_behavior_reason=(None if result.behavior is None else result.behavior.reason_code),
         observed_missing_fields=(() if result.behavior is None else result.behavior.missing_fields),
         observed_final_status=result.final_answer.status,
         observed_stop_reason=result.final_answer.stop_reason,
-        observed_tools=tuple(item.tool_name for item in result.safe_trace.tool_calls),
-        observed_evidence_count=len(result.evidence),
-        observed_tool_calls=governance.tool_calls,
-        observed_execute_calls=governance.execute_calls,
-        observed_repair_count=governance.repair_count,
-        error_type=error_type,
+        error_type=error_override,
         first_candidate_score=first_score,
         final_candidate_score=final_score,
         behavior_score=behavior,
         tool_score=tool,
-        evidence_score=evidence,
+        evidence_score=evidence_score,
         budget_score=budget_score,
         safe_tool_trace=_safe_tool_refs(result),
-        evidence_references=_evidence_refs(result),
+        evidence_references=_evidence_refs(result, purposes),
         resolved_models=case_models,
         model_identity_complete=model_identity_complete,
+        repair_succeeded=(
+            case.case_id == "W3K027" and suite_score.conformant if case.suite == "repair" else None
+        ),
+        valid_execute_count=sum(item.valid for item in result.observation_validations),
+        natural_refusal=(
+            behavior.conformant and terminal_ok and not result.safe_trace.tool_calls
+            if case.expected_behavior != "execute"
+            else None
+        ),
     )
-
-
-def _executed_hash(mode: str, cases: tuple[Week3EvaluationCase, ...]) -> str:
-    encoded = json.dumps(
-        {"mode": mode, "case_ids": [item.case_id for item in cases]},
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return sha256(encoded).hexdigest()
 
 
 def _pricing_hash(pricing: ModelPricing) -> str:
@@ -626,40 +732,67 @@ async def run_week3_evaluation(
     )
     settings = getattr(executor, "settings", AgentRuntimeSettings.model_validate({}))
     try:
-        outcomes: list[AgentRunResult] = []
+        outcomes: list[tuple[AgentRunResult, str | None]] = []
         for case in active:
+            error_type: str | None
             try:
                 outcome = await executor.run_case(case_id=case.case_id, question=case.question)
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
                 outcome = _safe_failure(case_id=case.case_id, reason=StopReason.INTERNAL_ERROR)
-            outcomes.append(outcome)
+                error_type = "internal_case_failure"
+            else:
+                if outcome.run_id != case.case_id:
+                    outcome = _safe_failure(case_id=case.case_id, reason=StopReason.INTERNAL_ERROR)
+                    error_type = "case_identity_mismatch"
+                else:
+                    error_type = None
+            outcomes.append((outcome, error_type))
         effective_pricing = _fixture_pricing() if mode == "fixture" else cast(ModelPricing, pricing)
-        scored = tuple(
-            _score_case(
-                case,
-                outcome,
-                settings,
-                expected_resolved_model=effective_pricing.resolved_model,
-            )
-            for case, outcome in zip(active, outcomes, strict=True)
-        )
+        scored_items: list[Week3CaseResult] = []
+        for case, (outcome, error_type) in zip(active, outcomes, strict=True):
+            try:
+                scored_case = _score_case(
+                    case,
+                    outcome,
+                    settings,
+                    expected_resolved_model=effective_pricing.resolved_model,
+                    error_override=error_type,
+                )
+            except Exception:
+                scored_case = _score_case(
+                    case,
+                    _safe_failure(case_id=case.case_id, reason=StopReason.INTERNAL_ERROR),
+                    settings,
+                    expected_resolved_model=effective_pricing.resolved_model,
+                    error_override="scoring_contract_failure",
+                )
+            scored_items.append(scored_case)
+        scored = tuple(scored_items)
         resolved = tuple(
             dict.fromkeys(
                 trace.provider_model
-                for outcome in outcomes
+                for outcome, _error_type in outcomes
                 for trace in outcome.safe_trace.model_calls
             )
         )
         requested = effective_pricing.requested_model
         limits = BudgetLimits.from_settings(settings)
+        overall_manifest = week3_manifest_sha256()
+        case_ids = tuple(case.case_id for case in active)
+        canonical_ids = tuple(case.case_id for case in load_week3_cases() if mode in case.modes)
         report = Week3RunReport(
             mode=mode,
-            overall_manifest_sha256=week3_manifest_sha256(),
+            overall_manifest_sha256=overall_manifest,
             known_cohort_sha256=week3_cohort_sha256("known"),
             heldout_cohort_sha256=week3_cohort_sha256("heldout"),
-            executed_manifest_sha256=_executed_hash(mode, active),
+            executed_manifest_sha256=derive_executed_manifest_sha256(
+                overall_manifest_sha256=overall_manifest,
+                mode=mode,
+                case_ids=case_ids,
+            ),
+            report_scope="canonical" if case_ids == canonical_ids else "partial_test",
             run_id=effective_run_id,
             generated_at_utc=generated,
             requested_model=requested,

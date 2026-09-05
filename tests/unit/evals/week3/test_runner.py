@@ -60,6 +60,7 @@ async def test_runner_passes_only_case_id_and_question_to_executor(tmp_path: Pat
 
     assert calls == [(case.case_id, case.question) for case in cases]
     assert artifact.report.protocol_version == "week3-agent-evaluation-v1"
+    assert artifact.report.report_scope == "partial_test"
     assert artifact.report_json.is_file()
 
 
@@ -130,3 +131,25 @@ async def test_runner_enforces_mode_pricing_contract_before_reservation(
             output_root=tmp_path,
         )
     assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_known_result_replayed_for_heldout_case(tmp_path: Path) -> None:
+    case = load_week3_cases()[-1:]
+
+    class ReplayingExecutor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            del case_id, question
+            return _failure("W3K001")
+
+    artifact = await run_week3_evaluation(
+        mode="fixture",
+        executor=ReplayingExecutor(),
+        cases=case,
+        output_root=tmp_path,
+        run_id="replay",
+        now=lambda: datetime(2026, 9, 4, tzinfo=UTC),
+    )
+
+    assert artifact.report.cases[0].error_type == "case_identity_mismatch"
+    assert not artifact.report.cases[0].passed

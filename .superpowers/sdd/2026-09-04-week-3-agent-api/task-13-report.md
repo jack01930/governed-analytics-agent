@@ -50,3 +50,59 @@
 
 - 按任务禁令未执行任何 live/付费/API client/network 调用；live 实际质量不在本任务验证范围。
 - Task 13 不拥有或关闭 shared engine/client。Task 14 仍负责先结束 runs，再关闭 client，最后 dispose engine。
+
+## Fix round 1（2026-09-05）
+
+### 修复结果
+
+- 报告 reservation 改为持有 parent/staging directory FD；所有固定文件均通过
+  `dir_fd + O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` 创建并逐文件 `fsync`，
+  cases 目录同样使用 FD。发布前按 FD 校验精确 inventory 和 regular-file 类型，native
+  no-replace rename 使用 parent FD，发布后以仍打开的 staging FD 校验最终 inode。
+- source swap 或 postcheck mismatch 时，错误 final 会从固定最终名称原子隔离；owned inode
+  通过 parent FD 重新定位并清理，foreign inode 不删除。FD close 状态逐项记录，可只重试失败项；
+  cleanup/close 失败不遮蔽原异常。
+- `Week3CaseResult.passed`、conformance flags、trace/budget/evidence counts 均改为 computed
+  fields；behavior/tool/evidence/budget/terminal/suite 使用安全详细字段确定性重算或严格交叉校验。
+- 正式报告强制 canonical fixture 40 / live 36 的固定顺序、cohort、suite 和三份冻结 manifest
+  hash；executed hash 由 protocol overall hash、mode、ordered case IDs 共同派生，无全零豁免。
+  自定义子集只能标记为 `partial_test`，case IDs 明确输出。
+- 所有报告字符串字段使用受限 Identifier；model ID 使用
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` 并拒绝 `sk-`、`pk-`、`bearer` 前缀。
+  writer 在重新验证 Pydantic model 后递归扫描 key/value，拒绝 SQL、prompt/question、raw rows、
+  payload、URL/endpoint 和 credential 形态；覆盖 `model_copy`/`model_construct` 绕过。
+- runner 在评分前核对 `AgentRunResult.run_id == case_id`，known→heldout replay 映射为固定
+  `case_identity_mismatch` 脱敏失败并继续。
+- W3K027/028 固定两个相同 Execute 安全三元组并验证 first 为最早 observation、首次 validation
+  invalid 及 final valid/no-valid 分支；W3K029 固定 confirm triple 和完整 verified evidence 链；
+  W3K030 固定失败 simple triple、允许的 policy diagnostic、零成功 observation/evidence/repair。
+- Execute scorer 对 `(purpose, contract_id, hypothesis_id)` 做精确 multiset；Profile 可插入，
+  attribution 的三个维度仍可换序。observation/validation/trace 以完整安全 metadata 做双射，
+  validation fingerprint 全局唯一；orphan/duplicate/mismatch/evidence-only 均显式零分。
+- 新增 `MetricCount(numerator, denominator, rate)`；JSON/Markdown 分开输出 first/final 的
+  result、alias contract、production validation、execution、truncated、strict，以及 repair、
+  valid execute、natural refusal、known/heldout、known behavior/simple/attribution、tool/evidence/budget。
+  nullable 指标只使用 applicable denominator，Markdown 用 `N/A` 表示零适用分母。
+
+### RED / mutation 回归
+
+- 命令：
+  `uv run pytest tests/unit/evals/week3/test_scorers.py::test_tool_trace_rejects_extra_or_duplicate_execute_safe_triples tests/unit/evals/week3/test_runner.py::test_runner_rejects_known_result_replayed_for_heldout_case tests/unit/evals/week3/test_reporting.py::test_report_reservation_rejects_symlink_in_parent_path tests/unit/evals/week3/test_models.py::test_week3_report_aggregates_are_derived_from_cases_only -q`
+- 输出：`4 failed`；分别证明 exact Execute triple、run identity、父路径 symlink 和全零
+  executed manifest 在修复前均未被拒绝。
+- 最终定向命令：
+  `uv run pytest tests/unit/evals/week3/test_models.py tests/unit/evals/week3/test_scorers.py tests/unit/evals/week3/test_runner.py tests/unit/evals/week3/test_reporting.py -q`
+- 输出：`39 passed in 8.99s`。
+
+### 最终验证
+
+- `uv run pytest tests/unit/evals/week3 -q` → `347 passed in 24.35s`。
+- `DATABASE_URL=postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.0.0.1:5432/governed_analytics uv run pytest tests/integration/evals/test_week3_runner.py -q`
+  → `1 passed in 15.35s`；覆盖 40/40 fixture、special suite exact triples、W3K029
+  verified evidence、W3K030 backend=0，以及逐 case backend 归因。
+- `make check` → Ruff `All checks passed!`；mypy
+  `Success: no issues found in 156 source files`；unit `1521 passed in 46.80s`。
+
+### 剩余关注
+
+- 按禁令未执行 live/付费/API client/network 调用；live provider 的实际质量和生命周期仍归 Task 14。
