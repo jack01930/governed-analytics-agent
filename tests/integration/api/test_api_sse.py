@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import json
 import re
 import threading
@@ -458,6 +459,10 @@ class _OwnedTaskHandle:
     task: asyncio.Task[object] | None = None
     reclaimed: bool = False
 
+    @property
+    def available(self) -> bool:
+        return self.task is None and not self.reclaimed
+
     def bind(self, task: asyncio.Task[object]) -> None:
         _safe_output_require(self.task is None)
         self.task = task
@@ -491,6 +496,10 @@ async def _await_with_deadline[T](
     loop = asyncio.get_running_loop()
     expires_at = loop.time() + seconds
     owned = not asyncio.isfuture(operation)
+    if owned_task_handle is not None and (not owned or not owned_task_handle.available):
+        if owned and inspect.iscoroutine(operation):
+            operation.close()
+        raise AssertionError(_SAFE_OUTPUT_ERROR)
     if owned:
         async def await_owned_operation() -> T:
             return await operation
@@ -1123,6 +1132,7 @@ def _normalize_sensitive_label(value: str) -> str:
 
 def _is_credential_label(value: str) -> bool:
     normalized = _normalize_sensitive_label(value)
+    compact = normalized.replace("_", "")
     parts = tuple(part for part in normalized.split("_") if part)
     if normalized in {
         "authorization",
@@ -1133,6 +1143,8 @@ def _is_credential_label(value: str) -> bool:
         "secret",
         "token",
     }:
+        return True
+    if compact in {"apikey", "clientsecret", "databasepassword", "accesstoken"}:
         return True
     return (
         len(parts) >= 2
@@ -1157,15 +1169,36 @@ def _contains_credential_assignment(value: str) -> bool:
 
 
 _SQL_QUERY_HEAD = re.compile(r"^(?:select|with|values)\b", re.IGNORECASE)
+_SQL_GRANT_STRUCTURE = re.compile(
+    r"^grant\s+(?:"
+    r"(?:(?:all(?:\s+privileges)?|select|insert|update|delete|truncate|references|"
+    r"trigger|usage|create|connect|temporary|execute|maintain|set|alter\s+system)"
+    r"(?:\s*\([^)]*\))?(?:\s*,\s*(?:select|insert|update|delete|truncate|references|"
+    r"trigger|usage|create|connect|temporary|execute|maintain|set|alter\s+system)"
+    r"(?:\s*\([^)]*\))?)*\s+on\s+"
+    r"(?:(?:table|sequence|database|domain|schema|tablespace|type|language|"
+    r"function|procedure|routine|large\s+object|foreign\s+server|"
+    r"foreign\s+data\s+wrapper)\s+)?\S+(?:\s*,\s*\S+)*)"
+    r"|(?:\S+(?:\s*,\s*\S+)*))"
+    r"\s+to\s+\S+(?:\s*,\s*\S+)*"
+    r"(?:\s+with\s+(?:grant|admin|inherit|set)\s+option)?"
+    r"(?:\s+granted\s+by\s+\S+)?$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SQL_COPY_STRUCTURE = re.compile(
+    r"^copy\s+(?:\(.+\)|[^\s(]+(?:\s*\([^)]*\))?)\s+"
+    r"(?:to|from)\s+(?:stdin|stdout|program\s+\S+|\S+)"
+    r"(?:\s+with(?:\s*\([^)]*\)|\s+.+))?"
+    r"(?:\s+where\s+.+)?$",
+    re.IGNORECASE | re.DOTALL,
+)
 _SQL_COMMAND_STRUCTURE = re.compile(
     r"^(?:"
     r"insert\s+into\s+\S+|"
     r"update\s+\S+\s+set\b|"
     r"delete\s+from\s+\S+|"
     r"merge\s+into\s+\S+|"
-    r"grant\s+.+\s+(?:on\s+(?:table\s+)?\S+\s+)?to\s+\S+|"
     r"revoke\s+.+\s+(?:on\s+(?:table\s+)?\S+\s+)?from\s+\S+|"
-    r"copy\s+(?:\([^;]+\)|\S+)\s+(?:to|from)\s+\S+|"
     r"create\s+(?:(?:or\s+replace|temp(?:orary)?|unlogged)\s+)*"
     r"(?:materialized\s+)?"
     r"(?:table|view|index|schema|database|role|function|procedure|type|extension)\b|"
@@ -1181,9 +1214,15 @@ _SQL_COMMAND_STRUCTURE = re.compile(
 
 
 def _is_sql_statement(value: str) -> bool:
-    normalized = _normalize_sql_text(value).strip().rstrip(";").strip()
+    normalized = _normalize_sql_text(value).strip()
+    if normalized.endswith(";"):
+        normalized = normalized[:-1].rstrip()
     if not normalized:
         return False
+    if _SQL_GRANT_STRUCTURE.fullmatch(normalized):
+        return True
+    if _SQL_COPY_STRUCTURE.fullmatch(normalized):
+        return True
     if _SQL_COMMAND_STRUCTURE.match(normalized):
         return True
     if not _SQL_QUERY_HEAD.match(normalized):
@@ -1577,12 +1616,18 @@ def test_sse_safe_output_oracle_scans_parsed_string_leaves() -> None:
 def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None:
     database = _oracle_database()
     credential_labels = (
+        "APIKey",
+        "APIKEY",
         "apiKey",
         "api key",
         "api/key",
         "\uff41\uff50\uff49Key",
+        "\uff21\uff30\uff29\uff2b\uff25\uff39",
+        "CLIENTSECRET",
         "client_secret",
+        "DATABASEPASSWORD",
         "database.password",
+        "ACCESSTOKEN",
         "access-token",
         "authorization",
         "bearer",
@@ -1594,13 +1639,19 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
             {label: opaque_value},
             {"status": f"{label}={opaque_value}"},
             [[label, opaque_value]],
+            [["status", f"{label}={opaque_value}"]],
             {"safe_arguments": [[label, opaque_value]]},
+            {"safe_arguments": [["contract_id", f"{label}={opaque_value}"]]},
         )
         for candidate in candidates:
             serialized = json.dumps(candidate)
             with pytest.raises(AssertionError) as failure:
                 _assert_serialized_output_has_no_secrets_or_sql(serialized, database)
             _assert_failure_is_redacted(failure, (label, opaque_value, serialized))
+        raw_comment = f": {label}={opaque_value}"
+        with pytest.raises(AssertionError) as raw_failure:
+            _sse_payloads(iter((raw_comment, "")), database)
+        _assert_failure_is_redacted(raw_failure, (label, opaque_value, raw_comment))
 
     unicode_assignments = (
         "\uff41\uff50\uff49Key\uff1dopaque-fullwidth-equals",
@@ -1648,12 +1699,15 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
             (
                 "GRANT SELECT ON orders TO analyst",
                 "GRANT ALL PRIVILEGES ON TABLE orders TO analyst",
+                "GRANT SELECT, UPDATE ON TABLE orders TO analyst WITH GRANT OPTION",
+                "GRANT analyst_role TO report_user WITH ADMIN OPTION;",
             ),
         ),
         (
             "copy",
             (
                 "COPY orders TO STDOUT",
+                "COPY orders (order_id) TO STDOUT",
                 "COPY (SELECT * FROM orders) TO STDOUT",
             ),
         ),
@@ -1687,6 +1741,8 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface() -> None
         "please select a cached model from the registry for this explanation",
         "with cached model metadata we can explain the selection",
         "drop shipping is selected from cache",
+        "grant access to the cached model",
+        "grant access to analyst in the cached model",
         "grant-model",
         "sentinel-llm",
     )
@@ -1881,6 +1937,79 @@ async def test_await_deadline_exposes_and_reclaims_owned_hostile_coroutine() -> 
     _safe_output_require(owned_task.done())
     _safe_output_require(finished.is_set())
     _safe_output_require(_pending_tasks(current) == pending_before)
+
+
+@pytest.mark.asyncio
+async def test_owned_handle_reuse_rejects_before_task_creation_and_closes_coroutine() -> None:
+    current = asyncio.current_task()
+    pending_before = _pending_tasks(current)
+    handle = _OwnedTaskHandle()
+
+    async def complete_once() -> str:
+        return "complete"
+
+    _safe_output_require(
+        await _await_with_deadline(
+            complete_once(),
+            seconds=1.0,
+            failure_message=_SSE_DEADLINE_ERROR,
+            owned_task_handle=handle,
+        )
+        == "complete"
+    )
+    bound_task = handle.task
+    _safe_output_require(bound_task is not None and bound_task.done())
+
+    started = False
+    release = asyncio.Event()
+
+    async def rejected_operation() -> None:
+        nonlocal started
+        started = True
+        await release.wait()
+
+    rejected_coroutine = rejected_operation()
+    introduced: frozenset[asyncio.Task[object]] = frozenset()
+    try:
+        with pytest.raises(AssertionError) as reuse_failure:
+            await _await_with_deadline(
+                rejected_coroutine,
+                seconds=1.0,
+                failure_message=_SSE_DEADLINE_ERROR,
+                owned_task_handle=handle,
+            )
+        _safe_output_require(str(reuse_failure.value) == _SAFE_OUTPUT_ERROR)
+        await asyncio.sleep(0)
+        introduced = _pending_tasks(current) - pending_before
+        _safe_output_require(introduced == frozenset())
+        _safe_output_require(not started)
+        _safe_output_require(
+            inspect.getcoroutinestate(rejected_coroutine) == inspect.CORO_CLOSED
+        )
+    finally:
+        release.set()
+        if introduced:
+            await asyncio.gather(*introduced, return_exceptions=True)
+    _safe_output_require(_pending_tasks(current) == pending_before)
+
+
+@pytest.mark.asyncio
+async def test_borrowed_future_rejects_owned_handle_without_ownership() -> None:
+    loop = asyncio.get_running_loop()
+    borrowed: asyncio.Future[str] = loop.create_future()
+    handle = _OwnedTaskHandle()
+    with pytest.raises(AssertionError) as handle_failure:
+        await _await_with_deadline(
+            borrowed,
+            seconds=1.0,
+            failure_message=_SSE_DEADLINE_ERROR,
+            owned_task_handle=handle,
+        )
+    _safe_output_require(str(handle_failure.value) == _SAFE_OUTPUT_ERROR)
+    _safe_output_require(handle.task is None)
+    _safe_output_require(not borrowed.done() and not borrowed.cancelled())
+    borrowed.set_result("released-by-owner")
+    _safe_output_require(await borrowed == "released-by-owner")
 
 
 @pytest.mark.asyncio

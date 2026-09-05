@@ -154,3 +154,72 @@ Success: no issues found in 156 source files
 - hostile owned probe 在 deadline 后明确断言 handle 指向的 named task 仍 pending；只有测试释放 gate 并 `reclaim()` 后才断言 pending-task snapshot 恢复，未声称可强制终止拒绝 cancellation 的依赖。
 - cooperative owned deadline/caller-cancel、borrowed Task/Future、same-tick child exception、真实 SSE lease 与 lifespan thread/engine 检查均保持通过。
 - 未修改生产 SSE/API、CLI/Make/CI/docs 或 controller ledger；Phase A Fix1 后继续停止等待 review。
+
+## Phase A Fix round 2
+
+### RED / mutation
+
+先扩展 acronym/all-caps credential 的全部结构化位置、column-list COPY、GRANT 自然语言对照，以及 handle 复用拒绝路径：
+
+```text
+uv run pytest tests/integration/api/test_api_sse.py -q -k 'safe_output_oracle or owned_handle_reuse or borrowed_future_rejects'
+.FF.
+2 failed, 2 passed, 10 deselected in 1.21s
+```
+
+- `APIKey`/`APIKEY` 等无分隔 acronym label 未触发拒绝。
+- 复用 handle 时 helper 先创建了 Task，留下由测试回收的 introduced pending task；这证明校验顺序不满足 fail-before-create。
+
+只加入 compact credential 精确匹配后再运行 SQL mutation：
+
+```text
+uv run pytest tests/integration/api/test_api_sse.py -q -k 'safe_output_oracle'
+.F
+1 failed, 1 passed, 12 deselected in 1.20s
+```
+
+此时 credential 矩阵已通过，失败推进到 `COPY orders (order_id) TO STDOUT` 未被拒绝，证明 table column-list 变体的独立缺口。
+
+### GREEN
+
+- credential label 在 NFKC/camel/casefold/separator 规范化后增加 compact token 精确 allowlist 的反向安全判断，覆盖 `APIKey`、`APIKEY`、fullwidth all-caps，以及 `CLIENTSECRET`、`DATABASEPASSWORD`、`ACCESSTOKEN`；每个 label 都进入 parsed key/value、generic pair name/value、`safe_arguments` name/value 和 raw SSE comment。
+- COPY 使用整串 anchored 结构，分别表达 table、table + optional column-list、parenthesized query，以及 `TO/FROM` target/option；不再依赖只接受单 token table 的窄前缀。
+- GRANT 从通用前缀正则拆出整串 anchored classifier，覆盖 privilege-on-object、多 privilege、role membership 与合法 option；`grant access to the cached model` 和既有普通说明保持可发布。GRANT/COPY 不调用可能输出 parser warning 的 command fallback。
+- `_await_with_deadline()` 在创建 owned Task 前检查 handle 可用性。复用/预绑定 handle 时关闭尚未启动的原始 coroutine，再返回固定错误；回归断言 coroutine 为 `CORO_CLOSED`、未运行且未创建 Task。borrowed Future 携带 handle 时同样在接管前拒绝，Future 保持 pending/uncancelled 并由创建者完成。
+
+### 验证
+
+```text
+uv run pytest tests/integration/api/test_api_sse.py -q -k 'safe_output_oracle or deadline or borrowed or caller_cancellation or hostile or owned_handle'
+...........
+11 passed, 3 deselected in 1.17s
+
+uv run ruff check tests/integration/api/test_api_sse.py
+All checks passed!
+
+uv run mypy tests/integration/api/test_api_sse.py
+Success: no issues found in 1 source file
+
+DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest tests/integration/agent/test_graph.py tests/integration/api/test_api_sse.py -q
+.................
+17 passed in 1.93s
+
+DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest tests/integration/api/test_api_sse.py tests/integration/agent/test_graph.py -q
+.................
+17 passed in 1.93s
+
+PYTHONASYNCIODEBUG=1 PYTHONWARNINGS=error DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest --asyncio-debug -o asyncio_default_fixture_loop_scope=function tests/integration/agent/test_graph.py tests/integration/api/test_api_sse.py -q
+.................
+17 passed in 2.12s
+
+make check
+All checks passed!
+Success: no issues found in 156 source files
+1610 passed in 44.28s
+```
+
+### 残留检查
+
+- same-tick child exception、hostile owned 显式回收、cooperative owned、borrowed Task/Future 及真实 SSE lease/thread/engine 检查全部保持通过。
+- fail-before-create 回归不依赖 task name 或 coroutine 私有 metadata；异常路径无 pending Task、无未 await coroutine warning。
+- 未修改/提交 production API/SSE、Phase B 文件或 controller `progress.md`；Fix2 后停止等待 review。
