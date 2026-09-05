@@ -37,12 +37,14 @@ def _report(run_id: str) -> Week3RunReport:
         cohort="known",
         suite="behavior",
         expected_behavior=BehaviorAction.CLARIFY,
+        expected_missing_fields=("metric", "time_window"),
         expected_final_status=FinalStatus.CLARIFICATION_REQUIRED,
         expected_stop_reason=StopReason.MISSING_REQUIRED_FIELDS,
         observed_final_status=FinalStatus.CLARIFICATION_REQUIRED,
         observed_stop_reason=StopReason.MISSING_REQUIRED_FIELDS,
         observed_behavior=BehaviorAction.CLARIFY,
         observed_behavior_reason=BehaviorReasonCode.MISSING_METRIC,
+        observed_missing_fields=("metric", "time_window"),
         suite_score=SuiteScore(suite="behavior", conformant=True),
         behavior_score=BehaviorScore(
             action_conformant=True,
@@ -74,6 +76,7 @@ def _report(run_id: str) -> Week3RunReport:
             expected_repair_count=0,
             hard_cost_cny=Decimal("1"),
         ),
+        natural_refusal=True,
     )
     overall = "a" * 64
     return Week3RunReport(
@@ -211,6 +214,106 @@ def test_report_file_symlink_is_never_followed(
     assert not reservation.staging_dir.exists()
 
 
+def _replace_regular_file(directory_fd: int, name: str, contents: bytes = b"foreign") -> None:
+    os.unlink(name, dir_fd=directory_fd)
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory_fd)
+    try:
+        os.write(fd, contents)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("target", ("report.json", "report.md", "W3K001.json"))
+def test_written_regular_file_inode_swap_is_rejected_and_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id=f"file-swap-{target.split('.')[0]}",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original = reporting._write_text_at
+    swapped = False
+
+    def swap_after_write(directory_fd: int, name: str, contents: str) -> object:
+        nonlocal swapped
+        binding = original(directory_fd, name, contents)
+        if name == target and not swapped:
+            swapped = True
+            _replace_regular_file(directory_fd, name)
+        return binding
+
+    monkeypatch.setattr(reporting, "_write_text_at", swap_after_write)
+    with pytest.raises(OSError, match="inventory changed"):
+        write_week3_report(reservation, _report(reservation.run_id))
+
+    assert not reservation.final_dir.exists()
+    quarantines = tuple(reservation.parent_dir.glob(".week3-foreign-*"))
+    assert len(quarantines) == 1
+    assert any(
+        path.read_bytes() == b"foreign"
+        for path in quarantines[0].rglob("*")
+        if path.is_file()
+    )
+
+
+def test_file_swap_after_publisher_identity_check_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id="publisher-file-swap",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original = reporting.__dict__["_native_publish_owned"]
+
+    def swap_then_publish(active_reservation: object) -> None:
+        _replace_regular_file(reservation.staging_fd, "report.json")
+        original(active_reservation)
+
+    monkeypatch.setattr(reporting, "_native_publish_owned", swap_then_publish)
+    with pytest.raises(OSError, match="inventory changed"):
+        write_week3_report(reservation, _report("publisher-file-swap"))
+
+    assert not reservation.final_dir.exists()
+    assert tuple(reservation.parent_dir.glob(".week3-foreign-*"))
+
+
+def test_component_swap_during_reservation_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "component"
+    original_mkdir = os.mkdir
+    swapped = False
+
+    def swap_component(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if path == "fixture" and dir_fd is not None and not swapped:
+            swapped = True
+            output.rename(tmp_path / "owned-component")
+            original_mkdir(output, 0o700)
+        original_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", swap_component)
+    with pytest.raises(OSError):
+        reserve_week3_report(
+            output,
+            mode="fixture",
+            run_id="component-swap",
+            timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+        )
+
+    assert output.is_dir()
+    assert not (output / "fixture" / "20260904T000000Z-component-swap").exists()
+
+
 def test_source_swap_at_native_publish_boundary_is_quarantined(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -275,7 +378,7 @@ def test_writer_revalidates_model_copy_bypass_and_scans_string_values(tmp_path: 
         write_week3_report(reservation, unsafe)
 
 
-def test_recursive_boundary_rejects_sentinel_in_every_serialized_string_field(
+def test_recursive_boundary_rejects_sensitive_shapes_in_every_serialized_string_field(
     tmp_path: Path,
 ) -> None:
     payload = _report("all-fields").model_dump(mode="json")
@@ -295,7 +398,7 @@ def test_recursive_boundary_rejects_sentinel_in_every_serialized_string_field(
         target = value
         for item in path[:-1]:
             target = target[item]  # type: ignore[index]
-        target[path[-1]] = "ROW_SENTINEL_SELECT_SK_ENDPOINT"  # type: ignore[index]
+        target[path[-1]] = "SELECT secret_value FROM protected_table"  # type: ignore[index]
 
     collect(payload)
     scan = reporting.__dict__["_scan_safe"]
@@ -313,18 +416,24 @@ def test_recursive_boundary_rejects_sentinel_in_every_serialized_string_field(
     reservation = reserve_week3_report(
         tmp_path,
         mode="fixture",
-        run_id="unsafe-sentinel",
+        run_id="unsafe-sensitive",
         timestamp=datetime(2026, 9, 4, tzinfo=UTC),
     )
     case = (
-        _report("unsafe-sentinel")
+        _report("unsafe-sensitive")
         .cases[0]
         .model_copy(update={"observed_missing_fields": ("ROW_SENTINEL",)})
     )
-    unsafe = _report("unsafe-sentinel").model_copy(update={"cases": (case,)})
+    unsafe = _report("unsafe-sensitive").model_copy(update={"cases": (case,)})
 
     with pytest.raises(ValueError, match="unsafe metadata"):
         write_week3_report(reservation, unsafe)
+
+
+def test_recursive_boundary_allows_plain_sentinel_and_sql_keywords_in_prose() -> None:
+    scan = reporting.__dict__["_scan_safe"]
+
+    scan({"requested_model": "sentinel-llm", "error_type": "selected_from_cache"})
 
 
 def test_reservation_close_retries_only_failed_descriptor(
@@ -384,4 +493,37 @@ def test_close_failure_does_not_mask_primary_write_failure(
 
     original_close(reservation.staging_fd)
     reservation._staging_fd_closed = True
+    assert reservation.closed
+
+
+@pytest.mark.parametrize("targets", (("cases",), ("staging",), ("parent",), ("staging", "parent")))
+def test_postpublish_close_failures_are_retried_without_hiding_valid_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, targets: tuple[str, ...]
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id="postpublish-close-" + "-".join(targets),
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_close = os.close
+    failed: set[str] = set()
+
+    def fail_each_once(fd: int) -> None:
+        labels = {
+            "staging": reservation.staging_fd,
+            "parent": reservation.parent_fd,
+            "cases": reservation._cases_fd,
+        }
+        for label in targets:
+            if labels[label] == fd and label not in failed:
+                failed.add(label)
+                raise OSError("fixed close failure")
+        original_close(fd)
+
+    monkeypatch.setattr(os, "close", fail_each_once)
+    published = write_week3_report(reservation, _report(reservation.run_id))
+
+    assert published.report_json.is_file()
+    assert failed == set(targets)
     assert reservation.closed

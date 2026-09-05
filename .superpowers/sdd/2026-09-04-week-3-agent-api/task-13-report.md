@@ -106,3 +106,54 @@
 ### 剩余关注
 
 - 按禁令未执行 live/付费/API client/network 调用；live provider 的实际质量和生命周期仍归 Task 14。
+
+## Fix round 2（2026-09-05）
+
+### 修复结果
+
+- 报告目录从文件系统根开始逐级使用 `dir_fd + O_DIRECTORY + O_NOFOLLOW` 打开或创建，
+  不再先扫描后按 pathname 创建。`report.json`、`report.md` 与每个 case JSON 的 FD 均保持到
+  publish 后校验完成，并绑定创建时的 device/inode/size/SHA-256；cases 目录同样绑定 FD identity，
+  发布前后都核对精确 inventory。普通文件替换、同 inode 内容篡改、component/source swap 均
+  fail closed，fixed final 不可见，检测到 foreign 内容时将其隔离保留。
+- publish 后已完成身份与内容校验即采用成功语义：file/cases/staging/parent FD 全部逐项关闭，失败项
+  最多重试四轮，单项错误不阻止其余 FD 的关闭，也不把已经验证的 final 改成失败；publish 前或
+  postcheck 失败仍隔离 fixed final，cleanup/close 异常不遮蔽原异常。
+- canonical case ID 现在固定绑定 cohort、suite、expected behavior/missing fields、terminal status/
+  reason 与 repair override；run budget configuration 与每个 case 的 action/model/tool/execute/profile/
+  repair/hard-cost limits（含 W3K029 tool=3）严格交叉验证。
+- 新增安全 validation refs、first observation ID 与逐 case model usage/expected resolved identity。
+  `SuiteScore`、`model_identity_complete`、`valid_execute_count`、`repair_succeeded`、
+  `natural_refusal` 均由这些安全明细唯一派生或严格绑定；writer 重新验证后再发布，可拒绝
+  `model_copy`/`model_construct` 绕过。
+- recursive guard 删除测试专用裸 `sentinel` 规则，合法 `sentinel-llm` 与普通
+  `selected_from_cache` 不再误报；SQL 语句、URL、credential 形态与禁止 key 仍统一拒绝且不回显。
+- W3K030 仅接受精确 `read_only_policy` failed Execute diagnostic；`sql_timeout`、
+  `database_error` 等不能伪装 policy rejection。runner budget gate 增加 hard cost 上限；超限 case
+  保留原始安全 token/cost 明细并形成 nonconformant result，不再降级成全零
+  `scoring_contract_failure`。
+
+### RED / mutation 回归
+
+- 显式 mutation：暂时移除 file identity 校验、恢复裸 `sentinel` 拒绝、放宽 W3K030 为任意
+  `SafeSqlDiagnostic`、移除 hard-cost gate。
+- 命令：
+  `uv run pytest tests/unit/evals/week3/test_reporting.py::test_written_regular_file_inode_swap_is_rejected_and_isolated tests/unit/evals/week3/test_reporting.py::test_file_swap_after_publisher_identity_check_is_rejected tests/unit/evals/week3/test_reporting.py::test_recursive_boundary_allows_plain_sentinel_and_sql_keywords_in_prose tests/unit/evals/week3/test_runner.py::test_policy_suite_accepts_only_exact_read_only_rejection tests/unit/evals/week3/test_runner.py::test_hard_cost_exceed_preserves_safe_usage_in_nonconformant_result -q`
+- 输出：`8 failed, 1 passed in 4.34s`；三类写后 inode swap、publisher seam swap、合法 model ID、
+  两个错误 policy diagnostic 与 hard-cost usage 保留均被 mutation 捕获。
+- 恢复实现后同一命令：`9 passed in 3.98s`。
+
+### 最终验证
+
+- `uv run pytest tests/unit/evals/week3 -q` → `361 passed in 26.99s`。
+- `DATABASE_URL=postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.0.0.1:5432/governed_analytics uv run pytest tests/integration/evals/test_week3_runner.py -q`
+  → `1 passed in 15.22s`；覆盖 canonical fixture 40/40、W3K030 精确
+  `read_only_policy` 与 per-case backend=0。
+- 定向 Ruff/mypy：`All checks passed!`；`Success: no issues found in 15 source files`。
+- `make check` → Ruff `All checks passed!`；mypy
+  `Success: no issues found in 156 source files`；unit `1535 passed in 48.40s`。
+
+### 剩余关注
+
+- 按禁令未执行 live/付费/API client/network 调用；live provider 实际质量与 engine/client 生命周期
+  仍归 Task 14。

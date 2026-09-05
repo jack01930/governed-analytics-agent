@@ -42,6 +42,7 @@ from governed_analytics.evals.week3.models import (
     SafeEvidenceRef,
     SafeProfileTraceMetadata,
     SafeToolTraceRef,
+    SafeValidationRef,
     SuiteScore,
     Week3CaseResult,
     Week3EvaluationCase,
@@ -525,7 +526,7 @@ def _suite_score(case: Week3EvaluationCase, result: AgentRunResult) -> SuiteScor
     )
     conformant = (
         len(failed) == 1
-        and failed[0].safe_error in {item.value for item in SafeSqlDiagnostic}
+        and failed[0].safe_error == SafeSqlDiagnostic.READ_ONLY_POLICY.value
         and not any(
             item.tool_name is ActionType.EXECUTE_SQL and item.ok for item in result.observations
         )
@@ -618,6 +619,7 @@ def _score_case(
         and governance.profile_calls <= limits.max_profile_calls
         and governance.repair_count <= limits.max_repairs
         and governance.repair_count == case.expected_repair_count
+        and governance.committed_cost_cny <= limits.hard_cost_cny
     )
     terminal_ok = (
         result.final_answer.status is case.expected_final_status
@@ -679,8 +681,24 @@ def _score_case(
         evidence_score=evidence_score,
         budget_score=budget_score,
         safe_tool_trace=_safe_tool_refs(result),
+        safe_validation_refs=tuple(
+            SafeValidationRef(
+                observation_id=item.observation_id,
+                contract_id=item.contract_id,
+                validation_fingerprint=item.validation_fingerprint,
+                valid=item.valid,
+            )
+            for item in result.observation_validations
+        ),
+        first_candidate_observation_id=(
+            None if result.first_candidate is None else result.first_candidate.observation_id
+        ),
         evidence_references=_evidence_refs(result, purposes),
+        expected_resolved_model=expected_resolved_model,
         resolved_models=case_models,
+        model_trace_calls=len(result.safe_trace.model_calls),
+        model_trace_input_tokens=sum(item.input_tokens for item in result.safe_trace.model_calls),
+        model_trace_output_tokens=sum(item.output_tokens for item in result.safe_trace.model_calls),
         model_identity_complete=model_identity_complete,
         repair_succeeded=(
             case.case_id == "W3K027" and suite_score.conformant if case.suite == "repair" else None

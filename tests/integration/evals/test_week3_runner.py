@@ -126,6 +126,11 @@ async def test_fixture_runner_executes_all_40_cases_on_one_shared_readonly_engin
     assert triples("W3K028") == (simple, simple)
     assert triples("W3K029") == (("gmv_comparison", "gmv_comparison", "confirm_decline"),)
     assert triples("W3K030") == (simple,)
+    assert tuple(
+        trace.safe_error
+        for trace in by_id["W3K030"].safe_tool_trace
+        if trace.tool_name.value == "execute_sql"
+    ) == ("read_only_policy",)
     assert by_id["W3K029"].evidence_score is not None
     assert by_id["W3K029"].evidence_score.verified_count == 1
     assert len(by_id["W3K029"].evidence_references) == 1

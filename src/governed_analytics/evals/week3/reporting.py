@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import json
 import os
 import platform
 import re
 import stat
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -52,6 +53,17 @@ class _Identity:
 
 
 @dataclass(slots=True)
+class _FileBinding:
+    directory_fd: int
+    name: str
+    fd: int
+    identity: _Identity
+    size: int
+    digest: str
+    closed: bool = False
+
+
+@dataclass(slots=True)
 class Week3ReportReservation:
     mode: str
     run_id: str
@@ -68,6 +80,12 @@ class Week3ReportReservation:
     _active: bool = True
     _staging_fd_closed: bool = False
     _parent_fd_closed: bool = False
+    _cases_fd: int | None = None
+    _cases_identity: _Identity | None = None
+    _cases_fd_closed: bool = True
+    _case_names: tuple[str, ...] = ()
+    _file_bindings: list[_FileBinding] = field(default_factory=list)
+    _foreign_content: bool = False
 
     @property
     def active(self) -> bool:
@@ -75,10 +93,33 @@ class Week3ReportReservation:
 
     @property
     def closed(self) -> bool:
-        return self._staging_fd_closed and self._parent_fd_closed
+        return (
+            self._staging_fd_closed
+            and self._parent_fd_closed
+            and self._cases_fd_closed
+            and all(item.closed for item in self._file_bindings)
+        )
 
     def close(self) -> None:
         first: OSError | None = None
+        for binding in self._file_bindings:
+            if binding.closed:
+                continue
+            try:
+                os.close(binding.fd)
+            except OSError as error:
+                if first is None:
+                    first = error
+            else:
+                binding.closed = True
+        if not self._cases_fd_closed and self._cases_fd is not None:
+            try:
+                os.close(self._cases_fd)
+            except OSError as error:
+                if first is None:
+                    first = error
+            else:
+                self._cases_fd_closed = True
         if not self._staging_fd_closed:
             try:
                 os.close(self.staging_fd)
@@ -117,32 +158,53 @@ def _directory_handle_identity(fd: int) -> _Identity:
     return _identity(metadata)
 
 
-def _path_identity(path: Path) -> _Identity:
-    metadata = path.lstat()
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise OSError("Week 3 report reservation unavailable")
-    return _identity(metadata)
-
-
-def _require_no_symlink_components(path: Path) -> None:
-    absolute = path.absolute()
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current /= part
-        try:
-            metadata = current.lstat()
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError("Week 3 report paths cannot contain symlinks")
-
-
-def _open_directory(path: Path) -> int:
+def _directory_flags() -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
         raise OSError("secure Week 3 report handles are unavailable")
-    flags = os.O_RDONLY | no_follow | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
-    return os.open(path, flags)
+    return int(
+        os.O_RDONLY | no_follow | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_or_create_directory_tree(path: Path) -> int:
+    absolute = path.absolute()
+    fd = os.open(absolute.anchor, _directory_flags())
+    try:
+        for part in absolute.parts[1:]:
+            with suppress(FileExistsError):
+                os.mkdir(part, mode=0o700, dir_fd=fd)
+            child = os.open(part, _directory_flags(), dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        raise
+
+
+def _open_directory_tree(path: Path) -> int:
+    absolute = path.absolute()
+    fd = os.open(absolute.anchor, _directory_flags())
+    try:
+        for part in absolute.parts[1:]:
+            child = os.open(part, _directory_flags(), dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        raise
+
+
+def _path_is_bound_to(path: Path, identity: _Identity) -> bool:
+    fd = _open_directory_tree(path)
+    try:
+        return _directory_handle_identity(fd) == identity
+    finally:
+        os.close(fd)
 
 
 def _normalize_timestamp(value: datetime) -> datetime:
@@ -162,20 +224,21 @@ def reserve_week3_report(
     if mode not in {"fixture", "live"} or _RUN_ID.fullmatch(run_id) is None:
         raise ValueError("Week 3 report target metadata is invalid")
     root = Path(output_root).absolute()
-    _require_no_symlink_components(root)
-    root.mkdir(parents=True, exist_ok=True)
-    _require_no_symlink_components(root)
+    root_fd = _open_or_create_directory_tree(root)
     mode_dir = root / mode
-    mode_dir.mkdir(mode=0o700, exist_ok=True)
-    _require_no_symlink_components(mode_dir)
     name = f"{normalized.strftime('%Y%m%dT%H%M%SZ')}-{run_id}"
     staging_name = f".{name}-staging-reservation"
-    parent_fd = _open_directory(mode_dir)
+    parent_fd: int | None = None
     staging_fd: int | None = None
     created = False
     try:
+        with suppress(FileExistsError):
+            os.mkdir(mode, mode=0o700, dir_fd=root_fd)
+        parent_fd = os.open(mode, _directory_flags(), dir_fd=root_fd)
+        os.close(root_fd)
+        root_fd = -1
         parent_identity = _directory_handle_identity(parent_fd)
-        if parent_identity != _path_identity(mode_dir):
+        if not _path_is_bound_to(mode_dir, parent_identity):
             raise OSError("Week 3 report reservation unavailable")
         for candidate in (name, staging_name):
             try:
@@ -185,10 +248,11 @@ def reserve_week3_report(
             raise FileExistsError("Week 3 report already exists or is reserved")
         os.mkdir(staging_name, mode=0o700, dir_fd=parent_fd)
         created = True
-        staging_fd = _open_directory(mode_dir / staging_name)
+        staging_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
         staging_identity = _directory_handle_identity(staging_fd)
         if (
-            staging_identity != _path_identity(mode_dir / staging_name)
+            _identity(os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False))
+            != staging_identity
             or stat.S_IMODE(staging_identity.mode) != 0o700
         ):
             raise OSError("Week 3 report reservation unavailable")
@@ -213,21 +277,32 @@ def reserve_week3_report(
         if created:
             with suppress(OSError):
                 os.rmdir(staging_name, dir_fd=parent_fd)
-        with suppress(OSError):
-            os.close(parent_fd)
+        if parent_fd is not None:
+            with suppress(OSError):
+                os.close(parent_fd)
+        if root_fd >= 0:
+            with suppress(OSError):
+                os.close(root_fd)
         raise
 
 
 def _validate_owned(reservation: Week3ReportReservation, *, require_path: bool = True) -> None:
     if not reservation.active or reservation.closed:
         raise OSError("Week 3 report reservation unavailable")
-    _require_no_symlink_components(reservation.parent_dir)
     if (
         _directory_handle_identity(reservation.parent_fd) != reservation.parent_identity
-        or _path_identity(reservation.parent_dir) != reservation.parent_identity
+        or not _path_is_bound_to(reservation.parent_dir, reservation.parent_identity)
         or _directory_handle_identity(reservation.staging_fd) != reservation.staging_identity
         or (
-            require_path and _path_identity(reservation.staging_dir) != reservation.staging_identity
+            require_path
+            and _identity(
+                os.stat(
+                    reservation.staging_name,
+                    dir_fd=reservation.parent_fd,
+                    follow_symlinks=False,
+                )
+            )
+            != reservation.staging_identity
         )
     ):
         raise OSError("Week 3 report reservation unavailable")
@@ -301,8 +376,7 @@ def _scan_safe(value: object, *, key: str | None = None) -> None:
         for child in value:
             _scan_safe(child)
     elif isinstance(value, str) and (
-        "sentinel" in value.casefold()
-        or _SQL_TEXT.search(value)
+        _SQL_TEXT.search(value)
         or _URL.search(value)
         or _CREDENTIAL.search(value)
     ):
@@ -402,37 +476,82 @@ def _markdown(report: Week3RunReport) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _write_text_at(directory_fd: int, name: str, contents: str) -> None:
+def _digest_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(fd, 65536, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
+def _write_text_at(directory_fd: int, name: str, contents: str) -> _FileBinding:
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
     fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
-    primary: BaseException | None = None
     try:
         payload = contents.encode("utf-8")
         offset = 0
         while offset < len(payload):
             offset += os.write(fd, payload[offset:])
         os.fsync(fd)
-    except BaseException as error:
-        primary = error
-        raise
-    finally:
-        try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("Week 3 report inventory changed")
+        return _FileBinding(
+            directory_fd=directory_fd,
+            name=name,
+            fd=fd,
+            identity=_identity(metadata),
+            size=metadata.st_size,
+            digest=_digest_fd(fd),
+        )
+    except BaseException:
+        with suppress(OSError):
             os.close(fd)
-        except OSError:
-            if primary is None:
-                raise
+        raise
+
+
+def _validate_file_binding(binding: _FileBinding) -> None:
+    if binding.closed:
+        raise OSError("Week 3 report inventory changed")
+    handle_metadata = os.fstat(binding.fd)
+    path_metadata = os.stat(binding.name, dir_fd=binding.directory_fd, follow_symlinks=False)
+    if (
+        _identity(handle_metadata) != binding.identity
+        or _identity(path_metadata) != binding.identity
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or handle_metadata.st_size != binding.size
+        or path_metadata.st_size != binding.size
+        or _digest_fd(binding.fd) != binding.digest
+    ):
+        raise OSError("Week 3 report inventory changed")
+
+
+def _validate_file_bindings(reservation: Week3ReportReservation) -> None:
+    try:
+        for binding in reservation._file_bindings:
+            _validate_file_binding(binding)
+    except OSError:
+        reservation._foreign_content = True
+        raise
 
 
 def _validate_inventory(
-    reservation: Week3ReportReservation, cases_fd: int, case_names: tuple[str, ...]
+    reservation: Week3ReportReservation,
+    cases_fd: int,
+    case_names: tuple[str, ...],
+    *,
+    published: bool = False,
 ) -> None:
-    _validate_owned(reservation)
+    _validate_owned(reservation, require_path=not published)
     if set(os.listdir(reservation.staging_fd)) != {"report.json", "report.md", "cases"}:
         raise OSError("Week 3 report inventory changed")
     if set(os.listdir(cases_fd)) != set(case_names):
@@ -442,12 +561,18 @@ def _validate_inventory(
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError("Week 3 report inventory changed")
     cases_metadata = os.stat("cases", dir_fd=reservation.staging_fd, follow_symlinks=False)
-    if not stat.S_ISDIR(cases_metadata.st_mode):
+    if (
+        not stat.S_ISDIR(cases_metadata.st_mode)
+        or reservation._cases_identity is None
+        or _identity(cases_metadata) != reservation._cases_identity
+        or _directory_handle_identity(cases_fd) != reservation._cases_identity
+    ):
         raise OSError("Week 3 report inventory changed")
     for name in case_names:
         metadata = os.stat(name, dir_fd=cases_fd, follow_symlinks=False)
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError("Week 3 report inventory changed")
+    _validate_file_bindings(reservation)
 
 
 def _quarantine_final(reservation: Week3ReportReservation) -> None:
@@ -535,8 +660,43 @@ def _publish_owned(reservation: Week3ReportReservation) -> None:
 
 def _validate_published(reservation: Week3ReportReservation) -> None:
     _validate_owned(reservation, require_path=False)
-    if _path_identity(reservation.final_dir) != reservation.staging_identity:
+    try:
+        final_identity = _identity(
+            os.stat(reservation.final_name, dir_fd=reservation.parent_fd, follow_symlinks=False)
+        )
+    except OSError:
+        raise OSError("atomic Week 3 report publication failed") from None
+    if final_identity != reservation.staging_identity:
         raise OSError("atomic Week 3 report publication failed")
+    if reservation._cases_fd is None or reservation._cases_fd_closed:
+        raise OSError("atomic Week 3 report publication failed")
+    _validate_inventory(
+        reservation, reservation._cases_fd, reservation._case_names, published=True
+    )
+
+
+def _close_reservation_best_effort(reservation: Week3ReportReservation) -> None:
+    for _attempt in range(4):
+        if reservation.closed:
+            return
+        with suppress(OSError):
+            reservation.close()
+
+
+def _quarantine_owned_with_foreign_content(reservation: Week3ReportReservation) -> None:
+    owned_name = _find_owned_name(reservation)
+    if owned_name is None:
+        return
+    for _attempt in range(16):
+        quarantine = f".week3-foreign-{uuid4().hex}"
+        try:
+            _native_rename_at_no_replace(reservation.parent_fd, owned_name, quarantine)
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            return
+        return
+    raise OSError("atomic Week 3 report publication failed")
 
 
 def write_week3_report(
@@ -552,7 +712,6 @@ def write_week3_report(
     except (ValidationError, ValueError) as error:
         cancel_week3_report_reservation(reservation)
         raise ValueError("Week 3 report contains unsafe metadata") from error
-    cases_fd: int | None = None
     published = False
     primary: BaseException | None = None
     try:
@@ -568,11 +727,19 @@ def write_week3_report(
             | getattr(os, "O_CLOEXEC", 0),
             dir_fd=reservation.staging_fd,
         )
-        _write_text_at(reservation.staging_fd, "report.json", _serialise(report_value))
-        _write_text_at(reservation.staging_fd, "report.md", _markdown(report))
+        reservation._cases_fd = cases_fd
+        reservation._cases_fd_closed = False
+        reservation._cases_identity = _directory_handle_identity(cases_fd)
+        reservation._file_bindings.append(
+            _write_text_at(reservation.staging_fd, "report.json", _serialise(report_value))
+        )
+        reservation._file_bindings.append(
+            _write_text_at(reservation.staging_fd, "report.md", _markdown(report))
+        )
         case_names = tuple(f"{case.case_id}.json" for case in report.cases)
+        reservation._case_names = case_names
         for name, value in zip(case_names, case_values, strict=True):
-            _write_text_at(cases_fd, name, _serialise(value))
+            reservation._file_bindings.append(_write_text_at(cases_fd, name, _serialise(value)))
         os.fsync(cases_fd)
         os.fsync(reservation.staging_fd)
         _validate_inventory(reservation, cases_fd, case_names)
@@ -589,22 +756,19 @@ def write_week3_report(
         primary = error
         raise
     finally:
-        if cases_fd is not None:
-            try:
-                os.close(cases_fd)
-            except OSError:
-                if primary is None:
-                    raise
         if primary is not None:
-            with suppress(OSError):
-                _remove_owned(reservation)
+            if reservation._foreign_content:
+                with suppress(OSError):
+                    _quarantine_owned_with_foreign_content(reservation)
+            else:
+                with suppress(OSError):
+                    _remove_owned(reservation)
             reservation._active = False
-            with suppress(OSError):
-                reservation.close()
+            _close_reservation_best_effort(reservation)
     if not published:
         raise OSError("atomic Week 3 report publication failed")
     reservation._active = False
-    reservation.close()
+    _close_reservation_best_effort(reservation)
     return PublishedWeek3Report(
         report_dir=reservation.final_dir,
         report_json=reservation.final_dir / "report.json",

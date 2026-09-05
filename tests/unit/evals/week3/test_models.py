@@ -14,6 +14,7 @@ from governed_analytics.agent.contracts import (
 from governed_analytics.evals.models import QueryResult
 from governed_analytics.evals.week3.models import (
     BehaviorScore,
+    BudgetConfiguration,
     BudgetOverrides,
     BudgetScore,
     CandidateScore,
@@ -102,6 +103,7 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
         cohort="known",
         suite="behavior",
         expected_behavior=BehaviorAction.CLARIFY,
+        expected_missing_fields=("metric", "time_window"),
         expected_final_status=FinalStatus.CLARIFICATION_REQUIRED,
         expected_stop_reason=StopReason.MISSING_REQUIRED_FIELDS,
         observed_final_status=FinalStatus.CLARIFICATION_REQUIRED,
@@ -119,7 +121,7 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
         budget_score=BudgetScore(
             conformant=True,
             action_loops=0,
-            llm_calls=0,
+            llm_calls=1,
             tool_calls=0,
             execute_calls=0,
             profile_calls=0,
@@ -140,6 +142,10 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
         natural_refusal=True,
         observed_behavior=BehaviorAction.CLARIFY,
         observed_behavior_reason=BehaviorReasonCode.MISSING_METRIC,
+        observed_missing_fields=("metric", "time_window"),
+        resolved_models=("fixture-agent",),
+        model_trace_calls=1,
+        model_identity_complete=True,
     )
     overall = "a" * 64
     report = Week3RunReport(
@@ -151,6 +157,7 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
             overall_manifest_sha256=overall, mode="fixture", case_ids=("W3K001",)
         ),
         report_scope="partial_test",
+        resolved_models=("fixture-agent",),
         cases=(case,),
     )
 
@@ -207,6 +214,43 @@ def test_week3_report_aggregates_are_derived_from_cases_only() -> None:
             {
                 **report.model_dump(exclude_computed_fields=True),
                 "executed_manifest_sha256": "d" * 64,
+            }
+        )
+
+    base_case = case.model_dump(exclude_computed_fields=True)
+    for update in (
+        {
+            "expected_behavior": BehaviorAction.REFUSE,
+            "expected_missing_fields": (),
+            "expected_final_status": FinalStatus.REFUSED,
+            "expected_stop_reason": StopReason.SENSITIVE_DATA_REQUEST,
+            "observed_behavior": BehaviorAction.REFUSE,
+            "observed_behavior_reason": BehaviorReasonCode.SENSITIVE_DATA_REQUEST,
+            "observed_missing_fields": (),
+        },
+        {"model_identity_complete": False},
+        {"natural_refusal": False},
+    ):
+        with pytest.raises(ValidationError):
+            Week3CaseResult.model_validate({**base_case, **update})
+
+    configuration = BudgetConfiguration(
+        max_action_loops=2,
+        max_llm_calls=2,
+        max_tool_calls=2,
+        max_execute_calls=2,
+        max_profile_calls=2,
+        max_repairs=1,
+        max_concurrent_runs=1,
+        timeout_seconds=1,
+        soft_cost_cny=Decimal("0.5"),
+        hard_cost_cny=Decimal("1"),
+    )
+    with pytest.raises(ValidationError, match="case budget limits"):
+        Week3RunReport.model_validate(
+            {
+                **report.model_dump(exclude_computed_fields=True),
+                "budget_configuration": configuration,
             }
         )
 

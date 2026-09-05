@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from governed_analytics.agent.contracts import (
+    ActionType,
     AgentRunResult,
     FinalAnswer,
     FinalStatus,
     GovernanceSnapshot,
     SafeTrace,
     StopReason,
+    ToolCallTrace,
 )
-from governed_analytics.evals.week3.runner import run_week3_evaluation
+from governed_analytics.evals.week3.runner import _suite_score, run_week3_evaluation
 from governed_analytics.evals.week3.suites import load_week3_cases
 
 
@@ -153,3 +156,65 @@ async def test_runner_rejects_known_result_replayed_for_heldout_case(tmp_path: P
 
     assert artifact.report.cases[0].error_type == "case_identity_mismatch"
     assert not artifact.report.cases[0].passed
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "conformant"),
+    (("read_only_policy", True), ("sql_timeout", False), ("database_error", False)),
+)
+def test_policy_suite_accepts_only_exact_read_only_rejection(
+    diagnostic: str, conformant: bool
+) -> None:
+    case = load_week3_cases()[29]
+    trace = ToolCallTrace(
+        tool_name=ActionType.EXECUTE_SQL,
+        purpose="metric_value_contract",
+        safe_arguments=(
+            ("contract_id", "metric_value_contract"),
+            ("hypothesis_id", "metric_value"),
+        ),
+        safe_error=diagnostic,
+    )
+    result = AgentRunResult.model_construct(
+        observations=(),
+        observation_validations=(),
+        evidence=(),
+        governance=GovernanceSnapshot(),
+        safe_trace=SafeTrace(tool_calls=(trace,)),
+    )
+
+    assert _suite_score(case, result).conformant is conformant
+
+
+@pytest.mark.asyncio
+async def test_hard_cost_exceed_preserves_safe_usage_in_nonconformant_result(
+    tmp_path: Path,
+) -> None:
+    class CostExceededExecutor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            del question
+            return _failure(case_id).model_copy(
+                update={
+                    "governance": GovernanceSnapshot(
+                        committed_cost_cny=Decimal("0.31"),
+                        input_tokens=123,
+                        output_tokens=45,
+                    )
+                }
+            )
+
+    artifact = await run_week3_evaluation(
+        mode="fixture",
+        executor=CostExceededExecutor(),
+        cases=load_week3_cases()[:1],
+        output_root=tmp_path,
+        run_id="hard-cost",
+        now=lambda: datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    result = artifact.report.cases[0]
+
+    assert result.budget_score.committed_cost_cny == Decimal("0.31")
+    assert result.budget_score.input_tokens == 123
+    assert result.budget_score.output_tokens == 45
+    assert not result.budget_conformant
+    assert result.error_type != "scoring_contract_failure"
