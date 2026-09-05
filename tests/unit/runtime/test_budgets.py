@@ -13,7 +13,7 @@ from governed_analytics.agent.contracts import (
     StructuredModelRequest,
 )
 from governed_analytics.config import AgentRuntimeSettings
-from governed_analytics.pricing import ModelPricing
+from governed_analytics.pricing import ModelPricing, load_model_pricing
 from governed_analytics.runtime.budgets import BudgetExceeded, BudgetLedger, BudgetLimits
 
 
@@ -176,6 +176,29 @@ def test_provider_model_mismatch_fails_closed_and_retains_reservation() -> None:
     assert ledger.snapshot.committed_cost_cny == Decimal("0")
     assert ledger.snapshot.reserved_cost_cny == reservation.reserved_cost_cny
     assert ledger.fail_model_call(reservation).committed_cost_cny == reservation.reserved_cost_cny
+
+
+def test_deepseek_observed_alias_settles_but_unknown_model_fails_closed() -> None:
+    pricing = load_model_pricing("data/pricing/deepseek-v4-flash-2026-09-01.yaml")
+    ledger = _ledger(pricing=pricing)
+    accepted = ledger.reserve_model_call(_request(max_output_tokens=1))
+
+    settled = ledger.settle_model_call(
+        accepted,
+        ModelUsage(input_tokens=1, output_tokens=1),
+        "deepseek-v4-flash",
+    )
+
+    assert settled.input_tokens == 1
+    assert settled.output_tokens == 1
+    rejected = ledger.reserve_model_call(_request(max_output_tokens=1))
+    with pytest.raises(RuntimeError, match="provider model"):
+        ledger.settle_model_call(
+            rejected,
+            ModelUsage(input_tokens=1, output_tokens=1),
+            "deepseek-v4-flash-unknown",
+        )
+    assert ledger.snapshot.reserved_cost_cny == rejected.reserved_cost_cny
 
 
 def test_usage_cost_above_reservation_fails_closed() -> None:

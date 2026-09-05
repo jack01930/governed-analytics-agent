@@ -75,7 +75,7 @@ from governed_analytics.evals.week3.suites import (
     _load_fixture_scripts_from_snapshot,
 )
 from governed_analytics.models.agent_fixtures import AgentScripts, ScriptedAgentModel
-from governed_analytics.pricing import ModelPricing
+from governed_analytics.pricing import ModelPricing, provider_model_has_pricing
 from governed_analytics.runtime.budgets import BudgetLedger, BudgetLimits
 
 
@@ -364,7 +364,10 @@ class LiveWeek3CaseExecutor(_BaseWeek3Executor):
         model_calls = result.safe_trace.model_calls
         if (
             not model_calls
-            or any(item.provider_model != self.pricing.resolved_model for item in model_calls)
+            or any(
+                not provider_model_has_pricing(item.provider_model, self.pricing)
+                for item in model_calls
+            )
             or sum(item.input_tokens for item in model_calls) != result.governance.input_tokens
             or sum(item.output_tokens for item in model_calls) != result.governance.output_tokens
         ):
@@ -1160,6 +1163,18 @@ def _rebuild_report_from_publication_evidence(
         for case in evidence.cases
     ):
         raise Week3RunError("publication evidence does not match the frozen registry")
+    observed_models = tuple(
+        dict.fromkeys(
+            call.provider_model
+            for outcome in evidence.outcomes
+            for call in outcome.safe_trace.model_calls
+        )
+    )
+    expected_provider_model = evidence.pricing.requested_model
+    if len(observed_models) == 1 and provider_model_has_pricing(
+        observed_models[0], evidence.pricing
+    ):
+        expected_provider_model = observed_models[0]
     scored_items: list[Week3CaseResult] = []
     for case, outcome, error_type, expected_results in zip(
         evidence.cases,
@@ -1174,7 +1189,7 @@ def _rebuild_report_from_publication_evidence(
                 outcome,
                 evidence.settings,
                 expected_results=expected_results,
-                expected_resolved_model=evidence.pricing.resolved_model,
+                expected_resolved_model=expected_provider_model,
                 error_override=error_type,
             )
         except Exception:
@@ -1183,7 +1198,7 @@ def _rebuild_report_from_publication_evidence(
                 _safe_failure(case_id=case.case_id, reason=StopReason.INTERNAL_ERROR),
                 evidence.settings,
                 expected_results=expected_results,
-                expected_resolved_model=evidence.pricing.resolved_model,
+                expected_resolved_model=expected_provider_model,
                 error_override="scoring_contract_failure",
             )
         scored_items.append(scored_case)

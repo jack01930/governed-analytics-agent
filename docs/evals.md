@@ -93,6 +93,11 @@ make eval-week3-fixture
 uv run governed-eval week3 --dataset tiny --mode live --live
 ```
 
+DeepSeek 当前可能把请求别名 `deepseek-v4-flash` 原样写入 `response.model`，而价格快照的 `resolved_model`
+保存官方版本标签 `DeepSeek-V4-Flash-0731`。预算结算只接受价格快照绑定的这两个精确值，不接受任意 alias；
+Week 3 的 `resolved_models` 保留 Provider 实际返回的安全模型名。陌生或同一轮混合模型身份会 fail closed，但仍
+发布不通过的安全报告，避免因报告契约二次失败而丢失本轮结果。
+
 CI 与 Makefile 只包含 fixture 命令，不携带 key、URL、network client 或 live 开关。任何 Week 3 live 都必须在
 审阅本次离线报告后获得新的、单次明确授权。
 

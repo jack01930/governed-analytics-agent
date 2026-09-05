@@ -37,6 +37,10 @@ MODEL_NAME=deepseek-v4-flash
 EVAL_MODEL_NAME=DeepSeek-V4-Flash-0731
 ```
 
+其中 `MODEL_NAME` 是请求时使用、也可能由 API 原样返回的模型别名；`EVAL_MODEL_NAME` 是价格快照绑定的官方
+版本标签，并不要求 Provider 的 `response.model` 必须逐字返回该标签。运行时只接受价格快照明确声明的这两个
+精确身份，其他模型名一律按无法结算处理。
+
 不得把 Key 粘贴到聊天、命令历史、测试夹具、报告或 Git。`make doctor` 只检查 Key 是否存在，不显示内容。
 
 ## 3. 显式执行一次 live

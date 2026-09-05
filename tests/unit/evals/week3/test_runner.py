@@ -33,17 +33,19 @@ from governed_analytics.agent.contracts import (
     StopReason,
     ToolCallTrace,
 )
-from governed_analytics.agent.ports import AgentTools
+from governed_analytics.agent.ports import AgentModel, AgentTools
 from governed_analytics.config import AgentRuntimeSettings
 from governed_analytics.evals.models import QueryResult
 from governed_analytics.evals.week3 import runner
 from governed_analytics.evals.week3.runner import (
     FixtureWeek3CaseExecutor,
+    LiveWeek3CaseExecutor,
     _score_case,
     _suite_score,
     run_week3_evaluation,
 )
 from governed_analytics.evals.week3.suites import load_week3_cases
+from governed_analytics.pricing import load_model_pricing
 
 
 def _failure(case_id: str) -> AgentRunResult:
@@ -67,7 +69,9 @@ def _failure(case_id: str) -> AgentRunResult:
     )
 
 
-def _simple_result_with_evidence_value(value: Decimal) -> AgentRunResult:
+def _simple_result_with_evidence_value(
+    value: Decimal, *, provider_model: str = "fixture-agent"
+) -> AgentRunResult:
     query_id = "b" * 64
     actual = Decimal("94636.23")
     observation = Observation(
@@ -151,7 +155,7 @@ def _simple_result_with_evidence_value(value: Decimal) -> AgentRunResult:
     model_calls = tuple(
         ModelCallTrace(
             purpose=purpose,
-            provider_model="fixture-agent",
+            provider_model=provider_model,
             outcome="completed",
             latency_ms=0,
             input_tokens=0,
@@ -286,6 +290,166 @@ async def test_runner_enforces_mode_pricing_contract_before_reservation(
             output_root=tmp_path,
         )
     assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "provider_model", ("deepseek-v4-flash", "DeepSeek-V4-Flash-0731")
+)
+@pytest.mark.asyncio
+async def test_live_pricing_bound_identity_is_preserved_in_partial_report(
+    tmp_path: Path, provider_model: str
+) -> None:
+    pricing = load_model_pricing("data/pricing/deepseek-v4-flash-2026-09-01.yaml")
+
+    class AliasExecutor:
+        settings = AgentRuntimeSettings.model_validate({})
+
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            del case_id, question
+            return _simple_result_with_evidence_value(
+                Decimal("94636.23"), provider_model=provider_model
+            )
+
+    case = next(item for item in load_week3_cases() if item.case_id == "W3K011")
+    artifact = await run_week3_evaluation(
+        mode="live",
+        executor=AliasExecutor(),
+        cases=(case,),
+        pricing=pricing,
+        output_root=tmp_path,
+        run_id=f"live-{provider_model}",
+        now=lambda: datetime(2026, 9, 5, tzinfo=UTC),
+    )
+
+    result = artifact.report.cases[0]
+    assert artifact.report.report_scope == "partial_test"
+    assert artifact.report.resolved_models == (provider_model,)
+    assert result.expected_resolved_model == provider_model
+    assert result.resolved_models == (provider_model,)
+    assert result.model_identity_complete
+    assert artifact.report_json.is_file()
+
+
+@pytest.mark.asyncio
+async def test_live_unknown_model_fails_identity_but_still_publishes_partial_report(
+    tmp_path: Path,
+) -> None:
+    pricing = load_model_pricing("data/pricing/deepseek-v4-flash-2026-09-01.yaml")
+
+    class UnknownExecutor:
+        settings = AgentRuntimeSettings.model_validate({})
+
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            del case_id, question
+            return _simple_result_with_evidence_value(
+                Decimal("94636.23"), provider_model="deepseek-v4-flash-unknown"
+            )
+
+    case = next(item for item in load_week3_cases() if item.case_id == "W3K011")
+    artifact = await run_week3_evaluation(
+        mode="live",
+        executor=UnknownExecutor(),
+        cases=(case,),
+        pricing=pricing,
+        output_root=tmp_path,
+        run_id="live-unknown",
+        now=lambda: datetime(2026, 9, 5, tzinfo=UTC),
+    )
+
+    result = artifact.report.cases[0]
+    assert artifact.report.resolved_models == ("deepseek-v4-flash-unknown",)
+    assert result.expected_resolved_model == "deepseek-v4-flash"
+    assert result.resolved_models == ("deepseek-v4-flash-unknown",)
+    assert not result.model_identity_complete
+    assert not result.passed
+    assert artifact.report_json.is_file()
+
+
+@pytest.mark.asyncio
+async def test_live_mixed_pricing_identities_are_preserved_but_not_reported_complete(
+    tmp_path: Path,
+) -> None:
+    pricing = load_model_pricing("data/pricing/deepseek-v4-flash-2026-09-01.yaml")
+
+    class MixedExecutor:
+        settings = AgentRuntimeSettings.model_validate({})
+
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            del case_id, question
+            result = _simple_result_with_evidence_value(Decimal("94636.23"))
+            calls = tuple(
+                call.model_copy(
+                    update={
+                        "provider_model": (
+                            pricing.requested_model if index % 2 == 0 else pricing.resolved_model
+                        )
+                    }
+                )
+                for index, call in enumerate(result.safe_trace.model_calls)
+            )
+            return result.model_copy(
+                update={"safe_trace": result.safe_trace.model_copy(update={"model_calls": calls})}
+            )
+
+    case = next(item for item in load_week3_cases() if item.case_id == "W3K011")
+    artifact = await run_week3_evaluation(
+        mode="live",
+        executor=MixedExecutor(),
+        cases=(case,),
+        pricing=pricing,
+        output_root=tmp_path,
+        run_id="live-mixed",
+        now=lambda: datetime(2026, 9, 5, tzinfo=UTC),
+    )
+
+    result = artifact.report.cases[0]
+    assert artifact.report.resolved_models == (
+        pricing.requested_model,
+        pricing.resolved_model,
+    )
+    assert result.expected_resolved_model == pricing.requested_model
+    assert not result.model_identity_complete
+    assert not result.passed
+    assert artifact.report_json.is_file()
+
+
+@pytest.mark.parametrize(
+    ("provider_model", "accepted"),
+    (
+        ("deepseek-v4-flash", True),
+        ("DeepSeek-V4-Flash-0731", True),
+        ("deepseek-v4-flash-unknown", False),
+    ),
+)
+@pytest.mark.asyncio
+async def test_live_executor_accepts_only_exact_pricing_bound_identities(
+    provider_model: str,
+    accepted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pricing = load_model_pricing("data/pricing/deepseek-v4-flash-2026-09-01.yaml")
+
+    class Model:
+        model = pricing.requested_model
+
+    executor = LiveWeek3CaseExecutor(
+        model=cast(AgentModel, Model()),
+        tools=cast(AgentTools, object()),
+        settings=AgentRuntimeSettings.model_validate({}),
+        pricing=pricing,
+    )
+    observed = _simple_result_with_evidence_value(
+        Decimal("94636.23"), provider_model=provider_model
+    )
+
+    async def execute(**_kwargs: object) -> AgentRunResult:
+        return observed
+
+    monkeypatch.setattr(executor, "_execute", execute)
+    result = await executor.run_case(case_id="W3K011", question="June GMV?")
+
+    assert (result.final_answer.status is FinalStatus.COMPLETED) is accepted
+    assert result.safe_trace.model_calls[0].provider_model == provider_model
 
 
 @pytest.mark.asyncio

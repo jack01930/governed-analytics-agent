@@ -1098,7 +1098,9 @@ class Week3RunReport(_FrozenWireModel):
             raise ValueError("run resolved models must match case identity facts")
         expected_models = {case.expected_resolved_model for case in self.cases}
         if len(expected_models) != 1 or any(
-            case.resolved_models not in {(), (case.expected_resolved_model,)} for case in self.cases
+            case.model_identity_complete
+            and case.resolved_models != (case.expected_resolved_model,)
+            for case in self.cases
         ):
             raise ValueError("case model identities must share one expected resolved model")
         if self.mode == "fixture" and expected_models != {"fixture-agent"}:

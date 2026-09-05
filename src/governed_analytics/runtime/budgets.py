@@ -17,7 +17,11 @@ from governed_analytics.agent.contracts import (
     StructuredModelRequest,
 )
 from governed_analytics.config import AgentRuntimeSettings
-from governed_analytics.pricing import ModelPricing, estimate_cost_cny
+from governed_analytics.pricing import (
+    ModelPricing,
+    estimate_cost_cny,
+    provider_model_has_pricing,
+)
 
 
 @dataclass(frozen=True)
@@ -110,7 +114,7 @@ class BudgetLedger:
         provider_model: str,
     ) -> GovernanceSnapshot:
         active = self._require_active(reservation)
-        if provider_model != self._pricing.resolved_model:
+        if not provider_model_has_pricing(provider_model, self._pricing):
             raise RuntimeError("provider model does not match pricing contract")
         try:
             actual_cost = estimate_cost_cny(

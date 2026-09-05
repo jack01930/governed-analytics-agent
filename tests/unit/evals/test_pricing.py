@@ -10,6 +10,7 @@ from governed_analytics.evals.pricing import (
     PricingContractError,
     estimate_cost_cny,
     load_model_pricing,
+    provider_model_has_pricing,
 )
 from governed_analytics.pricing import ModelPricing
 from governed_analytics.pricing import load_model_pricing as load_public_model_pricing
@@ -33,6 +34,15 @@ def test_pricing_record_is_versioned_and_cost_is_exact_decimal() -> None:
     assert estimate_cost_cny(200_000, 1_000_000, pricing) == Decimal("9.5475072")
     assert estimate_cost_cny(0, 0, pricing) == Decimal("0.00")
     assert estimate_cost_cny(1_000_000, 1_000_000, pricing) == Decimal("11.934384")
+
+
+def test_pricing_binds_only_the_exact_request_alias_and_official_version() -> None:
+    pricing = load_model_pricing(PRICING_PATH)
+
+    assert provider_model_has_pricing("deepseek-v4-flash", pricing)
+    assert provider_model_has_pricing("DeepSeek-V4-Flash-0731", pricing)
+    assert not provider_model_has_pricing("deepseek-v4-flash-latest", pricing)
+    assert not provider_model_has_pricing("DEEPSEEK-V4-FLASH", pricing)
 
 
 @pytest.mark.parametrize("value", (-1, True, 1.0, "1"))

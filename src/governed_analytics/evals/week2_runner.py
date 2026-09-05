@@ -20,7 +20,11 @@ from governed_analytics.evals.context import (
     context_sha256,
 )
 from governed_analytics.evals.models import BaselineRunReport, GeneratedSql, QueryResult
-from governed_analytics.evals.pricing import ModelPricing, estimate_cost_cny
+from governed_analytics.evals.pricing import (
+    ModelPricing,
+    estimate_cost_cny,
+    provider_model_has_pricing,
+)
 from governed_analytics.evals.suites import (
     EvaluationCase,
     load_active_suites,
@@ -305,10 +309,6 @@ def _implementation_sha256() -> str:
     except (OSError, ValueError):
         raise Week2RunError("Week 2 implementation manifest unavailable") from None
     return digest.hexdigest()
-
-
-def _provider_model_has_pricing(provider_model: str, pricing: ModelPricing) -> bool:
-    return provider_model in {pricing.requested_model, pricing.resolved_model}
 
 
 def _adapter_error_has_complete_usage(error: ModelAdapterError) -> bool:
@@ -642,7 +642,7 @@ async def _run_week2_evaluation(
                 if (
                     provider_model is None
                     or not provider_model_is_safe
-                    or not _provider_model_has_pricing(provider_model, live_pricing)
+                    or not provider_model_has_pricing(provider_model, live_pricing)
                     or not _adapter_error_has_complete_usage(error)
                 ):
                     error_type = "pricing_failed"
@@ -674,7 +674,7 @@ async def _run_week2_evaluation(
             resolved_models.add(generated.provider_model)
         cost = Decimal("0")
         if live_pricing is not None:
-            if not provider_model_is_safe or not _provider_model_has_pricing(
+            if not provider_model_is_safe or not provider_model_has_pricing(
                 generated.provider_model, live_pricing
             ):
                 case_results.append(

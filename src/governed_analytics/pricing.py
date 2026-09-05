@@ -118,6 +118,17 @@ class ModelPricing(BaseModel):
         return source
 
 
+def provider_model_has_pricing(provider_model: str, pricing: ModelPricing) -> bool:
+    """Return whether an observed provider identity is bound by this price record.
+
+    OpenAI-compatible providers can return either the requested API alias or the
+    provider's pinned version label.  The pricing record is the trusted, exact
+    mapping between those two identities; no other alias is accepted.
+    """
+
+    return provider_model in (pricing.requested_model, pricing.resolved_model)
+
+
 def _resolve_from_repository(path: str | Path) -> Path:
     candidate = Path(path)
     return candidate if candidate.is_absolute() else _REPOSITORY_ROOT / candidate
@@ -167,4 +178,5 @@ __all__ = [
     "PricingContractError",
     "estimate_cost_cny",
     "load_model_pricing",
+    "provider_model_has_pricing",
 ]

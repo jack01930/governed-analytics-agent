@@ -5,6 +5,7 @@ from governed_analytics.pricing import (
     PricingContractError,
     estimate_cost_cny,
     load_model_pricing,
+    provider_model_has_pricing,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "PricingContractError",
     "estimate_cost_cny",
     "load_model_pricing",
+    "provider_model_has_pricing",
 ]
