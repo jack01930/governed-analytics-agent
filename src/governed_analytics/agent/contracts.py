@@ -860,12 +860,31 @@ class StructuredModelRequest(_FrozenModel):
             safe_category = AgentModelErrorCategory(failure_category)
         except (TypeError, ValueError):
             raise ValueError("unsupported agent model error category") from None
+        # Re-run the governed task, never the malformed response or exception text.
+        context_keys = {
+            "query",
+            "current_time_utc",
+            "metrics",
+            "tables",
+            "planning_contract",
+            "plan",
+            "target_hypothesis_id",
+            "execute_arguments_schema",
+            "contracts",
+            "profile_observations",
+            "evidence",
+            "evidence_gaps",
+        }
         return StructuredModelRequest(
             purpose="repair",
             system_prompt=(
+                self.system_prompt + "\n"
                 "Return exactly one JSON object that conforms to the bound output schema."
             ),
             user_payload={
+                "original_request": {
+                    key: value for key, value in self.user_payload.items() if key in context_keys
+                },
                 "failure_category": safe_category.value,
                 "output_schema_name": self.output_schema_name,
                 "re_output_instruction": (

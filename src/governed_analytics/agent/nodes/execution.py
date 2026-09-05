@@ -53,6 +53,8 @@ _SQL_GENERATION_RULES = (
     "definitions, including default_filters and the plan time windows. "
     "Set purpose to contract_id; copy the supplied hypothesis_id and contract_id. "
     "Return explicit columns with the contract aliases/order and limit. "
+    "Honor validation_contract: column types/nullability, unique keys and exact ORDER BY "
+    "including tie-breaks and NULL placement. "
     "Follow execute_arguments_schema. Every :named parameter must be directly CAST "
     "to a supported SQL type: for dates use CAST(:start_at AS timestamptz) and "
     "CAST(:end_at AS timestamptz), with ISO strings in arguments.parameters. "
@@ -244,6 +246,7 @@ def _action_prompt(state: AgentState, hypothesis_id: str) -> Mapping[str, object
                 "columns": item.column_names,
                 "shape": item.shape.value,
                 "limit": item.limit,
+                "validation_contract": item.model_dump(mode="json"),
             }
             for item in matching
         ),

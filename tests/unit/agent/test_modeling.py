@@ -158,7 +158,7 @@ async def test_structural_error_repairs_once_and_returns_all_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_repair_call_receives_only_fixed_safe_payload() -> None:
+async def test_repair_call_receives_original_task_without_raw_response() -> None:
     model = _Model([AgentModelError("invalid_structure"), _result()])
     request = StructuredModelRequest(
         purpose="behavior",
@@ -177,17 +177,16 @@ async def test_repair_call_receives_only_fixed_safe_payload() -> None:
 
     repair = model.calls[1]
     assert repair.purpose == "repair"
-    assert repair.system_prompt == (
-        "Return exactly one JSON object that conforms to the bound output schema."
-    )
-    assert dict(repair.user_payload) == {
+    assert repair.system_prompt.startswith(request.system_prompt)
+    assert repair.model_dump(mode="json")["user_payload"] == {
+        "original_request": {"query": "QUERY_SENTINEL"},
         "failure_category": "invalid_structure",
         "output_schema_name": "BehaviorDecision",
         "re_output_instruction": "Re-output the complete answer as schema-valid JSON only.",
     }
     serialized = repair.model_dump_json()
-    assert "SYSTEM_SENTINEL" not in serialized
-    assert "QUERY_SENTINEL" not in serialized
+    assert "SYSTEM_SENTINEL" in serialized
+    assert "QUERY_SENTINEL" in serialized
     assert "CONTEXT_SENTINEL" not in serialized
     assert "RAW_RESPONSE_SENTINEL" not in serialized
 

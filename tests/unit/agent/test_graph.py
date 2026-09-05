@@ -3496,3 +3496,7 @@ async def test_action_request_carries_the_retrieved_metric_and_schema_for_sql_ge
     assert any(table["name"] == "orders" for table in payload.get("tables", ()))
     assert payload["plan"]["windows"]
     assert payload["execute_arguments_schema"]["properties"]["sql"]
+    contract = payload["contracts"][0]["validation_contract"]
+    assert contract["columns"][0]["nullable"] is False
+    assert contract["max_rows"] == 1
+    assert contract["order_by"] == []

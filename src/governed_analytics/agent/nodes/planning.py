@@ -504,6 +504,7 @@ async def build_plan(
             ),
             user_payload={
                 "query": state["normalized_query"],
+                "current_time_utc": context.clock.now().isoformat(),
                 "metrics": tuple(_metric_prompt(item) for item in state["metric_context"]),
                 "tables": tuple(_table_prompt(item) for item in state["schema_context"]),
                 "planning_contract": {

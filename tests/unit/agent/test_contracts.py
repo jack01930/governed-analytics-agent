@@ -262,7 +262,7 @@ def test_prompt_bytes_include_provider_envelope_schema_and_fixed_protocol_overhe
     assert request.prompt_bytes() == expected_payload + bytes(512)
 
 
-def test_structured_request_repair_preserves_only_bound_schema_and_safe_instruction() -> None:
+def test_structured_request_repair_preserves_bound_task_without_raw_response() -> None:
     request = StructuredModelRequest.for_output(
         purpose="behavior",
         system_prompt="SYSTEM_SENTINEL Return a decision.",
@@ -279,20 +279,19 @@ def test_structured_request_repair_preserves_only_bound_schema_and_safe_instruct
 
     assert request.output_schema_name == "BehaviorDecision"
     assert repair.purpose == "repair"
-    assert repair.system_prompt == (
-        "Return exactly one JSON object that conforms to the bound output schema."
-    )
+    assert repair.system_prompt.startswith(request.system_prompt)
     assert repair.output_schema_name == request.output_schema_name
     assert repair.output_schema_summary == request.output_schema_summary
     assert repair.max_output_tokens == request.max_output_tokens
-    assert dict(repair.user_payload) == {
+    assert repair.model_dump(mode="json")["user_payload"] == {
+        "original_request": {"query": "QUERY_SENTINEL"},
         "failure_category": "invalid_structure",
         "output_schema_name": "BehaviorDecision",
         "re_output_instruction": "Re-output the complete answer as schema-valid JSON only.",
     }
     serialized = repair.model_dump_json()
-    assert "SYSTEM_SENTINEL" not in serialized
-    assert "QUERY_SENTINEL" not in serialized
+    assert "SYSTEM_SENTINEL" in serialized
+    assert "QUERY_SENTINEL" in serialized
     assert "CONTEXT_SENTINEL" not in serialized
     assert "RAW_RESPONSE_SENTINEL" not in serialized
 

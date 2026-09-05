@@ -282,20 +282,32 @@ async def decide_behavior(
             purpose="behavior",
             system_prompt=(
                 "Classify requests for this company's historical e-commerce database. "
-                "Support GMV, payments, refunds, order counts, averages, conversion rates, "
+                "Support GMV (商品交易总额), paid GMV, net revenue (净收入), valid order counts, "
+                "average order value, payment success rate, refund amount/rate, active/new "
+                "customers, repeat purchase rate, customer acquisition cost, conversion rate, "
+                "stockout rate and campaign ROI, "
                 "grouping/Top-K and two-window GMV decline attribution by region, SKU and "
                 "customer segment. GMV is already an explicit metric, including in attribution. "
                 "Refuse destructive operations and requests for raw personal contact data. "
                 "Forecasting is unsupported_analysis; competitor or external-site data is "
                 "unsupported_data_domain. Check unsupported scope before missing fields. "
-                "Clarify ambiguous metrics such as unspecified performance or revenue. "
+                "Clarify ambiguous metrics such as unspecified performance or bare revenue; "
+                "net revenue is an explicit supported metric. "
                 "Return ALL missing_fields: metric first, then time_window for absent or "
                 "vague dates such as recently. A decline/comparison needs previous_window "
                 "and current_window instead of time_window when those windows are missing. "
                 "Explicit ranges, including short dates borrowing a stated year, are supplied "
-                "windows. Return execute/ready when supported and all required fields exist."
+                "windows. Named calendar months/weeks are concrete windows: if the year is "
+                "omitted, use current_time_utc's year. Do not treat omitted year as missing "
+                "time_window. Return execute/ready when supported and all required fields exist. "
+                "Always include a nonempty user_message, including for execute/ready. "
+                "If metric and dates are missing use missing_metric; if an explicit metric "
+                "needs comparison windows use missing_comparison_window."
             ),
-            user_payload={"query": state["normalized_query"]},
+            user_payload={
+                "query": state["normalized_query"],
+                "current_time_utc": context.clock.now().isoformat(),
+            },
             output_type=BehaviorDecision,
             max_output_tokens=300,
         )
