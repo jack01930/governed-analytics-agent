@@ -7,7 +7,7 @@ from contextlib import suppress
 from time import monotonic
 from typing import TypedDict
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from governed_analytics.agent.contracts import (
@@ -76,6 +76,23 @@ def _validation_category(error: ValidationError) -> AgentModelErrorCategory:
     )
 
 
+def _provider_failure_category(error: Exception) -> AgentModelErrorCategory:
+    """Read only SDK type/status, never provider body, headers or exception text."""
+    if isinstance(error, APITimeoutError):
+        return AgentModelErrorCategory.PROVIDER_TIMEOUT
+    if isinstance(error, APIConnectionError):
+        return AgentModelErrorCategory.PROVIDER_CONNECTION_ERROR
+    if isinstance(error, APIStatusError):
+        status = error.status_code
+        if status == 429:
+            return AgentModelErrorCategory.PROVIDER_RATE_LIMITED
+        if 400 <= status < 500:
+            return AgentModelErrorCategory.PROVIDER_HTTP_4XX
+        if 500 <= status < 600:
+            return AgentModelErrorCategory.PROVIDER_HTTP_5XX
+    return AgentModelErrorCategory.PROVIDER_CALL_FAILED
+
+
 class OpenAICompatibleAgentModel:
     """Validate one provider response directly into the requested Agent contract."""
 
@@ -99,11 +116,12 @@ class OpenAICompatibleAgentModel:
             raise AgentModelError(AgentModelErrorCategory.SCHEMA_IDENTITY_MISMATCH)
 
         started_at = monotonic()
+        failure_category = None
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "system", "content": request.system_prompt},
+                    {"role": "system", "content": request.provider_system_prompt()},
                     {"role": "user", "content": request.user_json()},
                 ],
                 temperature=0,
@@ -111,10 +129,13 @@ class OpenAICompatibleAgentModel:
                 max_tokens=request.max_output_tokens,
                 extra_body={"thinking": {"type": "disabled"}},
             )
-        except Exception:
+        except Exception as error:
+            failure_category = _provider_failure_category(error)
+        # Raise outside the handler so the SDK exception cannot survive in __context__.
+        if failure_category is not None:
             latency_ms = max(0, round((monotonic() - started_at) * 1000))
             raise AgentModelError(
-                AgentModelErrorCategory.PROVIDER_CALL_FAILED,
+                failure_category,
                 latency_ms=latency_ms,
             ) from None
         latency_ms = max(0, round((monotonic() - started_at) * 1000))

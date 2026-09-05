@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx2 as httpx
 import pytest
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
-from governed_analytics.agent.contracts import BehaviorDecision, StructuredModelRequest
+from governed_analytics.agent.contracts import (
+    AnalysisAction,
+    BehaviorDecision,
+    FinalAnswer,
+    StructuredModelRequest,
+    TypedMetricPlan,
+)
 from governed_analytics.agent.ports import AgentModelError
 from governed_analytics.models.agent_openai_compatible import OpenAICompatibleAgentModel
 
@@ -82,7 +90,7 @@ async def test_agent_adapter_requests_json_without_hidden_thinking() -> None:
         {
             "model": "deepseek-v4-flash",
             "messages": [
-                {"role": "system", "content": "只返回契约 JSON。"},
+                {"role": "system", "content": _request().provider_system_prompt()},
                 {"role": "user", "content": '{"query":"预测明年GMV"}'},
             ],
             "temperature": 0,
@@ -137,4 +145,75 @@ async def test_agent_adapter_sanitizes_sdk_failures() -> None:
         await model.invoke(_request(), BehaviorDecision)
 
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
     assert raw_error not in repr(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "category"),
+    [
+        (400, "provider_http_4xx"),
+        (401, "provider_http_4xx"),
+        (429, "provider_rate_limited"),
+        (503, "provider_http_5xx"),
+        ("timeout", "provider_timeout"),
+        ("connection", "provider_connection_error"),
+    ],
+)
+async def test_provider_failure_preserves_only_safe_category(
+    kind: int | str, category: str
+) -> None:
+    transport_request = httpx.Request("POST", "https://example.invalid/private")
+    if kind == "timeout":
+        error: Exception = APITimeoutError(request=transport_request)
+    elif kind == "connection":
+        error = APIConnectionError(request=transport_request)
+    else:
+        error = APIStatusError(
+            "SENSITIVE_ERROR_SENTINEL",
+            response=httpx.Response(int(kind), request=transport_request),
+            body={"private": "SENSITIVE_BODY_SENTINEL"},
+        )
+    client = _FakeClient(error)
+    model = OpenAICompatibleAgentModel(cast(AsyncOpenAI, client), "deepseek-v4-flash")
+    with pytest.raises(AgentModelError) as raised:
+        await model.invoke(_request(), BehaviorDecision)
+    assert raised.value.category.value == category
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    assert "SENSITIVE" not in repr(vars(raised.value))
+    assert len(client.completions.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output_type", [BehaviorDecision, TypedMetricPlan, AnalysisAction, FinalAnswer]
+)
+@pytest.mark.parametrize("repair", [False, True])
+async def test_production_requests_send_json_instruction_and_complete_schema(
+    output_type: Any, repair: bool
+) -> None:
+    request = StructuredModelRequest.for_output(
+        purpose="behavior",
+        system_prompt="Classify the governed analytics request. Return only the bound schema.",
+        user_payload={"query": "六月GMV"},
+        output_type=output_type,
+        max_output_tokens=300,
+    )
+    if repair:
+        request = request.for_repair(failure_category="invalid_structure")
+    client = _FakeClient(RuntimeError("test transport ends after recording the request"))
+    model = OpenAICompatibleAgentModel(cast(AsyncOpenAI, client), "deepseek-v4-flash")
+    with pytest.raises(AgentModelError):
+        await model.invoke(request, output_type)
+    sent = client.completions.calls[0]
+    system = sent["messages"][0]["content"]
+    assert "JSON" in system
+    assert (
+        json.loads(system.split("Output JSON Schema:\n", 1)[1]) == output_type.model_json_schema()
+    )
+    assert sent["response_format"] == {"type": "json_object"}
+    budget_envelope = json.loads(request.prompt_bytes()[:-512])
+    assert budget_envelope["messages"] == sent["messages"]
+    assert budget_envelope["response_format"] == sent["response_format"]

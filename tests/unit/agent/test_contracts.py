@@ -247,17 +247,10 @@ def test_prompt_bytes_include_provider_envelope_schema_and_fixed_protocol_overhe
     )
     expected_envelope = {
         "messages": [
-            {"role": "system", "content": "Return a decision."},
+            {"role": "system", "content": request.provider_system_prompt()},
             {"role": "user", "content": '{"query":"六月GMV"}'},
         ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "BehaviorDecision",
-                "schema": {"title": "BehaviorDecision", "type": "object"},
-                "strict": True,
-            },
-        },
+        "response_format": {"type": "json_object"},
     }
     expected_payload = json.dumps(
         expected_envelope,

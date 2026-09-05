@@ -69,6 +69,11 @@ def _safe_finish_reason(value: object) -> AgentFinishReason | None:
 def _stop_reason(category: AgentModelErrorCategory) -> StopReason:
     if category in {
         AgentModelErrorCategory.PROVIDER_CALL_FAILED,
+        AgentModelErrorCategory.PROVIDER_HTTP_4XX,
+        AgentModelErrorCategory.PROVIDER_RATE_LIMITED,
+        AgentModelErrorCategory.PROVIDER_HTTP_5XX,
+        AgentModelErrorCategory.PROVIDER_TIMEOUT,
+        AgentModelErrorCategory.PROVIDER_CONNECTION_ERROR,
         AgentModelErrorCategory.MISSING_CONTENT,
         AgentModelErrorCategory.INVALID_CONTENT_TYPE,
         AgentModelErrorCategory.MISSING_USAGE,

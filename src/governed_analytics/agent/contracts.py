@@ -111,6 +111,11 @@ class AgentModelErrorCategory(StrEnum):
     INVALID_REQUEST = "invalid_request"
     SCHEMA_IDENTITY_MISMATCH = "schema_identity_mismatch"
     PROVIDER_CALL_FAILED = "provider_call_failed"
+    PROVIDER_HTTP_4XX = "provider_http_4xx"
+    PROVIDER_RATE_LIMITED = "provider_rate_limited"
+    PROVIDER_HTTP_5XX = "provider_http_5xx"
+    PROVIDER_TIMEOUT = "provider_timeout"
+    PROVIDER_CONNECTION_ERROR = "provider_connection_error"
     MISSING_CONTENT = "missing_content"
     INVALID_CONTENT_TYPE = "invalid_content_type"
     INVALID_JSON = "invalid_json"
@@ -332,6 +337,16 @@ class TimeWindow(_FrozenModel):
 
 
 class BehaviorDecision(_FrozenModel):
+    """Route with matching action/reason_code and unique missing_fields.
+
+    execute requires ready; clarify requires missing_metric, missing_time_window,
+    missing_comparison_window or ambiguous_metric and nonempty missing_fields;
+    refuse requires unsafe_request or sensitive_data_request; unsupported requires
+    unsupported_analysis or unsupported_data_domain. Only clarify has missing_fields.
+    Allowed missing_fields: metric, time_window, previous_window, current_window,
+    comparison_window. Do not infer omitted requirements from an example.
+    """
+
     action: BehaviorAction
     reason_code: BehaviorReasonCode
     missing_fields: tuple[Identifier, ...] = ()
@@ -803,21 +818,29 @@ class StructuredModelRequest(_FrozenModel):
             separators=(",", ":"),
         )
 
+    def provider_system_prompt(self) -> str:
+        """Bind the same JSON contract in both transport and budget accounting."""
+        schema = json.dumps(
+            _thaw_json(self.output_schema_summary),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return (
+            f"{self.system_prompt}\n"
+            "Return exactly one JSON object conforming to the following output schema. "
+            "Return an instance, not the schema itself; do not use Markdown fences.\n"
+            f"Output JSON Schema:\n{schema}"
+        )
+
     def prompt_bytes(self) -> bytes:
         envelope: JsonValue = _normalize_and_freeze_object(
             {
                 "messages": (
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": self.provider_system_prompt()},
                     {"role": "user", "content": self.user_json()},
                 ),
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": self.output_schema_name,
-                        "schema": self.output_schema_summary,
-                        "strict": True,
-                    },
-                },
+                "response_format": {"type": "json_object"},
             }
         )
         serialized_envelope = json.dumps(
