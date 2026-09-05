@@ -15,6 +15,7 @@ from governed_analytics.agent.contracts import (
     GovernanceSnapshot,
     ModelCallTrace,
     ModelReservation,
+    ModelUsage,
     RepairRecord,
     StopReason,
     StructuredInvocation,
@@ -185,8 +186,7 @@ class StructuredModelInvoker:
         error: AgentModelError,
     ) -> StructuredInvocation[T]:
         category = _safe_error_category(error)
-        governance = self._fail_closed(reservation)
-        first_trace = self._error_trace(request, reservation, error, outcome="failed")
+        governance, first_trace = self._settle_model_error(request, reservation, error)
         self._append(first_trace)
         traces = (first_trace,)
 
@@ -251,12 +251,10 @@ class StructuredModelInvoker:
             raise
         except AgentModelError as repair_error:
             repair_category = _safe_error_category(repair_error)
-            governance = self._fail_closed(repair_reservation)
-            repair_trace = self._error_trace(
+            governance, repair_trace = self._settle_model_error(
                 repair_request,
                 repair_reservation,
                 repair_error,
-                outcome="failed",
             )
             self._append(repair_trace)
             record = self._repair_record(repair_id, request, category, outcome="failed")
@@ -397,6 +395,32 @@ class StructuredModelInvoker:
             output_truncated=finish_reason is AgentFinishReason.LENGTH,
             estimated_cost_cny=reservation.reserved_cost_cny,
         )
+
+    def _settle_model_error(
+        self,
+        request: StructuredModelRequest,
+        reservation: ModelReservation,
+        error: AgentModelError,
+    ) -> tuple[GovernanceSnapshot, ModelCallTrace]:
+        trace = self._error_trace(request, reservation, error, outcome="failed")
+        before = self._budget.snapshot
+        if error.provider_model is not None and trace.input_tokens > 0 and trace.output_tokens > 0:
+            try:
+                governance = self._budget.settle_model_call(
+                    reservation,
+                    ModelUsage(input_tokens=trace.input_tokens, output_tokens=trace.output_tokens),
+                    error.provider_model,
+                )
+            except Exception:
+                pass
+            else:
+                return governance, trace.model_copy(
+                    update={
+                        "estimated_cost_cny": governance.committed_cost_cny
+                        - before.committed_cost_cny,
+                    }
+                )
+        return self._fail_closed(reservation), trace
 
     def _fail_closed(self, reservation: ModelReservation) -> GovernanceSnapshot:
         try:

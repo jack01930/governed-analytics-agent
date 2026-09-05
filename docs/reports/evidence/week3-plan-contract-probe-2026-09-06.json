@@ -1,0 +1,29 @@
+{
+  "implementation_commit": "f723f9b",
+  "scope": "diagnostic_only_W3K011",
+  "model": "deepseek-v4-flash",
+  "observations": [
+    {
+      "diagnostic": "plan_contract",
+      "analysis_type": "simple",
+      "hypothesis_shape_matches": false,
+      "hypothesis_kinds": [
+        "metric_value"
+      ],
+      "hypothesis_ids_match": [
+        false
+      ],
+      "metric_binding_matches": true
+    },
+    {
+      "diagnostic": "terminal",
+      "case_id": "W3K011",
+      "status": "execution_failed",
+      "reason": "plan_invalid",
+      "llm_calls": 2,
+      "input_tokens": 2815,
+      "output_tokens": 230,
+      "budget_cost_cny": "0.010457503980"
+    }
+  ]
+}

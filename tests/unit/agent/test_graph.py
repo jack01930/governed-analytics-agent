@@ -436,7 +436,7 @@ def pricing(*, input_price: str = "0", output_price: str = "0") -> ModelPricing:
             "effective_date": date(2026, 9, 1),
             "currency": "CNY",
             "unit_tokens": 1000,
-            "input_token_upper_bound": 10000,
+            "input_token_upper_bound": 1_000_000,
             "input_price": input_price,
             "output_price": output_price,
             "pricing_basis": "test",
@@ -3439,3 +3439,53 @@ async def test_tool_payload_mapping_read_failure_is_fixed_and_does_not_leak(
         }
     )
     assert MAPPING_READ_SENTINEL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_plan_request_supplies_the_hypothesis_contract_needed_for_execution() -> None:
+    scripts = scripts_for(QUERY, actions=(execute_action(),), synthesis_output=synthesis())
+    context, _, _, _, _ = context_for(scripts, (query_result(),))
+
+    class ContractFollowingModel(RecordingModel):
+        async def invoke(self, request, output_type):  # type: ignore[no-untyped-def]
+            if request.purpose != "plan":
+                return await self.delegate.invoke(request, output_type)
+            plan = simple_plan()
+            rules = request.model_dump(mode="json")["user_payload"].get("planning_contract", {})
+            plan["hypotheses"] = rules.get(
+                "simple_hypotheses", ({"hypothesis_id": "h1", "kind": "metric_value"},)
+            )
+            return StructuredModelResult(
+                output=output_type.model_validate(plan),
+                provider_model=self.model,
+                usage=ModelUsage(input_tokens=0, output_tokens=0),
+                latency_ms=0,
+            )
+
+    result = await run_agent(
+        run_id="plan-contract",
+        query=QUERY,
+        context=replace_context(context, model=ContractFollowingModel(scripts)),
+    )
+    assert result.final_answer.status is FinalStatus.COMPLETED
+    assert result.governance.execute_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_action_request_carries_the_retrieved_metric_and_schema_for_sql_generation() -> None:
+    scripts = scripts_for(
+        QUERY, plan=simple_plan(), actions=(execute_action(),), synthesis_output=synthesis()
+    )
+    context, _, model, _, _ = context_for(scripts, (query_result(),))
+    result = await run_agent(run_id="action-context", query=QUERY, context=context)
+    assert result.final_answer.status is FinalStatus.COMPLETED
+    request = next(call for call in model.calls if call.purpose == "action")
+    payload = request.model_dump(mode="json")["user_payload"]
+    metrics = payload.get("metrics", ())
+    gmv = next((item for item in metrics if item["metric_id"] == "gmv"), None)
+    assert gmv is not None
+    assert gmv["expression_sql"]
+    assert gmv["default_filters"]
+    assert any(table["name"] == "orders" for table in payload.get("tables", ()))
+    assert payload["plan"]["windows"]
+    assert payload["execute_arguments_schema"]["properties"]["sql"]

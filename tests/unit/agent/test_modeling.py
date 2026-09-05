@@ -93,7 +93,12 @@ def _request(
     )
 
 
-def _budget(*, max_repairs: int = 1) -> BudgetLedger:
+def _budget(
+    *,
+    max_repairs: int = 1,
+    input_price: str = "0",
+    output_price: str = "0",
+) -> BudgetLedger:
     return BudgetLedger(
         limits=BudgetLimits(
             max_action_loops=4,
@@ -116,8 +121,8 @@ def _budget(*, max_repairs: int = 1) -> BudgetLedger:
                 "currency": "CNY",
                 "unit_tokens": 1000,
                 "input_token_upper_bound": 10000,
-                "input_price": "0",
-                "output_price": "0",
+                "input_price": input_price,
+                "output_price": output_price,
                 "pricing_basis": "test",
                 "source": "https://example.test/pricing",
             }
@@ -168,9 +173,7 @@ async def test_repair_call_receives_only_fixed_safe_payload() -> None:
         max_output_tokens=300,
     )
 
-    await _invoker(model, _budget(), InMemoryTraceRecorder()).invoke(
-        request, BehaviorDecision
-    )
+    await _invoker(model, _budget(), InMemoryTraceRecorder()).invoke(request, BehaviorDecision)
 
     repair = model.calls[1]
     assert repair.purpose == "repair"
@@ -379,9 +382,7 @@ async def test_initial_settle_identity_failure_fails_closed_without_repair() -> 
     model = _Model([_result_with_model("different-model")])
 
     with pytest.raises(StructuredInvocationError) as raised:
-        await _invoker(model, budget, InMemoryTraceRecorder()).invoke(
-            _request(), BehaviorDecision
-        )
+        await _invoker(model, budget, InMemoryTraceRecorder()).invoke(_request(), BehaviorDecision)
 
     assert raised.value.category == "accounting_contract_failed"
     assert raised.value.repair_record is None
@@ -392,14 +393,10 @@ async def test_initial_settle_identity_failure_fails_closed_without_repair() -> 
 @pytest.mark.asyncio
 async def test_repair_settle_identity_failure_is_a_failed_repair() -> None:
     budget = _budget()
-    model = _Model(
-        [AgentModelError("invalid_structure"), _result_with_model("different-model")]
-    )
+    model = _Model([AgentModelError("invalid_structure"), _result_with_model("different-model")])
 
     with pytest.raises(StructuredInvocationError) as raised:
-        await _invoker(model, budget, InMemoryTraceRecorder()).invoke(
-            _request(), BehaviorDecision
-        )
+        await _invoker(model, budget, InMemoryTraceRecorder()).invoke(_request(), BehaviorDecision)
 
     assert raised.value.repair_record is not None
     assert raised.value.repair_record.outcome == "failed"
@@ -436,3 +433,34 @@ async def test_cancellation_fails_closed_records_safe_trace_and_reraises() -> No
     trace = recorder.snapshot().model_calls[0]
     assert trace.outcome == "cancelled"
     assert trace.safe_error == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repair_fails", (False, True))
+async def test_schema_failure_with_provider_usage_is_settled_even_when_repair_fails(
+    repair_fails: bool,
+) -> None:
+    first = AgentModelError(
+        "invalid_structure", provider_model="fixture-agent", input_tokens=30, output_tokens=10
+    )
+    last = (
+        AgentModelError(
+            "invalid_structure", provider_model="fixture-agent", input_tokens=20, output_tokens=5
+        )
+        if repair_fails
+        else _result().model_copy(update={"usage": ModelUsage(input_tokens=20, output_tokens=5)})
+    )
+    budget = _budget(input_price="0.001", output_price="0.002")
+    recorder = InMemoryTraceRecorder()
+    invoker = _invoker(_Model([first, last]), budget, recorder)
+    if repair_fails:
+        with pytest.raises(StructuredInvocationError):
+            await invoker.invoke(_request(), BehaviorDecision)
+    else:
+        await invoker.invoke(_request(), BehaviorDecision)
+    assert budget.snapshot.input_tokens == 50
+    assert budget.snapshot.output_tokens == 15
+    assert budget.snapshot.reserved_cost_cny == 0
+    assert sum(t.input_tokens for t in recorder.snapshot().model_calls) == 50
+    assert budget.snapshot.committed_cost_cny == Decimal("0.00008")
+    assert sum(t.estimated_cost_cny for t in recorder.snapshot().model_calls) == Decimal("0.00008")

@@ -491,11 +491,30 @@ async def build_plan(
     try:
         request = StructuredModelRequest.for_output(
             purpose="plan",
-            system_prompt="Build one bounded governed metric plan using only supplied context.",
+            system_prompt=(
+                "Build one bounded governed metric plan using only supplied context. "
+                "Follow planning_contract exactly; hypothesis identifiers are protocol "
+                "identifiers, not arbitrary labels. Copy the metric version from metrics. "
+                "Use simple for scalar/grouped/Top-K values; attribution only for "
+                "GMV decline diagnosis. Use UTC half-open time windows."
+            ),
             user_payload={
                 "query": state["normalized_query"],
                 "metrics": tuple(_metric_prompt(item) for item in state["metric_context"]),
                 "tables": tuple(_table_prompt(item) for item in state["schema_context"]),
+                "planning_contract": {
+                    "simple_hypotheses": tuple(
+                        {"hypothesis_id": identity, "kind": kind, "dimension": dimension}
+                        for identity, kind, dimension in _SIMPLE_HYPOTHESIS_SHAPE
+                    ),
+                    "attribution_hypotheses": tuple(
+                        {"hypothesis_id": identity, "kind": kind, "dimension": dimension}
+                        for identity, kind, dimension in _ATTRIBUTION_HYPOTHESIS_SHAPE
+                    ),
+                    "attribution_dimensions": ("region", "product", "segment"),
+                    "simple_result_columns": "selected dimensions followed by metric_id",
+                    "sorting": "sort and tie_break must reference result column identifiers",
+                },
             },
             output_type=TypedMetricPlan,
             max_output_tokens=1200,

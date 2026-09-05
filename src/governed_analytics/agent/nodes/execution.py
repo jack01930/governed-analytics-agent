@@ -46,6 +46,7 @@ from governed_analytics.agent.validation import (
     validate_observation,
 )
 from governed_analytics.runtime.budgets import BudgetExceeded
+from governed_analytics.tools.contracts import ExecuteSqlRequest
 
 _SAFE_COLUMN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_TOOL_ERRORS = frozenset(
@@ -221,6 +222,10 @@ def _action_prompt(state: AgentState, hypothesis_id: str) -> Mapping[str, object
     return {
         "query": state["normalized_query"],
         "target_hypothesis_id": hypothesis_id,
+        "plan": _current_plan(state).model_dump(mode="json"),
+        "metrics": tuple(item.model_dump(mode="json") for item in state["metric_context"]),
+        "tables": tuple(item.model_dump(mode="json") for item in state["schema_context"]),
+        "execute_arguments_schema": ExecuteSqlRequest.model_json_schema(),
         "contracts": tuple(
             {
                 "contract_id": item.contract_id,
@@ -341,7 +346,12 @@ async def route_action(
         request = StructuredModelRequest.for_output(
             purpose="action",
             system_prompt=(
-                "Choose one bounded profile or execute_sql action for the supplied hypothesis."
+                "Choose one bounded profile or execute_sql action for the supplied hypothesis. "
+                "For execute_sql, generate PostgreSQL SELECT from the supplied tables and metric "
+                "definitions, including default_filters and the plan time windows. "
+                "Set purpose to contract_id; copy the supplied hypothesis_id and contract_id. "
+                "Return explicit columns with the contract aliases/order and limit. "
+                "Follow execute_arguments_schema and use :named parameters for dates."
             ),
             user_payload=_action_prompt(state, pending),
             output_type=AnalysisAction,
