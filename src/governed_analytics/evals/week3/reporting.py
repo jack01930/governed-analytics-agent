@@ -32,6 +32,31 @@ if TYPE_CHECKING:
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _URL = re.compile(r"(?i)\b(?:https?|postgres(?:ql)?|mysql)://")
 _CREDENTIAL = re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:sk-|pk-|bearer\s+)")
+_SQL_COMMAND = re.compile(
+    r"(?is)^\s*(?:"
+    r"select\b|values\b|with\b|grant\b|revoke\b|copy\b|"
+    r"insert\s+into\b|update\s+[^\s;]+\s+set\b|delete\s+from\b|"
+    r"create\s+(?:table|view|index|schema|database|function|procedure|type|role)\b|"
+    r"alter\s+(?:table|view|index|schema|database|function|procedure|type|role)\b|"
+    r"drop\s+(?:table|view|index|schema|database|function|procedure|type|role)\b|"
+    r"vacuum(?:\s|;|$)|call\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*\(|"
+    r"begin(?:\s+(?:work|transaction))?\s*;?\s*$|"
+    r"commit(?:\s+(?:work|transaction))?\s*;?\s*$|"
+    r"rollback(?:\s+(?:work|transaction))?\s*;?\s*$|"
+    r"set\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*(?:=|to\b)|"
+    r"analyze(?:\s|;|$)"
+    r")"
+)
+_SQL_DIRECT_COMMAND = re.compile(
+    r"(?is)^\s*(?:"
+    r"vacuum(?:\s|;|$)|call\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*\(|"
+    r"begin(?:\s+(?:work|transaction))?\s*;?\s*$|"
+    r"commit(?:\s+(?:work|transaction))?\s*;?\s*$|"
+    r"rollback(?:\s+(?:work|transaction))?\s*;?\s*$|"
+    r"set\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*(?:=|to\b)|"
+    r"analyze(?:\s|;|$)"
+    r")"
+)
 _FORBIDDEN_KEY_TOKENS = frozenset(
     {
         "api_key",
@@ -164,6 +189,7 @@ class PublishedWeek3Report:
 @dataclass(frozen=True, slots=True, repr=False)
 class Week3PublicationEvidence:
     mode: Literal["fixture", "live"]
+    canonical_cases: tuple[Week3EvaluationCase, ...]
     cases: tuple[Week3EvaluationCase, ...]
     outcomes: tuple[AgentRunResult, ...]
     error_types: tuple[str | None, ...]
@@ -172,6 +198,9 @@ class Week3PublicationEvidence:
     pricing: ModelPricing
     generated_at_utc: datetime
     run_id: str
+    overall_manifest_sha256: str
+    known_cohort_sha256: str
+    heldout_cohort_sha256: str
 
 
 def _identity(metadata: os.stat_result) -> _Identity:
@@ -365,12 +394,96 @@ def _find_owned_name(reservation: Week3ReportReservation) -> str | None:
     return None
 
 
-def _binding_matches(binding: _FileBinding) -> bool:
+def _open_regular_at(directory_fd: int, name: str) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("secure Week 3 report handles are unavailable")
+    return os.open(
+        name,
+        os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=directory_fd,
+    )
+
+
+def _validate_opened_binding(binding: _FileBinding, verification_fd: int) -> None:
+    held_before = os.fstat(binding.fd)
+    opened_before = os.fstat(verification_fd)
+    if (
+        _identity(held_before) != binding.identity
+        or _identity(opened_before) != binding.identity
+        or not stat.S_ISREG(held_before.st_mode)
+        or not stat.S_ISREG(opened_before.st_mode)
+        or held_before.st_size != binding.size
+        or opened_before.st_size != binding.size
+    ):
+        raise OSError("Week 3 report inventory changed")
+    opened_digest = _digest_fd(verification_fd)
+    held_digest = _digest_fd(binding.fd)
+    held_after = os.fstat(binding.fd)
+    opened_after = os.fstat(verification_fd)
+    entry_after = os.stat(
+        binding.name,
+        dir_fd=binding.directory_fd,
+        follow_symlinks=False,
+    )
+    if (
+        opened_digest != binding.digest
+        or held_digest != binding.digest
+        or _identity(held_after) != binding.identity
+        or _identity(opened_after) != binding.identity
+        or _identity(entry_after) != binding.identity
+        or not stat.S_ISREG(entry_after.st_mode)
+        or held_after.st_size != binding.size
+        or opened_after.st_size != binding.size
+        or entry_after.st_size != binding.size
+    ):
+        raise OSError("Week 3 report inventory changed")
+
+
+def _unlink_bound_file(binding: _FileBinding) -> None:
+    verification_fd = _open_regular_at(binding.directory_fd, binding.name)
     try:
-        _validate_file_binding(binding)
+        _validate_opened_binding(binding, verification_fd)
+        final_entry = os.stat(
+            binding.name,
+            dir_fd=binding.directory_fd,
+            follow_symlinks=False,
+        )
+        if _identity(final_entry) != binding.identity or final_entry.st_size != binding.size:
+            raise OSError("Week 3 report inventory changed")
+        os.unlink(binding.name, dir_fd=binding.directory_fd)
+    finally:
+        os.close(verification_fd)
+
+
+def _rmdir_bound_directory(
+    directory_fd: int,
+    name: str,
+    *,
+    identity: _Identity,
+    held_fd: int,
+) -> bool:
+    try:
+        verification_fd = os.open(name, _directory_flags(), dir_fd=directory_fd)
     except OSError:
         return False
-    return True
+    try:
+        if (
+            _directory_handle_identity(held_fd) != identity
+            or _directory_handle_identity(verification_fd) != identity
+            or os.listdir(held_fd)
+            or os.listdir(verification_fd)
+        ):
+            return False
+        entry_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if _identity(entry_after) != identity or not stat.S_ISDIR(entry_after.st_mode):
+            return False
+        os.rmdir(name, dir_fd=directory_fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(verification_fd)
 
 
 def _quarantine_entry(reservation: Week3ReportReservation, directory_fd: int, name: str) -> None:
@@ -391,6 +504,39 @@ def _quarantine_entry(reservation: Week3ReportReservation, directory_fd: int, na
     raise OSError("atomic Week 3 report publication failed")
 
 
+def _quarantine_owned_root(reservation: Week3ReportReservation) -> None:
+    for _attempt in range(16):
+        owned_name = _find_owned_name(reservation)
+        if owned_name is None:
+            return
+        try:
+            metadata = os.stat(
+                owned_name,
+                dir_fd=reservation.parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return
+        if (
+            _identity(metadata) != reservation.staging_identity
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            return
+        quarantine = f".week3-foreign-{uuid4().hex}"
+        try:
+            _native_rename_at_no_replace(
+                reservation.parent_fd,
+                owned_name,
+                quarantine,
+            )
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            return
+        return
+    raise OSError("atomic Week 3 report publication failed")
+
+
 def _remove_known_leaf_or_quarantine(
     reservation: Week3ReportReservation,
     directory_fd: int,
@@ -401,10 +547,13 @@ def _remove_known_leaf_or_quarantine(
         os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
-    if binding is not None and _binding_matches(binding):
-        os.unlink(name, dir_fd=directory_fd)
-    else:
-        _quarantine_entry(reservation, directory_fd, name)
+    if binding is not None:
+        try:
+            _unlink_bound_file(binding)
+            return
+        except OSError:
+            pass
+    _quarantine_entry(reservation, directory_fd, name)
 
 
 def _cleanup_cases_directory(reservation: Week3ReportReservation) -> None:
@@ -443,9 +592,14 @@ def _remove_owned(reservation: Week3ReportReservation) -> None:
             and _identity(metadata) == reservation._cases_identity
             and stat.S_ISDIR(metadata.st_mode)
             and reservation._cases_fd is not None
-            and not os.listdir(reservation._cases_fd)
+            and _rmdir_bound_directory(
+                reservation.staging_fd,
+                entry,
+                identity=reservation._cases_identity,
+                held_fd=reservation._cases_fd,
+            )
         ):
-            os.rmdir(entry, dir_fd=reservation.staging_fd)
+            continue
         else:
             _remove_known_leaf_or_quarantine(
                 reservation,
@@ -453,10 +607,13 @@ def _remove_owned(reservation: Week3ReportReservation) -> None:
                 entry,
                 root_bindings.get(entry),
             )
-    if not os.listdir(reservation.staging_fd):
-        os.rmdir(name, dir_fd=reservation.parent_fd)
-    else:
-        _quarantine_entry(reservation, reservation.parent_fd, name)
+    if not _rmdir_bound_directory(
+        reservation.parent_fd,
+        name,
+        identity=reservation.staging_identity,
+        held_fd=reservation.staging_fd,
+    ):
+        _quarantine_owned_root(reservation)
 
 
 def cancel_week3_report_reservation(reservation: Week3ReportReservation) -> None:
@@ -489,10 +646,14 @@ def _scan_safe(value: object, *, key: str | None = None) -> None:
 
 
 def _is_complete_sql(value: str) -> bool:
+    if _SQL_COMMAND.search(value) is None:
+        return False
+    if _SQL_DIRECT_COMMAND.search(value) is not None:
+        return True
     try:
         statements = sqlglot.parse(value, read="postgres")
     except sqlglot.errors.SqlglotError:
-        return False
+        return True
     statement_types = (
         exp.Query,
         exp.DDL,
@@ -502,10 +663,13 @@ def _is_complete_sql(value: str) -> bool:
         exp.Revoke,
         exp.Drop,
         exp.Alter,
+        exp.Command,
+        exp.Transaction,
+        exp.Commit,
+        exp.Set,
+        exp.Analyze,
     )
-    return bool(statements) and any(
-        isinstance(statement, statement_types) for statement in statements
-    )
+    return not statements or any(isinstance(statement, statement_types) for statement in statements)
 
 
 def _dump(model: Week3RunReport | Week3CaseResult) -> dict[str, object]:
@@ -647,17 +811,18 @@ def _write_text_at(directory_fd: int, name: str, contents: str) -> _FileBinding:
 def _validate_file_binding(binding: _FileBinding) -> None:
     if binding.closed:
         raise OSError("Week 3 report inventory changed")
-    handle_metadata = os.fstat(binding.fd)
-    path_metadata = os.stat(binding.name, dir_fd=binding.directory_fd, follow_symlinks=False)
-    if (
-        _identity(handle_metadata) != binding.identity
-        or _identity(path_metadata) != binding.identity
-        or not stat.S_ISREG(path_metadata.st_mode)
-        or handle_metadata.st_size != binding.size
-        or path_metadata.st_size != binding.size
-        or _digest_fd(binding.fd) != binding.digest
-    ):
-        raise OSError("Week 3 report inventory changed")
+    verification_fd = _open_regular_at(binding.directory_fd, binding.name)
+    try:
+        _validate_opened_binding(binding, verification_fd)
+        final_entry = os.stat(
+            binding.name,
+            dir_fd=binding.directory_fd,
+            follow_symlinks=False,
+        )
+        if _identity(final_entry) != binding.identity or final_entry.st_size != binding.size:
+            raise OSError("Week 3 report inventory changed")
+    finally:
+        os.close(verification_fd)
 
 
 def _validate_file_bindings(reservation: Week3ReportReservation) -> None:
@@ -720,16 +885,7 @@ def _validate_inventory(
 
 
 def _quarantine_final(reservation: Week3ReportReservation) -> None:
-    for _attempt in range(16):
-        quarantine = f".week3-foreign-{uuid4().hex}"
-        try:
-            _native_rename_at_no_replace(reservation.parent_fd, reservation.final_name, quarantine)
-        except FileExistsError:
-            continue
-        except FileNotFoundError:
-            return
-        return
-    raise OSError("atomic Week 3 report publication failed")
+    _quarantine_owned_root(reservation)
 
 
 def _raise_publish_error(error_number: int) -> None:
@@ -897,6 +1053,7 @@ def write_week3_report(
             published = False
             raise
         os.fsync(reservation.parent_fd)
+        _validate_published(reservation)
     except BaseException as error:
         primary = error
         raise

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import stat
 from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -68,10 +71,8 @@ from governed_analytics.evals.week3.scorers import (
 from governed_analytics.evals.week3.suites import (
     WEEK3_HELDOUT_REGISTRY,
     WEEK3_KNOWN_REGISTRY,
+    WEEK3_ROOT,
     load_fixture_scripts,
-    load_week3_cases,
-    week3_cohort_sha256,
-    week3_manifest_sha256,
 )
 from governed_analytics.models.agent_fixtures import AgentScripts, ScriptedAgentModel
 from governed_analytics.pricing import ModelPricing
@@ -80,6 +81,31 @@ from governed_analytics.runtime.budgets import BudgetLedger, BudgetLimits
 
 class Week3RunError(ValueError):
     """Stable global evaluation failure."""
+
+
+_CANONICAL_PROTOCOL_HASHES = (
+    "c0ec7ff77b5927210fdeda1648e32ecc71f3819d6724b0eea5092a262bb4e577",
+    "01b9b184b42bde3e710124eea0861ac032ae3ebdd0dfee0e9048174ec932af88",
+    "a8da032f4ea0b1c09eefc65ba11e44c84a06ec94afc867d53b1b621a36511cb5",
+)
+_EXPECTED_STEMS = tuple(
+    [f"W3K{number:03d}" for number in range(11, 26)]
+    + [
+        "W3K026-confirm_decline",
+        "W3K026-region_contribution",
+        "W3K026-sku_contribution",
+        "W3K026-segment_contribution",
+    ]
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProtocolSnapshot:
+    cases: tuple[Week3EvaluationCase, ...]
+    expected_results: tuple[tuple[str, EvalQueryResult], ...]
+    overall_manifest_sha256: str
+    known_cohort_sha256: str
+    heldout_cohort_sha256: str
 
 
 class Week3CaseExecutor(Protocol):
@@ -333,13 +359,343 @@ class LiveWeek3CaseExecutor(_BaseWeek3Executor):
         return result
 
 
-def _read_expected(path: Path) -> EvalQueryResult:
+def _protocol_directory_flags() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise Week3RunError("Week 3 protocol snapshot is unavailable")
+    return int(
+        os.O_RDONLY
+        | no_follow
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_protocol_directory(path: Path) -> int:
+    absolute = path.absolute()
+    fd = os.open(absolute.anchor, _protocol_directory_flags())
     try:
-        return FrozenExpectedResult.model_validate_json(
-            path.read_text(encoding="utf-8"), strict=True
-        ).result
-    except (OSError, TypeError, ValueError):
-        raise Week3RunError("frozen expected result is unavailable") from None
+        for part in absolute.parts[1:]:
+            child = os.open(part, _protocol_directory_flags(), dir_fd=fd)
+            old_fd = fd
+            fd = -1
+            try:
+                os.close(old_fd)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(child)
+                raise
+            fd = child
+        return fd
+    except BaseException:
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
+        raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+
+
+def _protocol_stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _pread_all(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    while True:
+        chunk = os.pread(fd, 65536, offset)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        offset += len(chunk)
+
+
+def _read_protocol_file(directory_fd: int, name: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = -1
+    verification_fd = -1
+    try:
+        entry_before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        fd = os.open(name, flags, dir_fd=directory_fd)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError
+        first = _pread_all(fd)
+        middle = os.fstat(fd)
+        second = _pread_all(fd)
+        after = os.fstat(fd)
+        verification_fd = os.open(name, flags, dir_fd=directory_fd)
+        verification_before = os.fstat(verification_fd)
+        verification_content = _pread_all(verification_fd)
+        verification_after = os.fstat(verification_fd)
+        entry_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        signature = _protocol_stat_signature(before)
+        if (
+            _protocol_stat_signature(entry_before) != signature
+            or _protocol_stat_signature(middle) != signature
+            or _protocol_stat_signature(after) != signature
+            or _protocol_stat_signature(verification_before) != signature
+            or _protocol_stat_signature(verification_after) != signature
+            or _protocol_stat_signature(entry_after) != signature
+            or first != second
+            or first != verification_content
+            or len(first) != before.st_size
+        ):
+            raise OSError
+        return first
+    except (OSError, ValueError):
+        raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+    finally:
+        for owned_fd in (verification_fd, fd):
+            if owned_fd >= 0:
+                with suppress(OSError):
+                    os.close(owned_fd)
+
+
+def _snapshot_protocol_file(directory_fd: int, name: str) -> bytes:
+    try:
+        directory_before = _protocol_stat_signature(os.fstat(directory_fd))
+        content = _read_protocol_file(directory_fd, name)
+        directory_after = _protocol_stat_signature(os.fstat(directory_fd))
+    except OSError:
+        raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+    if directory_before != directory_after:
+        raise Week3RunError("Week 3 protocol snapshot is unavailable")
+    return content
+
+
+def _open_protocol_child(parent_fd: int, name: str) -> int:
+    try:
+        return os.open(name, _protocol_directory_flags(), dir_fd=parent_fd)
+    except OSError:
+        raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+
+
+def _snapshot_hash(files: Mapping[str, bytes], names: set[str]) -> str:
+    digest = sha256()
+    for name in sorted(names):
+        try:
+            content = files[name]
+        except KeyError:
+            raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+        relative = f"evals/datasets/week3/{name}".encode()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def _snapshot_yaml_list(content: bytes) -> list[dict[str, Any]]:
+    try:
+        value = yaml.safe_load(content.decode("utf-8"))
+    except (UnicodeError, yaml.YAMLError):
+        raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+    if not isinstance(value, list) or not value or not all(type(item) is dict for item in value):
+        raise Week3RunError("Week 3 protocol snapshot is unavailable")
+    return cast(list[dict[str, Any]], value)
+
+
+def _snapshot_case(
+    raw: dict[str, Any], *, cohort: Literal["known", "heldout"]
+) -> Week3EvaluationCase:
+    data = dict(raw)
+    if data.get("cohort") != cohort:
+        raise Week3RunError("Week 3 protocol snapshot is unavailable")
+    observations = data.get("expected_observations", [])
+    if not isinstance(observations, list):
+        raise Week3RunError("Week 3 protocol snapshot is unavailable")
+    parsed: list[dict[str, Any]] = []
+    prefix = "evals/datasets/week3/expected/"
+    for observation in observations:
+        if type(observation) is not dict:
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        item = dict(observation)
+        raw_path = item.get("expected_result_path")
+        if (
+            type(raw_path) is not str
+            or not raw_path.startswith(prefix)
+            or "/" in raw_path[len(prefix) :]
+            or not raw_path.endswith(".json")
+        ):
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        item["expected_result_path"] = WEEK3_ROOT / "expected" / raw_path[len(prefix) :]
+        parsed.append(item)
+    data["expected_observations"] = parsed
+    try:
+        return Week3EvaluationCase.model_validate_json(
+            json.dumps(data, ensure_ascii=False, default=str), strict=True
+        )
+    except (TypeError, ValueError):
+        raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+
+
+def _snapshot_cases(files: Mapping[str, bytes]) -> tuple[Week3EvaluationCase, ...]:
+    known = tuple(
+        _snapshot_case(item, cohort="known")
+        for item in _snapshot_yaml_list(files["known/cases.yaml"])
+    )
+    heldout_raw = tuple(
+        _snapshot_case(item, cohort="heldout")
+        for item in _snapshot_yaml_list(files["heldout/cases.yaml"])
+    )
+    by_known = {case.case_id: case for case in known}
+    heldout = tuple(
+        case.model_copy(
+            update={
+                "expected_observations": by_known[
+                    case.expected_ref or ""
+                ].expected_observations
+            }
+        )
+        if case.expected_ref in by_known
+        else case
+        for case in heldout_raw
+    )
+    cases = (*known, *heldout)
+    expected_ids = tuple(f"W3K{number:03d}" for number in range(1, 31)) + tuple(
+        f"W3H{number:03d}" for number in range(1, 11)
+    )
+    if tuple(case.case_id for case in cases) != expected_ids:
+        raise Week3RunError("Week 3 protocol snapshot is unavailable")
+    return cases
+
+
+def _script_dependencies(files: Mapping[str, bytes]) -> dict[str, set[str]]:
+    dependencies: dict[str, set[str]] = {}
+    for raw in _snapshot_yaml_list(files["scripted/scripts.yaml"]):
+        script_id, steps = raw.get("script_id"), raw.get("steps")
+        if type(script_id) is not str or not isinstance(steps, list):
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        refs: set[str] = set()
+        for step in steps:
+            if type(step) is not dict:
+                raise Week3RunError("Week 3 protocol snapshot is unavailable")
+            raw_ref = step.get("sql_ref")
+            if raw_ref is None:
+                continue
+            prefix = "evals/datasets/week3/"
+            if type(raw_ref) is not str or not raw_ref.startswith(prefix):
+                raise Week3RunError("Week 3 protocol snapshot is unavailable")
+            refs.add(raw_ref[len(prefix) :])
+        dependencies[script_id] = refs
+    return dependencies
+
+
+def _load_protocol_snapshot() -> _ProtocolSnapshot:
+    root_fd = _open_protocol_directory(WEEK3_ROOT)
+    open_fds: list[int] = [root_fd]
+    try:
+        expected_top = {"known", "heldout", "scripted", "oracle", "expected"}
+        if set(os.listdir(root_fd)) != expected_top:
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        known_fd = _open_protocol_child(root_fd, "known")
+        open_fds.append(known_fd)
+        heldout_fd = _open_protocol_child(root_fd, "heldout")
+        open_fds.append(heldout_fd)
+        scripted_fd = _open_protocol_child(root_fd, "scripted")
+        open_fds.append(scripted_fd)
+        oracle_fd = _open_protocol_child(root_fd, "oracle")
+        open_fds.append(oracle_fd)
+        expected_fd = _open_protocol_child(root_fd, "expected")
+        open_fds.append(expected_fd)
+        sql_fd = _open_protocol_child(scripted_fd, "sql")
+        open_fds.append(sql_fd)
+        if (
+            set(os.listdir(known_fd)) != {"cases.yaml"}
+            or set(os.listdir(heldout_fd)) != {"cases.yaml"}
+            or set(os.listdir(scripted_fd)) != {"scripts.yaml", "sql"}
+        ):
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        expected_names = {f"{stem}.json" for stem in _EXPECTED_STEMS}
+        oracle_names = {f"{stem}.sql" for stem in _EXPECTED_STEMS}
+        if (
+            set(os.listdir(expected_fd)) != expected_names
+            or set(os.listdir(oracle_fd)) != oracle_names
+        ):
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        files: dict[str, bytes] = {
+            "known/cases.yaml": _snapshot_protocol_file(known_fd, "cases.yaml"),
+            "heldout/cases.yaml": _snapshot_protocol_file(heldout_fd, "cases.yaml"),
+            "scripted/scripts.yaml": _snapshot_protocol_file(scripted_fd, "scripts.yaml"),
+        }
+        for name in sorted(expected_names):
+            files[f"expected/{name}"] = _snapshot_protocol_file(expected_fd, name)
+        for name in sorted(oracle_names):
+            files[f"oracle/{name}"] = _snapshot_protocol_file(oracle_fd, name)
+        sql_names = set(os.listdir(sql_fd))
+        for name in sorted(sql_names):
+            files[f"scripted/sql/{name}"] = _snapshot_protocol_file(sql_fd, name)
+
+        cases = _snapshot_cases(files)
+        dependencies = _script_dependencies(files)
+        referenced_sql = set().union(*dependencies.values())
+        if referenced_sql != {f"scripted/sql/{name}" for name in sql_names}:
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        overall_names = set(files)
+        overall = _snapshot_hash(files, overall_names)
+        by_id = {case.case_id: case for case in cases}
+
+        def cohort_hash(cohort: Literal["known", "heldout"]) -> str:
+            selected = tuple(case for case in cases if case.cohort == cohort)
+            owners = {
+                case.case_id if cohort == "known" else cast(str, case.expected_ref)
+                for case in selected
+            }
+            names = {
+                "known/cases.yaml",
+                "scripted/scripts.yaml",
+                "known/cases.yaml" if cohort == "known" else "heldout/cases.yaml",
+            }
+            for case in selected:
+                names.update(dependencies[case.script_ref])
+            for owner_id in owners:
+                for observation in by_id[owner_id].expected_observations:
+                    stem = observation.expected_result_path.stem
+                    names.add(f"expected/{stem}.json")
+                    names.add(f"oracle/{stem}.sql")
+            return _snapshot_hash(files, names)
+
+        known_hash = cohort_hash("known")
+        heldout_hash = cohort_hash("heldout")
+        if (overall, known_hash, heldout_hash) != _CANONICAL_PROTOCOL_HASHES:
+            raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        expected_results: list[tuple[str, EvalQueryResult]] = []
+        for name in sorted(expected_names):
+            try:
+                frozen = FrozenExpectedResult.model_validate_json(
+                    files[f"expected/{name}"], strict=True
+                )
+            except (TypeError, ValueError):
+                raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+            expected_results.append((name, frozen.result))
+        expected_by_name = dict(expected_results)
+        for case in cases[:30]:
+            for observation in case.expected_observations:
+                expected_result = expected_by_name[observation.expected_result_path.name]
+                if set(observation.key_columns) | set(observation.numeric_columns) != set(
+                    expected_result.columns
+                ):
+                    raise Week3RunError("Week 3 protocol snapshot is unavailable")
+        return _ProtocolSnapshot(
+            cases=cases,
+            expected_results=tuple(expected_results),
+            overall_manifest_sha256=overall,
+            known_cohort_sha256=known_hash,
+            heldout_cohort_sha256=heldout_hash,
+        )
+    except (OSError, KeyError, TypeError, ValueError):
+        raise Week3RunError("Week 3 protocol snapshot is unavailable") from None
+    finally:
+        for fd in reversed(open_fds):
+            with suppress(OSError):
+                os.close(fd)
 
 
 def _combine(scores: tuple[CandidateScore, ...]) -> CandidateScore | None:
@@ -782,7 +1138,17 @@ def _rebuild_report_from_publication_evidence(
         evidence.error_types
     ) or len(evidence.cases) != len(evidence.expected_results):
         raise Week3RunError("publication evidence is incomplete")
-    frozen_cases_by_id = {item.case_id: item for item in load_week3_cases()}
+    if (
+        evidence.overall_manifest_sha256,
+        evidence.known_cohort_sha256,
+        evidence.heldout_cohort_sha256,
+    ) != _CANONICAL_PROTOCOL_HASHES:
+        raise Week3RunError("publication evidence does not match the frozen protocol")
+    frozen_cases_by_id = {item.case_id: item for item in evidence.canonical_cases}
+    if tuple(frozen_cases_by_id) != tuple(
+        f"W3K{number:03d}" for number in range(1, 31)
+    ) + tuple(f"W3H{number:03d}" for number in range(1, 11)):
+        raise Week3RunError("publication evidence does not match the frozen registry")
     if any(
         case.case_id not in frozen_cases_by_id
         or case != frozen_cases_by_id[case.case_id]
@@ -825,16 +1191,16 @@ def _rebuild_report_from_publication_evidence(
         )
     )
     limits = BudgetLimits.from_settings(evidence.settings)
-    overall_manifest = week3_manifest_sha256()
+    overall_manifest = evidence.overall_manifest_sha256
     case_ids = tuple(case.case_id for case in evidence.cases)
     canonical_ids = tuple(
-        case.case_id for case in load_week3_cases() if evidence.mode in case.modes
+        case.case_id for case in evidence.canonical_cases if evidence.mode in case.modes
     )
     return Week3RunReport(
         mode=evidence.mode,
         overall_manifest_sha256=overall_manifest,
-        known_cohort_sha256=week3_cohort_sha256("known"),
-        heldout_cohort_sha256=week3_cohort_sha256("heldout"),
+        known_cohort_sha256=evidence.known_cohort_sha256,
+        heldout_cohort_sha256=evidence.heldout_cohort_sha256,
         executed_manifest_sha256=derive_executed_manifest_sha256(
             overall_manifest_sha256=overall_manifest,
             mode=evidence.mode,
@@ -877,7 +1243,14 @@ async def run_week3_evaluation(
         raise Week3RunError("fixture mode does not accept pricing")
     if mode == "live" and pricing is None:
         raise Week3RunError("live mode requires pricing")
-    source_cases = load_week3_cases() if cases is None else cases
+    snapshot = _load_protocol_snapshot()
+    canonical_by_id = {case.case_id: case for case in snapshot.cases}
+    source_cases = snapshot.cases if cases is None else cases
+    if any(
+        case.case_id not in canonical_by_id or case != canonical_by_id[case.case_id]
+        for case in source_cases
+    ):
+        raise Week3RunError("evaluation cases do not match the frozen protocol")
     active = tuple(case for case in source_cases if mode in case.modes)
     if not active:
         raise Week3RunError("no cases are enabled for this mode")
@@ -886,18 +1259,19 @@ async def run_week3_evaluation(
         raise Week3RunError("evaluation clock must be timezone-aware")
     generated = generated.astimezone(UTC)
     effective_run_id = run_id or f"week3-{generated.strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+    settings = getattr(executor, "settings", AgentRuntimeSettings.model_validate({}))
+    expected_by_name = dict(snapshot.expected_results)
+    expected_results = tuple(
+        tuple(
+            expected_by_name[item.expected_result_path.name]
+            for item in case.expected_observations
+        )
+        for case in active
+    )
     reservation = reserve_week3_report(
         output_root, mode=mode, run_id=effective_run_id, timestamp=generated
     )
-    settings = getattr(executor, "settings", AgentRuntimeSettings.model_validate({}))
     try:
-        expected_results = tuple(
-            tuple(
-                _read_expected(item.expected_result_path)
-                for item in case.expected_observations
-            )
-            for case in active
-        )
         effective_pricing = _fixture_pricing() if mode == "fixture" else cast(ModelPricing, pricing)
         outcomes: list[tuple[AgentRunResult, str | None]] = []
         for case in active:
@@ -918,6 +1292,7 @@ async def run_week3_evaluation(
             outcomes.append((outcome, error_type))
         publication_evidence = Week3PublicationEvidence(
             mode=mode,
+            canonical_cases=snapshot.cases,
             cases=active,
             outcomes=tuple(outcome for outcome, _error_type in outcomes),
             error_types=tuple(error_type for _outcome, error_type in outcomes),
@@ -926,6 +1301,9 @@ async def run_week3_evaluation(
             pricing=effective_pricing,
             generated_at_utc=generated,
             run_id=effective_run_id,
+            overall_manifest_sha256=snapshot.overall_manifest_sha256,
+            known_cohort_sha256=snapshot.known_cohort_sha256,
+            heldout_cohort_sha256=snapshot.heldout_cohort_sha256,
         )
         report = _rebuild_report_from_publication_evidence(publication_evidence)
         published = write_week3_report(

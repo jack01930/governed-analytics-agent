@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -33,10 +35,10 @@ from governed_analytics.evals.week3.reporting import (
 )
 from governed_analytics.evals.week3.runner import (
     _fixture_pricing,
+    _load_protocol_snapshot,
     _rebuild_report_from_publication_evidence,
     _safe_failure,
 )
-from governed_analytics.evals.week3.suites import load_week3_cases
 
 
 def _report(run_id: str) -> Week3RunReport:
@@ -105,9 +107,11 @@ def _publication_pair(
     run_id: str,
 ) -> tuple[Week3RunReport, Week3PublicationEvidence]:
     generated = datetime(2026, 9, 4, tzinfo=UTC)
-    case = load_week3_cases()[:1]
+    snapshot = _load_protocol_snapshot()
+    case = snapshot.cases[:1]
     evidence = Week3PublicationEvidence(
         mode="fixture",
+        canonical_cases=snapshot.cases,
         cases=case,
         outcomes=(_safe_failure(case_id=case[0].case_id, reason=StopReason.INTERNAL_ERROR),),
         error_types=(None,),
@@ -116,6 +120,9 @@ def _publication_pair(
         pricing=_fixture_pricing(),
         generated_at_utc=generated,
         run_id=run_id,
+        overall_manifest_sha256=snapshot.overall_manifest_sha256,
+        known_cohort_sha256=snapshot.known_cohort_sha256,
+        heldout_cohort_sha256=snapshot.heldout_cohort_sha256,
     )
     return _rebuild_report_from_publication_evidence(evidence), evidence
 
@@ -552,7 +559,8 @@ def test_source_swap_at_native_publish_boundary_is_quarantined(
     with pytest.raises(OSError, match="publication failed"):
         write_week3_report(reservation, _report("source-swap"))
 
-    assert not reservation.final_dir.exists()
+    assert reservation.final_dir.is_dir()
+    assert not tuple(reservation.final_dir.iterdir())
     assert not (reservation.parent_dir / ".owned-moved").exists()
 
 
@@ -618,6 +626,7 @@ def test_writer_rejects_publication_evidence_with_modified_frozen_case(tmp_path:
     forged_case = evidence.cases[0].model_copy(update={"question": "forged but private"})
     forged_evidence = Week3PublicationEvidence(
         mode=evidence.mode,
+        canonical_cases=evidence.canonical_cases,
         cases=(forged_case,),
         outcomes=evidence.outcomes,
         error_types=evidence.error_types,
@@ -626,6 +635,9 @@ def test_writer_rejects_publication_evidence_with_modified_frozen_case(tmp_path:
         pricing=evidence.pricing,
         generated_at_utc=evidence.generated_at_utc,
         run_id=evidence.run_id,
+        overall_manifest_sha256=evidence.overall_manifest_sha256,
+        known_cohort_sha256=evidence.known_cohort_sha256,
+        heldout_cohort_sha256=evidence.heldout_cohort_sha256,
     )
     reservation = reserve_week3_report(
         tmp_path,
@@ -723,13 +735,227 @@ def test_recursive_boundary_allows_plain_sentinel_and_sql_keywords_in_prose() ->
         "ALTER TABLE metrics ADD COLUMN label text",
         "DROP TABLE metrics",
         "WITH metric AS (SELECT 1) SELECT * FROM metric",
+        "VACUUM metrics",
+        "CALL refresh_metrics()",
+        "BEGIN",
+        "COMMIT",
+        "SET search_path = public",
+        "ANALYZE metrics",
     ),
 )
-def test_recursive_boundary_rejects_complete_sql_statements(sql: str) -> None:
+def test_recursive_boundary_rejects_complete_sql_statements_without_parser_leaks(
+    sql: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     scan = reporting.__dict__["_scan_safe"]
 
     with pytest.raises(ValueError, match="unsafe metadata"):
         scan({"detail": sql})
+
+    captured = capsys.readouterr()
+    assert sql not in captured.out
+    assert sql not in captured.err
+    assert all(sql not in record.getMessage() for record in caplog.records)
+
+
+def test_binding_validation_rejects_swap_between_path_check_and_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id="stat-digest-swap",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_digest = cast(Callable[[int], str], reporting.__dict__["_digest_fd"])
+    swapped = False
+
+    def swap_after_path_stat(fd: int) -> str:
+        nonlocal swapped
+        binding = next(
+            (item for item in reservation._file_bindings if item.fd == fd),
+            None,
+        )
+        if binding is not None and binding.name == "report.json" and not swapped:
+            swapped = True
+            digest = original_digest(fd)
+            _replace_regular_file(binding.directory_fd, binding.name, b"foreign-race")
+            return digest
+        return original_digest(fd)
+
+    monkeypatch.setattr(reporting, "_digest_fd", swap_after_path_stat)
+    with pytest.raises(OSError, match="inventory changed"):
+        write_week3_report(reservation, _report(reservation.run_id))
+
+    assert not reservation.final_dir.exists()
+    assert any(
+        path.is_file() and path.read_bytes() == b"foreign-race"
+        for path in _quarantined_paths(reservation.parent_dir)
+    )
+
+
+def test_postcheck_internal_swap_after_digest_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id="postcheck-internal-swap",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original = reporting.__dict__["_validate_opened_binding"]
+    report_checks = 0
+
+    def swap_after_digest(binding: Any, verification_fd: int) -> None:
+        nonlocal report_checks
+        original(binding, verification_fd)
+        if getattr(binding, "name", None) == "report.json":
+            report_checks += 1
+            if report_checks == 2:
+                _replace_regular_file(
+                    binding.directory_fd,
+                    binding.name,
+                    b"foreign-postcheck",
+                )
+
+    monkeypatch.setattr(reporting, "_validate_opened_binding", swap_after_digest)
+    with pytest.raises(OSError, match="inventory changed"):
+        write_week3_report(reservation, _report(reservation.run_id))
+
+    assert not reservation.final_dir.exists()
+    assert any(
+        path.is_file() and path.read_bytes() == b"foreign-postcheck"
+        for path in _quarantined_paths(reservation.parent_dir)
+    )
+
+
+def test_cleanup_rechecks_leaf_binding_immediately_before_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id="cleanup-leaf-race",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_unlink_bound = reporting.__dict__["_unlink_bound_file"]
+    swapped = False
+
+    def swap_at_bound_delete(binding: Any) -> None:
+        nonlocal swapped
+        if getattr(binding, "name", None) == "report.json" and not swapped:
+            swapped = True
+            _replace_regular_file(
+                binding.directory_fd,
+                binding.name,
+                b"foreign-cleanup-race",
+            )
+        original_unlink_bound(binding)
+
+    monkeypatch.setattr(reporting, "_unlink_bound_file", swap_at_bound_delete)
+    original_validate = reporting.__dict__["_validate_inventory"]
+
+    def force_cleanup(*args: object, **kwargs: object) -> None:
+        original_validate(*args, **kwargs)
+        raise OSError("fixed cleanup trigger")
+
+    monkeypatch.setattr(reporting, "_validate_inventory", force_cleanup)
+    with pytest.raises(OSError, match="fixed cleanup trigger"):
+        write_week3_report(reservation, _report(reservation.run_id))
+
+    assert any(
+        path.is_file() and path.read_bytes() == b"foreign-cleanup-race"
+        for path in _quarantined_paths(reservation.parent_dir)
+    )
+
+
+@pytest.mark.parametrize("target", ("cases", "staging"))
+def test_cleanup_rechecks_owned_directory_immediately_before_rmdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id=f"cleanup-{target}-race",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_rmdir = cast(Callable[..., bool], reporting.__dict__["_rmdir_bound_directory"])
+    swapped = False
+
+    def swap_at_bound_rmdir(
+        directory_fd: int,
+        name: str,
+        *,
+        identity: object,
+        held_fd: int,
+    ) -> bool:
+        nonlocal swapped
+        is_target = (target == "cases" and name == "cases") or (
+            target == "staging" and identity == reservation.staging_identity
+        )
+        if is_target and not swapped:
+            swapped = True
+            os.rename(
+                name,
+                f"owned-{target}",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.mkdir(name, dir_fd=directory_fd)
+        return original_rmdir(
+            directory_fd,
+            name,
+            identity=identity,
+            held_fd=held_fd,
+        )
+
+    monkeypatch.setattr(reporting, "_rmdir_bound_directory", swap_at_bound_rmdir)
+    original_validate = reporting.__dict__["_validate_inventory"]
+
+    def force_cleanup(*args: object, **kwargs: object) -> None:
+        original_validate(*args, **kwargs)
+        raise OSError("fixed cleanup trigger")
+
+    monkeypatch.setattr(reporting, "_validate_inventory", force_cleanup)
+    with pytest.raises(OSError, match="fixed cleanup trigger"):
+        write_week3_report(reservation, _report(reservation.run_id))
+
+    fixed = reservation.staging_dir if target == "staging" else None
+    if fixed is not None:
+        assert fixed.is_dir()
+    assert _quarantined_paths(reservation.parent_dir)
+
+
+def test_foreign_final_swap_before_quarantine_preserves_fixed_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id="foreign-final-quarantine-race",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_quarantine = reporting.__dict__["_quarantine_final"]
+
+    def replace_final_then_quarantine(active: object) -> None:
+        reservation.final_dir.rename(reservation.parent_dir / ".owned-final")
+        reservation.final_dir.mkdir()
+        marker = reservation.final_dir / "marker"
+        marker.write_bytes(b"foreign-final")
+        original_quarantine(active)
+
+    def fail_postcheck(_reservation: object) -> None:
+        raise OSError("fixed postcheck failure")
+
+    monkeypatch.setattr(reporting, "_validate_published", fail_postcheck)
+    monkeypatch.setattr(reporting, "_quarantine_final", replace_final_then_quarantine)
+    with pytest.raises(OSError, match="fixed postcheck failure"):
+        write_week3_report(reservation, _report(reservation.run_id))
+
+    assert (reservation.final_dir / "marker").read_bytes() == b"foreign-final"
 
 
 def test_reservation_close_detaches_failed_descriptor_without_retry(

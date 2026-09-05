@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -172,10 +176,10 @@ async def test_runner_freezes_expected_results_before_invoking_any_case(
             called = True
             raise AssertionError("executor must not run")
 
-    def unavailable_expected(_path: Path) -> object:
+    def unavailable_snapshot() -> object:
         raise RuntimeError("private expected diagnostic")
 
-    monkeypatch.setattr(runner, "_read_expected", unavailable_expected)
+    monkeypatch.setattr(runner, "_load_protocol_snapshot", unavailable_snapshot)
     with pytest.raises(RuntimeError, match="private expected diagnostic"):
         await run_week3_evaluation(
             mode="fixture",
@@ -187,7 +191,166 @@ async def test_runner_freezes_expected_results_before_invoking_any_case(
         )
 
     assert not called
-    assert not tuple((tmp_path / "fixture").iterdir())
+    assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_expected_leaf_symlink_before_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protocol = tmp_path / "week3"
+    shutil.copytree(cast(Path, runner.__dict__["WEEK3_ROOT"]), protocol)
+    expected = protocol / "expected/W3K011.json"
+    owned = protocol / "expected/W3K011-owned.json"
+    expected.rename(owned)
+    expected.symlink_to(owned.name)
+    calls = 0
+
+    class SpyExecutor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            nonlocal calls
+            del case_id, question
+            calls += 1
+            return _failure("W3K011")
+
+    monkeypatch.setattr(runner, "WEEK3_ROOT", protocol, raising=False)
+    with pytest.raises(ValueError, match="protocol snapshot"):
+        await run_week3_evaluation(
+            mode="fixture",
+            executor=SpyExecutor(),
+            output_root=tmp_path / "output",
+            run_id="expected-leaf-symlink",
+            now=lambda: datetime(2026, 9, 4, tzinfo=UTC),
+        )
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_protocol_parent_component_symlink_before_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    protocol = real_parent / "week3"
+    shutil.copytree(cast(Path, runner.__dict__["WEEK3_ROOT"]), protocol)
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    calls = 0
+
+    class SpyExecutor:
+        async def run_case(self, *, case_id: str, question: str) -> AgentRunResult:
+            nonlocal calls
+            del case_id, question
+            calls += 1
+            return _failure("W3K001")
+
+    monkeypatch.setattr(runner, "WEEK3_ROOT", linked_parent / "week3")
+    with pytest.raises(ValueError, match="protocol snapshot"):
+        await run_week3_evaluation(
+            mode="fixture",
+            executor=SpyExecutor(),
+            output_root=tmp_path / "output",
+        )
+
+    assert calls == 0
+
+
+@pytest.mark.parametrize("phase", ("before_open", "after_identity", "after_read"))
+def test_protocol_snapshot_rejects_restored_source_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    protocol = tmp_path / "week3"
+    shutil.copytree(cast(Path, runner.__dict__["WEEK3_ROOT"]), protocol)
+    target = protocol / "expected/W3K011.json"
+    target_inode = target.stat().st_ino
+    monkeypatch.setattr(runner, "WEEK3_ROOT", protocol)
+
+    if phase in {"before_open", "after_read"}:
+        original = cast(
+            Callable[[int, str], bytes], runner.__dict__["_read_protocol_file"]
+        )
+        injected = False
+
+        def swap_around_read(directory_fd: int, name: str) -> bytes:
+            nonlocal injected
+            if name != target.name or injected:
+                return original(directory_fd, name)
+            injected = True
+            if phase == "before_open":
+                os.rename(name, "owned.json", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                source_fd = os.open("owned.json", os.O_RDONLY, dir_fd=directory_fd)
+                replacement_fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    os.write(replacement_fd, os.pread(source_fd, 1 << 20, 0))
+                finally:
+                    os.close(source_fd)
+                    os.close(replacement_fd)
+                content = original(directory_fd, name)
+                os.unlink(name, dir_fd=directory_fd)
+                os.rename("owned.json", name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                return content
+            content = original(directory_fd, name)
+            os.rename(name, "owned.json", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            os.rename("owned.json", name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            return content
+
+        monkeypatch.setattr(runner, "_read_protocol_file", swap_around_read)
+    else:
+        original_pread = cast(Callable[[int], bytes], runner.__dict__["_pread_all"])
+        injected = False
+
+        def swap_after_identity(fd: int) -> bytes:
+            nonlocal injected
+            if os.fstat(fd).st_ino == target_inode and not injected:
+                injected = True
+                target.rename(target.with_name("owned.json"))
+                target.write_bytes(target.with_name("owned.json").read_bytes())
+                content = original_pread(fd)
+                target.unlink()
+                target.with_name("owned.json").rename(target)
+                return content
+            return original_pread(fd)
+
+        monkeypatch.setattr(runner, "_pread_all", swap_after_identity)
+
+    with pytest.raises(ValueError, match="protocol snapshot"):
+        runner.__dict__["_load_protocol_snapshot"]()
+
+
+def test_protocol_snapshot_rejects_same_inode_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protocol = tmp_path / "week3"
+    shutil.copytree(cast(Path, runner.__dict__["WEEK3_ROOT"]), protocol)
+    target = protocol / "expected/W3K011.json"
+    target_inode = target.stat().st_ino
+    original_pread = cast(Callable[[int], bytes], runner.__dict__["_pread_all"])
+    tampered = False
+
+    def tamper_during_read(fd: int) -> bytes:
+        nonlocal tampered
+        if os.fstat(fd).st_ino == target_inode and not tampered:
+            tampered = True
+            write_fd = os.open(target, os.O_WRONLY)
+            try:
+                os.pwrite(write_fd, b"X", 0)
+                os.fsync(write_fd)
+            finally:
+                os.close(write_fd)
+        return original_pread(fd)
+
+    monkeypatch.setattr(runner, "WEEK3_ROOT", protocol)
+    monkeypatch.setattr(runner, "_pread_all", tamper_during_read)
+    with pytest.raises(ValueError, match="protocol snapshot"):
+        runner.__dict__["_load_protocol_snapshot"]()
 
 
 @pytest.mark.asyncio

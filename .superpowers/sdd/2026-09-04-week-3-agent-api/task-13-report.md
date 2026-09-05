@@ -210,3 +210,68 @@
 - 按禁令未执行 live/付费/API client/network 调用；`close_unknown` 仅在 OS 无法确认 close 状态的罕见
   分支保留到进程退出，避免重试同一整数误关复用 FD。live provider 与 engine/client 生命周期仍归
   Task 14。
+
+## Fix round 4（2026-09-05）
+
+### 修复结果
+
+- regular-file publication validation 改为从目标 parent `dir_fd` 使用 `O_NOFOLLOW` 重开并持有独立
+  verification FD，同时核对 held FD、verification FD 与 directory entry 的 device/inode/type/size；
+  两个 FD 分别计算 SHA-256，digest 完成后再次核对 directory entry，发布前和发布后均执行。
+  parent `fsync` 后再做最终 postcheck，覆盖 pathname stat 与 held-FD digest 之间及 postcheck 内部的
+  inode swap。
+- cleanup 不再使用外层 match 结果直接按名删除。owned leaf 在 `_unlink_bound_file` 内重开、核对完整
+  identity/size/digest 并在紧邻 `unlink` 前再次 stat；cases/staging directory 在 `_rmdir_bound_directory`
+  内以 held FD + nofollow verification FD 核对 identity 与空 inventory，并在紧邻 `rmdir` 前再次 stat。
+  replacement、extra 或篡改内容只会被隔离/保留；fixed staging/final 若换入 foreign inode，则按原
+  staging identity 寻找并隔离 owned root，绝不移动或删除 foreign fixed name。
+- runner 在任何 `run_case` 调用和 report reservation 前建立完整 `_ProtocolSnapshot`：从文件系统根开始
+  逐级 `dir_fd + O_DIRECTORY + O_NOFOLLOW` 打开 Week3 树；registry、scripts、candidate SQL、Oracle 与
+  expected leaf 均以同一 FD 双读，并做 fstat before/after、第二个 nofollow verification FD、directory
+  entry 及 parent-directory metadata 稳定性核对。snapshot 在内存中解析 canonical cases 与 frozen
+  expected result，并重新计算、核对固定 overall/known/heldout 三份 manifest hash。
+- scorer 和 writer rebuild 只消费该 immutable snapshot 投影；`Week3PublicationEvidence` 绑定完整
+  canonical cases、三份 snapshot hash 与内存 frozen expected，不再调用 pathname loader。snapshot
+  失败使用固定 `Week 3 protocol snapshot is unavailable`，在 executor 调用数为零时终止，不回显
+  registry、SQL、rows 或 parser/OS 原始诊断。
+- SQL value guard 先做无日志的完整 statement 前缀/结构分类，仅对 SQL 候选调用 PostgreSQL parser；
+  Command/Transaction/Set/Analyze 类中的 `VACUUM`、`CALL`、`BEGIN`、`COMMIT`、`SET`、`ANALYZE` 连同
+  SELECT/VALUES/GRANT/COPY/DML/DDL/CTE 全部拒绝。普通 `please select a cached model`、
+  `drop shipping is selected from cache` 和 `sentinel-llm` 仍允许，caplog/capsys 不含输入。
+- 保持 Fix round 3 的 one-shot close ruling：每个 FD 仅尝试关闭一次，`close_unknown` 与 publication
+  validity 分离；本轮未恢复任何同编号 FD 重试。
+
+### RED / mutation 回归
+
+- 命令：
+  `uv run pytest tests/unit/evals/week3/test_reporting.py::test_binding_validation_rejects_swap_between_path_check_and_digest tests/unit/evals/week3/test_reporting.py::test_cleanup_rechecks_leaf_binding_immediately_before_unlink tests/unit/evals/week3/test_reporting.py::test_recursive_boundary_rejects_complete_sql_statements_without_parser_leaks tests/unit/evals/week3/test_runner.py::test_runner_rejects_expected_leaf_symlink_before_executor -q`
+- 输出：`8 failed, 12 passed in 1.47s`。失败分别证明 cleanup outer-check→unlink 可删除 foreign leaf、
+  VACUUM/CALL/BEGIN/COMMIT/SET/ANALYZE 未拒绝且 Command fallback 会记录输入，以及 runner 尚未建立
+  handle-bound protocol snapshot。随后补充 postcheck-internal swap、cases/staging bound-rmdir、
+  publish-postcheck→quarantine fixed-final swap、parent component symlink、open/identity/read/restore source
+  swap 与 same-inode tamper mutations。
+
+### GREEN 与最终验证
+
+- reporting + runner 定向：
+  `uv run pytest tests/unit/evals/week3/test_reporting.py tests/unit/evals/week3/test_runner.py -q`
+  → `86 passed in 5.56s`。
+- Week3 unit：`uv run pytest tests/unit/evals/week3 -q` → `416 passed in 20.67s`。
+- 本地 40-case integration：
+  `DATABASE_URL=postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.0.0.1:5432/governed_analytics uv run pytest tests/integration/evals/test_week3_runner.py -q`
+  → `1 passed in 13.04s`。
+- 定向 Ruff → `All checks passed!`；全量 mypy →
+  `Success: no issues found in 156 source files`。
+- `make check` → Ruff/mypy 通过，unit `1590 passed in 43.73s`。
+- `git diff --check` → PASS。
+
+### 自审与关注
+
+- 已逐项复核 four findings：validation 与 delete helper 都在 digest 后重新绑定 directory entry；所有
+  已暴露 Python helper seam 的 mutation 均 fail closed；unknown inventory 不递归删除；publisher
+  postcheck 与 quarantine 只按 owned root identity 操作；snapshot 在任何 executor 调用前完成且后续
+  scorer/writer 不再读取 protocol pathname；SQL parser 不输出原文。
+- 按 Task12 staging trust model，拥有相同 UID 的攻击者在最后一次 identity check 与原生
+  `unlinkat/rmdirat/renameat` 的纳秒级 syscall 边界仍无法由 Python 消除，本轮未声称解决该已 ruling
+  的边界。
+- 按禁令未执行 live/付费/provider/API/network 调用；仅运行本地 fixture PostgreSQL integration。
