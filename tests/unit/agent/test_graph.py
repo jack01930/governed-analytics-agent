@@ -1579,6 +1579,85 @@ async def test_refuse_and_unsupported_never_call_tools(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("behavior", "expected_status", "expected_reason"),
+    [
+        (
+            {
+                "action": "clarify",
+                "reason_code": "missing_time_window",
+                "missing_fields": ["time_window"],
+                "user_message": "请补充查询时间范围。",
+            },
+            FinalStatus.CLARIFICATION_REQUIRED,
+            StopReason.MISSING_REQUIRED_FIELDS,
+        ),
+        (
+            {
+                "action": "refuse",
+                "reason_code": "unsafe_request",
+                "missing_fields": [],
+                "user_message": "拒绝。",
+            },
+            FinalStatus.REFUSED,
+            StopReason.UNSAFE_REQUEST,
+        ),
+        (
+            {
+                "action": "unsupported",
+                "reason_code": "unsupported_analysis",
+                "missing_fields": [],
+                "user_message": "不支持。",
+            },
+            FinalStatus.UNSUPPORTED,
+            StopReason.UNSUPPORTED_ANALYSIS,
+        ),
+    ],
+)
+async def test_soft_cap_does_not_replace_terminal_behavior_decision(
+    behavior: dict[str, object],
+    expected_status: FinalStatus,
+    expected_reason: StopReason,
+) -> None:
+    budget = SoftAfterExecuteBudget(ledger())
+    budget.soft = True
+    context, tools, model, events, _ = context_for(
+        scripts_for(QUERY, behavior=behavior),
+        (),
+        budget=budget,
+    )
+
+    result = await run_agent(run_id="soft-terminal-behavior", query=QUERY, context=context)
+
+    assert result.final_answer.status is expected_status
+    assert result.final_answer.stop_reason is expected_reason
+    assert result.governance.soft_cap_reached is True
+    assert tools.calls == []
+    assert [call.purpose for call in model.calls] == ["behavior"]
+    assert [item[1] for item in events.items].count("budget.warning") == 1
+
+
+@pytest.mark.asyncio
+async def test_soft_cap_stops_execute_behavior_before_downstream_calls() -> None:
+    budget = SoftAfterExecuteBudget(ledger())
+    budget.soft = True
+    context, tools, model, events, _ = context_for(
+        scripts_for(QUERY),
+        (),
+        budget=budget,
+    )
+
+    result = await run_agent(run_id="soft-execute-behavior", query=QUERY, context=context)
+
+    assert result.final_answer.status is FinalStatus.BUDGET_EXHAUSTED
+    assert result.final_answer.stop_reason is StopReason.COST_SOFT_CAP
+    assert result.governance.soft_cap_reached is True
+    assert tools.calls == []
+    assert [call.purpose for call in model.calls] == ["behavior"]
+    assert [item[1] for item in events.items].count("budget.warning") == 1
+
+
+@pytest.mark.asyncio
 async def test_premise_not_met_has_completed_terminal_and_stops_at_comparison() -> None:
     scripts = scripts_for(
         ATTRIBUTION_QUERY,

@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 
+import governed_analytics.evals.week3 as week3_evals
 from governed_analytics.agent.contracts import (
     BehaviorAction,
     BehaviorReasonCode,
@@ -129,6 +130,13 @@ def _publication_pair(
 
 def _quarantined_paths(parent: Path) -> tuple[Path, ...]:
     return tuple(parent.glob(".week3-foreign-*"))
+
+
+def test_public_exports_hide_internal_publication_evidence() -> None:
+    assert "Week3PublicationEvidence" not in week3_evals.__all__
+    assert not hasattr(week3_evals, "Week3PublicationEvidence")
+    assert "Week3PublicationEvidence" not in reporting.__all__
+    assert reporting.Week3PublicationEvidence is Week3PublicationEvidence
 
 
 def test_report_reservation_rejects_duplicate_run_directory(tmp_path: Path) -> None:

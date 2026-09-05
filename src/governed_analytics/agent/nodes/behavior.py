@@ -321,7 +321,8 @@ async def decide_behavior(
                 reason=StopReason.COST_SOFT_CAP,
             ):
                 raise SafeDependencyError("event_sink_failed")
-            delta["stop_reason"] = StopReason.COST_SOFT_CAP
+            if decision.action is BehaviorAction.EXECUTE:
+                delta["stop_reason"] = StopReason.COST_SOFT_CAP
         return finish_node(
             context=context,
             node="decide_behavior",

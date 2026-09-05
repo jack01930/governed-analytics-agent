@@ -1080,7 +1080,6 @@ def write_week3_report(
 
 __all__ = [
     "PublishedWeek3Report",
-    "Week3PublicationEvidence",
     "Week3ReportReservation",
     "cancel_week3_report_reservation",
     "reserve_week3_report",
