@@ -1121,7 +1121,7 @@ def _is_forbidden_field_name(value: object) -> bool:
         normalized in _FORBIDDEN_KEYS
         or normalized.endswith("_sql")
         or normalized.startswith("sql_")
-        or _has_credential_label_suffix(normalized)
+        or _is_credential_label(value)
     )
 
 
@@ -1132,52 +1132,126 @@ def _normalize_sensitive_label(value: str) -> str:
     return re.sub(r"[\s./\\_-]+", "_", normalized).strip("_")
 
 
+_CREDENTIAL_BASE_PARTS = (
+    ("api", "key"),
+    ("client", "secret"),
+    ("database", "password"),
+    ("access", "token"),
+    ("authorization",),
+    ("bearer",),
+    ("credential",),
+    ("credentials",),
+    ("password",),
+    ("secret",),
+    ("token",),
+)
+_CREDENTIAL_COMPACT_BASES = (
+    "apikey",
+    "clientsecret",
+    "databasepassword",
+    "accesstoken",
+    "authorization",
+    "bearer",
+    "credentials",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+_CREDENTIAL_PROVIDER_PREFIXES = frozenset(
+    {"openai", "provider", "service", "model", "database", "db", "client", "internal"}
+)
+_CREDENTIAL_QUALIFIERS = frozenset(
+    {
+        "backup",
+        "current",
+        "dev",
+        "external",
+        "internal",
+        "legacy",
+        "new",
+        "next",
+        "old",
+        "primary",
+        "prod",
+        "production",
+        "secondary",
+        "staging",
+        "test",
+    }
+)
+
+
+def _is_credential_qualifier_sequence(parts: tuple[str, ...]) -> bool:
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        if part in _CREDENTIAL_QUALIFIERS or re.fullmatch(r"(?:v|ver|version)?\d+", part):
+            index += 1
+            continue
+        if (
+            part in {"v", "ver", "version"}
+            and index + 1 < len(parts)
+            and parts[index + 1].isdigit()
+        ):
+            index += 2
+            continue
+        return False
+    return True
+
+
+def _valid_credential_provider_prefix(
+    parts: tuple[str, ...],
+    *,
+    original_has_space: bool,
+) -> bool:
+    if not parts:
+        return True
+    if all(part in _CREDENTIAL_PROVIDER_PREFIXES for part in parts):
+        return True
+    return not original_has_space and len(parts) <= 2
+
+
 def _is_credential_label(value: str) -> bool:
-    normalized = _normalize_sensitive_label(value)
-    compact = normalized.replace("_", "")
+    normalized_source = unicodedata.normalize("NFKC", value).strip()
+    normalized = _normalize_sensitive_label(normalized_source)
     parts = tuple(part for part in normalized.split("_") if part)
-    if normalized in {
-        "authorization",
-        "bearer",
-        "credential",
-        "credentials",
-        "password",
-        "secret",
-        "token",
-    }:
-        return True
-    if compact in {"apikey", "clientsecret", "databasepassword", "accesstoken"}:
-        return True
-    return (
-        len(parts) >= 2
-        and parts[-2:]
-        in {
-            ("api", "key"),
-            ("client", "secret"),
-            ("database", "password"),
-            ("access", "token"),
-        }
+    original_has_space = bool(re.search(r"\s", normalized_source))
+    for base in _CREDENTIAL_BASE_PARTS:
+        for index in range(0, len(parts) - len(base) + 1):
+            if parts[index : index + len(base)] != base:
+                continue
+            before = parts[:index]
+            after = parts[index + len(base) :]
+            if _valid_credential_provider_prefix(
+                before, original_has_space=original_has_space
+            ) and _is_credential_qualifier_sequence(after):
+                return True
+
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
+    compact_qualifier = (
+        r"(?:(?:v|ver|version)?\d+|backup|current|dev|external|internal|legacy|new|"
+        r"next|old|primary|production|prod|secondary|staging|test)*"
+    )
+    providers = "|".join(sorted(_CREDENTIAL_PROVIDER_PREFIXES))
+    return any(
+        re.fullmatch(rf"(?:(?:{providers}))*{base}{compact_qualifier}", compact)
+        is not None
+        for base in _CREDENTIAL_COMPACT_BASES
     )
 
 
 def _has_credential_label_suffix(value: str) -> bool:
-    normalized = _normalize_sensitive_label(value)
-    parts = tuple(part for part in normalized.split("_") if part)
-    if parts and parts[-1] in {
-        "authorization",
-        "bearer",
-        "credential",
-        "credentials",
-        "password",
-        "secret",
-        "token",
-    }:
-        return True
-    compact = re.sub(r"[^a-z0-9]", "", normalized)
-    return any(
-        compact.endswith(label)
-        for label in ("apikey", "clientsecret", "databasepassword", "accesstoken")
+    # A credential assignment label must be immediately adjacent to its delimiter.
+    # Bounding this suffix also prevents large raw SSE/SQL values with many colons
+    # from turning this test oracle into a quadratic scanner.
+    normalized = unicodedata.normalize("NFKC", value[-256:])
+    starts = {0}
+    starts.update(
+        boundary.end()
+        for boundary in re.finditer(r"[\s:;=,()[\]{}\"'/\\]+", normalized)
     )
+    return any(_is_credential_label(normalized[start:].strip()) for start in starts)
 
 
 def _contains_credential_assignment(value: str) -> bool:
@@ -1185,35 +1259,54 @@ def _contains_credential_assignment(value: str) -> bool:
     if re.search(r"(?i)(?<![\w-])bearer\s+\S+", normalized):
         return True
     for delimiter in re.finditer(r"[:=]", normalized):
-        if _has_credential_label_suffix(normalized[: delimiter.start()]):
+        delimiter_start = delimiter.start()
+        if _has_credential_label_suffix(
+            normalized[max(0, delimiter_start - 256) : delimiter_start]
+        ):
             return True
     return False
 
 
 _SQL_QUERY_HEAD = re.compile(r"^(?:select|with|values)\b", re.IGNORECASE)
-_SQL_GRANT_HEAD = re.compile(r"^grant\s+", re.IGNORECASE)
-_SQL_COPY_HEAD = re.compile(r"^copy\s+", re.IGNORECASE)
+_SQL_IDENTIFIER = r'(?:[a-z_][a-z0-9_$]*|"(?:[^"]|"")+")'
+_SQL_QUALIFIED_IDENTIFIER = rf"{_SQL_IDENTIFIER}(?:\.{_SQL_IDENTIFIER})*"
+_SQL_IDENTIFIER_LIST = rf"{_SQL_QUALIFIED_IDENTIFIER}(?:\s*,\s*{_SQL_QUALIFIED_IDENTIFIER})*"
+_SQL_PRIVILEGE = (
+    r"(?:all(?:\s+privileges)?|select|insert|update|delete|truncate|references|trigger|"
+    r"usage|create|connect|temporary|execute|maintain|set|alter\s+system)"
+    r"(?:\s*\([^)]*\))?"
+)
+_SQL_ROLE_OPTION = r"(?:admin|inherit|set)\s+(?:option|true|false)"
 _SQL_GRANT_STRUCTURE = re.compile(
-    r"^grant\s+(?:"
-    r"(?:(?:all(?:\s+privileges)?|select|insert|update|delete|truncate|references|"
-    r"trigger|usage|create|connect|temporary|execute|maintain|set|alter\s+system)"
-    r"(?:\s*\([^)]*\))?(?:\s*,\s*(?:select|insert|update|delete|truncate|references|"
-    r"trigger|usage|create|connect|temporary|execute|maintain|set|alter\s+system)"
-    r"(?:\s*\([^)]*\))?)*\s+on\s+"
-    r"(?:(?:table|sequence|database|domain|schema|tablespace|type|language|"
-    r"function|procedure|routine|large\s+object|foreign\s+server|"
-    r"foreign\s+data\s+wrapper)\s+)?\S+(?:\s*,\s*\S+)*)"
-    r"|(?:\S+(?:\s*,\s*\S+)*))"
-    r"\s+to\s+\S+(?:\s*,\s*\S+)*"
-    r"(?:\s+with\s+(?:grant|admin|inherit|set)\s+option)?"
-    r"(?:\s+granted\s+by\s+\S+)?$",
+    rf"^grant\s+(?:"
+    rf"(?:{_SQL_PRIVILEGE})(?:\s*,\s*{_SQL_PRIVILEGE})*\s+on\s+(?:"
+    rf"all\s+(?:tables|sequences|functions|procedures|routines)\s+in\s+schema\s+"
+    rf"{_SQL_IDENTIFIER_LIST}|"
+    rf"(?:(?:table|sequence|database|domain|schema|tablespace|type|language|function|"
+    rf"procedure|routine|large\s+object|foreign\s+server|foreign\s+data\s+wrapper)\s+)?"
+    rf"{_SQL_IDENTIFIER_LIST})\s+to\s+{_SQL_IDENTIFIER_LIST}"
+    rf"(?:\s+with\s+grant\s+option)?|"
+    rf"{_SQL_IDENTIFIER_LIST}\s+to\s+{_SQL_IDENTIFIER_LIST}"
+    rf"(?:\s+with\s+{_SQL_ROLE_OPTION}(?:\s*,\s*{_SQL_ROLE_OPTION})*)?)"
+    rf"(?:\s+granted\s+by\s+{_SQL_IDENTIFIER})?$",
     re.IGNORECASE | re.DOTALL,
 )
+_SQL_GRANT_COMMAND_HINT = re.compile(
+    rf"^grant\s+(?:{_SQL_PRIVILEGE})(?:\s*,\s*{_SQL_PRIVILEGE})*\s+on\b.+\bto\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_SQL_STRING_LITERAL = r"'(?:[^']|'')*'"
 _SQL_COPY_STRUCTURE = re.compile(
-    r"^copy\s+(?:\(.+\)|[^\s(]+(?:\s*\([^)]*\))?)\s+"
-    r"(?:to|from)\s+(?:stdin|stdout|program\s+\S+|\S+)"
-    r"(?:\s+with(?:\s*\([^)]*\)|\s+.+))?"
+    rf"^copy\s+(?:\(.+\)|{_SQL_QUALIFIED_IDENTIFIER}"
+    rf"(?:\s*\({_SQL_IDENTIFIER_LIST}\))?)\s+"
+    rf"(?:to|from)\s+(?:stdin|stdout|program\s+{_SQL_STRING_LITERAL}|"
+    rf"{_SQL_STRING_LITERAL})"
+    r"(?:\s+with(?:\s*\([^)]*\)|\s+[a-z].*))?"
     r"(?:\s+where\s+.+)?$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SQL_COPY_COMMAND_HINT = re.compile(
+    r"^copy\s+.+\s+(?:to|from)\s+(?:stdin|stdout|program\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _SQL_COMMAND_STRUCTURE = re.compile(
@@ -1256,14 +1349,12 @@ def _is_single_sql_statement(value: str) -> bool:
         return False
     if _SQL_GRANT_STRUCTURE.fullmatch(normalized):
         return True
-    if _SQL_GRANT_HEAD.match(normalized):
-        return bool(re.search(r"\bon\b.+\bto\b", normalized, re.IGNORECASE | re.DOTALL))
+    if _SQL_GRANT_COMMAND_HINT.match(normalized):
+        return True
     if _SQL_COPY_STRUCTURE.fullmatch(normalized):
         return True
-    if _SQL_COPY_HEAD.match(normalized):
-        return bool(
-            re.search(r"\b(?:to|from)\b", normalized, re.IGNORECASE | re.DOTALL)
-        )
+    if _SQL_COPY_COMMAND_HINT.match(normalized):
+        return True
     if _SQL_COMMAND_STRUCTURE.match(normalized):
         return True
     if not _SQL_QUERY_HEAD.match(normalized):
@@ -1285,8 +1376,8 @@ def _is_sql_statement(value: str) -> bool:
         normalized = _normalize_sql_text(value).strip()
         return bool(
             _SQL_QUERY_HEAD.match(normalized)
-            or _SQL_GRANT_HEAD.match(normalized)
-            or _SQL_COPY_HEAD.match(normalized)
+            or _SQL_GRANT_COMMAND_HINT.match(normalized)
+            or _SQL_COPY_COMMAND_HINT.match(normalized)
             or _SQL_COMMAND_STRUCTURE.match(normalized)
         )
     return any(_is_single_sql_statement(statement) for statement in statements)
@@ -1690,6 +1781,14 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface(
         "database.password",
         "ACCESSTOKEN",
         "access-token",
+        "api-key-v2",
+        "token-v2",
+        "client_secret_legacy",
+        "provider.apiKey.production",
+        "access-token-version-2",
+        "provider/openAIAPIKey/version-02",
+        "clientSecret.legacy",
+        "access-token-production",
         "authorization",
         "bearer",
         "credentials",
@@ -1700,8 +1799,10 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface(
             {label: opaque_value},
             {"status": f"{label}={opaque_value}"},
             [[label, opaque_value]],
+            [["status", label]],
             [["status", f"{label}={opaque_value}"]],
             {"safe_arguments": [[label, opaque_value]]},
+            {"safe_arguments": [["contract_id", label]]},
             {"safe_arguments": [["contract_id", f"{label}={opaque_value}"]]},
         )
         for candidate in candidates:
@@ -1734,6 +1835,8 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface(
         "OPENAIAPIKEY=opaque-openai-key",
         "providerAPIKey=opaque-provider-key",
         "provider.api_key=opaque-provider-dot-key",
+        "please use token-v2=opaque-versioned-token",
+        "provider.api-key-v2=opaque-versioned-provider-key",
         "\uff2f\uff30\uff25\uff2e\uff21\uff29\uff21\uff30\uff29\uff2b\uff25\uff39"
         "\uff1dopaque-fullwidth-provider-key",
     )
@@ -1798,6 +1901,12 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface(
                 "GRANT SELECT ON ALL TABLES IN SCHEMA public TO analyst",
                 "GRANT SELECT, UPDATE ON TABLE orders TO analyst WITH GRANT OPTION",
                 "GRANT analyst_role TO report_user WITH ADMIN OPTION;",
+                'GRANT "analyst role" TO report_user',
+                'GRANT "analyst ""senior"" role" TO report_user GRANTED BY CURRENT_USER',
+                'GRANT analyst_role, "review role" TO report_user, "audit user" '
+                "WITH ADMIN FALSE GRANTED BY CURRENT_USER",
+                "GRANT analyst_role TO report_user WITH INHERIT TRUE",
+                "GRANT analyst_role TO report_user WITH SET FALSE GRANTED BY grant_admin",
                 "GRANT SELECT ON orders TO analyst; /* trailing; comment */",
                 "GRANT SELECT ON orders TO analyst; DROP TABLE audit_log",
             ),
@@ -1809,6 +1918,11 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface(
                 "COPY orders (order_id) TO STDOUT",
                 "COPY (SELECT * FROM orders) TO STDOUT",
                 "COPY (SELECT ';' AS marker FROM orders) TO STDOUT",
+                "COPY orders (order_id) TO STDOUT WITH (FORMAT csv, HEADER true)",
+                "COPY orders FROM STDIN WITH (FORMAT csv) WHERE order_id IS NOT NULL",
+                "COPY orders TO PROGRAM 'gzip > /tmp/orders.gz'",
+                "COPY (SELECT order_id FROM orders) TO PROGRAM "
+                "'gzip > /tmp/orders-query.gz' WITH (FORMAT csv, HEADER true)",
                 "COPY orders TO STDOUT; COPY audit_log TO STDOUT",
             ),
         ),
@@ -1848,6 +1962,12 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface(
         "drop shipping is selected from cache",
         "grant access to the cached model",
         "grant access to analyst in the cached model",
+        "grant access on the cached model to the analyst for testing",
+        "copy this result from cache for the report",
+        "copy this result from cache for the report's appendix",
+        "please discuss token-v2 usage without an assignment",
+        "token budget=2 is a normal metric explanation",
+        "api-key usage=2 is a normal metric explanation",
         "grant-model",
         "sentinel-llm",
     )
@@ -1856,6 +1976,16 @@ def test_safe_output_oracle_scans_every_structured_and_raw_sse_surface(
             json.dumps({"status": prose}),
             database,
         )
+    _assert_serialized_output_has_no_secrets_or_sql(
+        json.dumps(
+            {
+                "token_count": 2,
+                "api_key_usage_count": 0,
+                "secret_sauce": "ordinary field value",
+            }
+        ),
+        database,
+    )
     captured = capsys.readouterr()
     _safe_output_require(captured.out == "" and captured.err == "")
     _safe_output_require(

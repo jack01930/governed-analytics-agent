@@ -292,3 +292,62 @@ Success: no issues found in 156 source files
 - credential 与 SQL 新矩阵覆盖 parsed/raw/pair 边界，failure traceback 继续由 redaction helper 验证不含 operand。
 - asyncio debug + warnings-as-errors 无未观察 exception、未 await coroutine 或 pending-task warning；hostile dependency 仅在测试显式 release 后 reclaim。
 - 未修改/提交 production API/SSE、Phase B 文件或 controller ledger；Fix3 后停止等待 scoped review。
+
+## Phase A Fix round 4
+
+### RED / mutation
+
+先把 version/environment qualifier label、quoted role、role option、真实 COPY options 与自然语言对照加入同一 safe-output 边界矩阵：
+
+```text
+uv run pytest tests/integration/api/test_api_sse.py -q -k 'safe_output_oracle'
+.F
+1 failed, 1 passed, 12 deselected in 1.14s
+```
+
+首个失败是 `api-key-v2` 未拒绝；同一预置 mutation 已将 qualifier label 放入 parsed key/value、generic pair name/value、`safe_arguments` name/value 与 raw SSE comment，证明旧实现只识别精确 base label。
+
+### GREEN
+
+- credential label 现在按 `provider* + credential-base + qualifier*` 的受限语法分类；separator/camel/acronym/compact/fullwidth 均先 NFKC 后统一处理，覆盖 version number、legacy、production 及 `provider/openAIAPIKey/version-02`。赋值扫描仅检查 delimiter 紧邻的 256 字符标签窗口，避免长 SSE/SQL 字符串上的无界后缀枚举。
+- label 识别保持 token boundary：`token_count`、`api_key_usage_count`、`secret_sauce` 与无赋值的 `discuss token-v2 usage` 可发布，任意 prose 中间出现 `token` 不被当作凭据字段。
+- GRANT 使用 PostgreSQL unquoted/double-quoted identifier（含 doubled-quote escape）、qualified/comma list 和整串 role/object grant 结构；覆盖 ADMIN/INHERIT/SET 的 OPTION/TRUE/FALSE、`GRANTED BY CURRENT_USER`，不再以宽泛 `GRANT ... ON ... TO ...` 前缀拒绝正常说明。
+- COPY 使用整串 table/column-list/query source、STDIN/STDOUT/file/PROGRAM target、WITH/WHERE 结构；仅对高置信 target 保留 fail-closed hint。含撇号的 COPY prose及 `copy ... from cache ...` 对照保持可发布，多语句仍由 PostgreSQL tokenizer 分句后逐句拒绝。
+- Fix1–Fix3 的 owned/borrowed handle、caller cancellation、same-tick child exception 与 hostile explicit reclaim 回归保持不变。
+
+### 验证
+
+```text
+uv run pytest tests/integration/api/test_api_sse.py -q -k 'safe_output_oracle or deadline or borrowed or caller_cancellation or hostile or owned_handle'
+...........
+11 passed, 3 deselected in 1.36s
+
+uv run ruff check tests/integration/api/test_api_sse.py
+All checks passed!
+
+uv run mypy tests/integration/api/test_api_sse.py
+Success: no issues found in 1 source file
+
+DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest tests/integration/agent/test_graph.py tests/integration/api/test_api_sse.py -q
+.................
+17 passed in 2.79s
+
+DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest tests/integration/api/test_api_sse.py tests/integration/agent/test_graph.py -q
+.................
+17 passed in 2.78s
+
+PYTHONASYNCIODEBUG=1 PYTHONWARNINGS=error DATABASE_URL='postgresql+asyncpg://analytics_readonly:***@127.0.0.1:5432/governed_analytics' uv run pytest --asyncio-debug -o asyncio_default_fixture_loop_scope=function tests/integration/agent/test_graph.py tests/integration/api/test_api_sse.py -q
+.................
+17 passed in 2.98s
+
+make check
+All checks passed!
+Success: no issues found in 156 source files
+1610 passed in 43.53s
+```
+
+### 残留检查
+
+- safe-output oracle 的 unsafe error 仍固定且不回显输入；`caplog`、stdout、stderr 继续断言无 sqlglot 原文或 warning。
+- asyncio debug + warnings-as-errors 未发现未观察 exception、未 await coroutine 或 pending-task residue；hostile probe 仍由创建者 release/reclaim。
+- 仅修改 Phase A harness 与本报告；未修改 production API/SSE、Phase B、ledger 或 `progress.md`。
