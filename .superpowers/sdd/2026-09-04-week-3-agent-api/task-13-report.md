@@ -275,3 +275,50 @@
   `unlinkat/rmdirat/renameat` 的纳秒级 syscall 边界仍无法由 Python 消除，本轮未声称解决该已 ruling
   的边界。
 - 按禁令未执行 live/付费/provider/API/network 调用；仅运行本地 fixture PostgreSQL integration。
+
+## Fix round 5（2026-09-05）
+
+### 修复结果
+
+- report value SQL guard 改为两段式无回显分类：命令类 statement 使用无日志的 lexical structural
+  规则直接拒绝，新增覆盖 `MERGE INTO`、`TRUNCATE TABLE`、`CREATE OR REPLACE VIEW`、
+  `CREATE MATERIALIZED VIEW`、`SET LOCAL` 与 `VACUUM(FULL)`；仅 `SELECT` 或具备
+  `identifier AS (` CTE 结构的 `WITH` 候选进入 PostgreSQL AST parser。parser failure 被固定为
+  非 SQL 候选，不输出或抛出携带原文的诊断。
+- 普通 prose 与合法 model ID 不再被粗粒度 SQL 前缀误判：显式验证
+  `select a cached model`、`with cached model metadata`、
+  `drop shipping is selected from cache`、`grant-model` 与 `sentinel-llm` 可发布；正反矩阵均捕获
+  caplog/stdout/stderr，确认无输入泄漏。unsafe boundary 仍统一返回固定
+  `Week 3 report contains unsafe metadata`。
+- `_validate_file_binding()` 的 verification FD 改为 one-shot close：完成 identity/content/entry
+  验证后只调用一次 `close(2)`，close 状态未知时记录到 reservation `close_unknown`，不重试同一整数。
+  validation 主异常不会被 close 异常遮蔽；已经完成 post-publish validation 的 final 不会因资源回收
+  异常被反向隔离，publication validity 与 resource status 保持分离。
+- 新增 pre/post-publish 正常 close、close-before-syscall、close-after-real-close 后 `dup2` 复用、持续
+  close error 以及 validation-first failure 的确定性回归；断言每个整数仅尝试一次、其他 FD 继续处理、
+  复用 FD 不被误关、成功 final 保留且失败 final 不可见。
+
+### RED / mutation 回归
+
+- 定向命令：
+  `uv run pytest tests/unit/evals/week3/test_reporting.py::test_recursive_boundary_rejects_complete_sql_statements_without_parser_leaks tests/unit/evals/week3/test_reporting.py::test_recursive_boundary_allows_prose_and_model_ids_without_parser_leaks tests/unit/evals/week3/test_reporting.py::test_verification_fd_close_error_does_not_reverse_valid_publication tests/unit/evals/week3/test_reporting.py::test_persistent_verification_fd_close_errors_attempt_every_fd_once tests/unit/evals/week3/test_reporting.py::test_verification_fd_close_error_does_not_mask_validation_failure -q`
+- 修复前输出：`15 failed, 20 passed in 1.56s`。六个新增 PostgreSQL statement 漏过边界；三个合法
+  prose/model-id 被拒绝，其中 Command fallback 记录了输入；四个 pre/post close-error case、持续错误
+  case 与 validation-first case 分别证明 publication 被反转或主异常被遮蔽。
+- 修复后同一定向集：`35 passed in 1.30s`；另加入 pre/post 正常 close 显式一次性回归。
+
+### 最终验证
+
+- Week3 unit：`uv run pytest tests/unit/evals/week3 -q` → `436 passed in 21.37s`。
+- 本地 canonical fixture 40-case integration：
+  `DATABASE_URL=postgresql+asyncpg://analytics_readonly:analytics_readonly_dev@127.0.0.1:5432/governed_analytics uv run pytest tests/integration/evals/test_week3_runner.py -q`
+  → `1 passed in 13.15s`。
+- `make check` → Ruff `All checks passed!`；mypy
+  `Success: no issues found in 156 source files`；unit `1610 passed in 43.40s`。
+- `git diff --check` → PASS。
+
+### 剩余关注
+
+- 按禁令未执行 live/付费/provider/API/network 调用；仅使用本地 fixture PostgreSQL。
+- `close_unknown` 仍表达 OS close 结果不可知；依 ledger ruling 不对同一整数做第二次 close，允许该罕见
+  分支保留到进程退出。未处理 ledger deferred Minor `Week3PublicationEvidence.__all__`。

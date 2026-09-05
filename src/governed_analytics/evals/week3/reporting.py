@@ -32,30 +32,36 @@ if TYPE_CHECKING:
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _URL = re.compile(r"(?i)\b(?:https?|postgres(?:ql)?|mysql)://")
 _CREDENTIAL = re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:sk-|pk-|bearer\s+)")
-_SQL_COMMAND = re.compile(
-    r"(?is)^\s*(?:"
-    r"select\b|values\b|with\b|grant\b|revoke\b|copy\b|"
-    r"insert\s+into\b|update\s+[^\s;]+\s+set\b|delete\s+from\b|"
-    r"create\s+(?:table|view|index|schema|database|function|procedure|type|role)\b|"
-    r"alter\s+(?:table|view|index|schema|database|function|procedure|type|role)\b|"
-    r"drop\s+(?:table|view|index|schema|database|function|procedure|type|role)\b|"
-    r"vacuum(?:\s|;|$)|call\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*\(|"
+_SQL_STRUCTURAL_STATEMENT = re.compile(
+    r"(?isx)^\s*(?:"
+    r"values\s*\(|"
+    r"grant\s+(?:all(?:\s+privileges)?|select|insert|update|delete|truncate|"
+    r"references|trigger|usage|execute|connect|create|temporary|temp)\b.*\bon\b.*\bto\b|"
+    r"revoke\s+(?:all(?:\s+privileges)?|select|insert|update|delete|truncate|"
+    r"references|trigger|usage|execute|connect|create|temporary|temp)\b.*\bon\b.*\bfrom\b|"
+    r"copy\s+(?:\([^)]*\)|[A-Za-z_][A-Za-z0-9_$]*"
+    r"(?:\.[A-Za-z_][A-Za-z0-9_$]*)*)(?:\s*\([^)]*\))?\s+(?:to|from)\b|"
+    r"insert\s+into\b|update\s+[^\s;]+\s+set\b|delete\s+from\b|merge\s+into\b|"
+    r"create\s+(?:or\s+replace\s+)?(?:materialized\s+)?"
+    r"(?:table|view|index|schema|database|function|procedure|type|role)\b|"
+    r"alter\s+(?:materialized\s+)?"
+    r"(?:table|view|index|schema|database|function|procedure|type|role)\b|"
+    r"drop\s+(?:materialized\s+)?"
+    r"(?:table|view|index|schema|database|function|procedure|type|role)\b|"
+    r"truncate(?:\s+table)?\s+(?:only\s+)?[A-Za-z_][A-Za-z0-9_$]*\b|"
+    r"vacuum(?:\s*\([^)]*\))?(?:\s|;|$)|"
+    r"call\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*\(|"
     r"begin(?:\s+(?:work|transaction))?\s*;?\s*$|"
     r"commit(?:\s+(?:work|transaction))?\s*;?\s*$|"
     r"rollback(?:\s+(?:work|transaction))?\s*;?\s*$|"
-    r"set\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*(?:=|to\b)|"
-    r"analyze(?:\s|;|$)"
+    r"set\s+(?:(?:local|session)\s+)?"
+    r"[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*(?:=|to\b)|"
+    r"analyze(?:\s*\([^)]*\))?(?:\s|;|$)"
     r")"
 )
-_SQL_DIRECT_COMMAND = re.compile(
-    r"(?is)^\s*(?:"
-    r"vacuum(?:\s|;|$)|call\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*\(|"
-    r"begin(?:\s+(?:work|transaction))?\s*;?\s*$|"
-    r"commit(?:\s+(?:work|transaction))?\s*;?\s*$|"
-    r"rollback(?:\s+(?:work|transaction))?\s*;?\s*$|"
-    r"set\s+[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\s*(?:=|to\b)|"
-    r"analyze(?:\s|;|$)"
-    r")"
+_SQL_QUERY_CANDIDATE = re.compile(
+    r"(?is)^\s*(?:select\s+|with\s+(?:recursive\s+)?"
+    r"[A-Za-z_][A-Za-z0-9_$]*\s+as\s*\()"
 )
 _FORBIDDEN_KEY_TOKENS = frozenset(
     {
@@ -646,30 +652,15 @@ def _scan_safe(value: object, *, key: str | None = None) -> None:
 
 
 def _is_complete_sql(value: str) -> bool:
-    if _SQL_COMMAND.search(value) is None:
-        return False
-    if _SQL_DIRECT_COMMAND.search(value) is not None:
+    if _SQL_STRUCTURAL_STATEMENT.search(value) is not None:
         return True
+    if _SQL_QUERY_CANDIDATE.search(value) is None:
+        return False
     try:
         statements = sqlglot.parse(value, read="postgres")
     except sqlglot.errors.SqlglotError:
-        return True
-    statement_types = (
-        exp.Query,
-        exp.DDL,
-        exp.DML,
-        exp.Values,
-        exp.Grant,
-        exp.Revoke,
-        exp.Drop,
-        exp.Alter,
-        exp.Command,
-        exp.Transaction,
-        exp.Commit,
-        exp.Set,
-        exp.Analyze,
-    )
-    return not statements or any(isinstance(statement, statement_types) for statement in statements)
+        return False
+    return any(isinstance(statement, exp.Query) for statement in statements)
 
 
 def _dump(model: Week3RunReport | Week3CaseResult) -> dict[str, object]:
@@ -808,7 +799,17 @@ def _write_text_at(directory_fd: int, name: str, contents: str) -> _FileBinding:
         raise
 
 
-def _validate_file_binding(binding: _FileBinding) -> None:
+def _close_verification_fd(reservation: Week3ReportReservation, fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        reservation._close_unknown = True
+
+
+def _validate_file_binding(
+    reservation: Week3ReportReservation,
+    binding: _FileBinding,
+) -> None:
     if binding.closed:
         raise OSError("Week 3 report inventory changed")
     verification_fd = _open_regular_at(binding.directory_fd, binding.name)
@@ -822,13 +823,13 @@ def _validate_file_binding(binding: _FileBinding) -> None:
         if _identity(final_entry) != binding.identity or final_entry.st_size != binding.size:
             raise OSError("Week 3 report inventory changed")
     finally:
-        os.close(verification_fd)
+        _close_verification_fd(reservation, verification_fd)
 
 
 def _validate_file_bindings(reservation: Week3ReportReservation) -> None:
     try:
         for binding in reservation._file_bindings:
-            _validate_file_binding(binding)
+            _validate_file_binding(reservation, binding)
     except OSError:
         reservation._foreign_content = True
         raise

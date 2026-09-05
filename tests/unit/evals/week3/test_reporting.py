@@ -714,8 +714,11 @@ def test_recursive_boundary_allows_plain_sentinel_and_sql_keywords_in_prose() ->
     scan(
         {
             "requested_model": "sentinel-llm",
+            "resolved_model": "grant-model",
             "error_type": "selected_from_cache",
             "detail": "please select a cached model",
+            "alternate_detail": "select a cached model",
+            "context": "with cached model metadata",
             "operation": "drop shipping is selected from cache",
         }
     )
@@ -741,6 +744,13 @@ def test_recursive_boundary_allows_plain_sentinel_and_sql_keywords_in_prose() ->
         "COMMIT",
         "SET search_path = public",
         "ANALYZE metrics",
+        "MERGE INTO target USING source ON target.id = source.id "
+        "WHEN MATCHED THEN UPDATE SET value = source.value",
+        "TRUNCATE TABLE metrics",
+        "CREATE OR REPLACE VIEW metrics_v AS SELECT 1",
+        "CREATE MATERIALIZED VIEW metrics_mv AS SELECT 1",
+        "SET LOCAL search_path = public",
+        "VACUUM(FULL) metrics",
     ),
 )
 def test_recursive_boundary_rejects_complete_sql_statements_without_parser_leaks(
@@ -757,6 +767,30 @@ def test_recursive_boundary_rejects_complete_sql_statements_without_parser_leaks
     assert sql not in captured.out
     assert sql not in captured.err
     assert all(sql not in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "please select a cached model",
+        "select a cached model",
+        "with cached model metadata",
+        "drop shipping is selected from cache",
+        "grant-model",
+        "sentinel-llm",
+    ),
+)
+def test_recursive_boundary_allows_prose_and_model_ids_without_parser_leaks(
+    value: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reporting.__dict__["_scan_safe"]({"detail": value})
+
+    captured = capsys.readouterr()
+    assert value not in captured.out
+    assert value not in captured.err
+    assert all(value not in record.getMessage() for record in caplog.records)
 
 
 def test_binding_validation_rejects_swap_between_path_check_and_digest(
@@ -828,6 +862,195 @@ def test_postcheck_internal_swap_after_digest_is_rejected(
         path.is_file() and path.read_bytes() == b"foreign-postcheck"
         for path in _quarantined_paths(reservation.parent_dir)
     )
+
+
+@pytest.mark.parametrize("phase", ("prepublish", "postpublish"))
+def test_verification_fd_closes_once_during_valid_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id=f"verification-close-normal-{phase}",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_open = cast(Callable[[int, str], int], reporting.__dict__["_open_regular_at"])
+    original_close = os.close
+    report_opens = 0
+    target_fd: int | None = None
+    target_pending = False
+    target_close_calls = 0
+
+    def track_verification_fd(directory_fd: int, name: str) -> int:
+        nonlocal report_opens, target_fd, target_pending
+        fd = original_open(directory_fd, name)
+        if name == "report.json":
+            report_opens += 1
+            target_open = 1 if phase == "prepublish" else 2
+            if report_opens == target_open:
+                target_fd = fd
+                target_pending = True
+        return fd
+
+    def track_target_close(fd: int) -> None:
+        nonlocal target_pending, target_close_calls
+        if target_pending and fd == target_fd:
+            target_close_calls += 1
+            target_pending = False
+        original_close(fd)
+
+    with monkeypatch.context() as context:
+        context.setattr(reporting, "_open_regular_at", track_verification_fd)
+        context.setattr(os, "close", track_target_close)
+        published = write_week3_report(reservation, _report(reservation.run_id))
+
+    assert published.report_json.is_file()
+    assert target_close_calls == 1
+    assert not target_pending
+    assert not reservation.close_unknown
+    assert reservation.closed
+
+
+@pytest.mark.parametrize("phase", ("prepublish", "postpublish"))
+@pytest.mark.parametrize("failure_mode", ("before_syscall", "after_syscall_reuse"))
+def test_verification_fd_close_error_does_not_reverse_valid_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    failure_mode: str,
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id=f"verification-close-{phase}-{failure_mode}",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_open = cast(Callable[[int, str], int], reporting.__dict__["_open_regular_at"])
+    original_close = os.close
+    sentinel_read, sentinel_write = os.pipe()
+    report_opens = 0
+    target_fd: int | None = None
+    close_calls = 0
+
+    def track_verification_fd(directory_fd: int, name: str) -> int:
+        nonlocal report_opens, target_fd
+        fd = original_open(directory_fd, name)
+        if name == "report.json":
+            report_opens += 1
+            target_open = 1 if phase == "prepublish" else 2
+            if report_opens == target_open:
+                target_fd = fd
+        return fd
+
+    def fail_target_once(fd: int) -> None:
+        nonlocal close_calls
+        if fd == target_fd:
+            close_calls += 1
+            if failure_mode == "after_syscall_reuse":
+                original_close(fd)
+                os.dup2(sentinel_read, fd)
+            raise OSError("fixed verification close failure")
+        original_close(fd)
+
+    with monkeypatch.context() as context:
+        context.setattr(reporting, "_open_regular_at", track_verification_fd)
+        context.setattr(os, "close", fail_target_once)
+        published = write_week3_report(reservation, _report(reservation.run_id))
+
+    assert published.report_json.is_file()
+    assert close_calls == 1
+    assert reservation.close_unknown
+    assert reservation.closed
+    assert target_fd is not None
+    os.fstat(target_fd)
+    original_close(target_fd)
+    original_close(sentinel_read)
+    original_close(sentinel_write)
+
+
+def test_persistent_verification_fd_close_errors_attempt_every_fd_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id="persistent-verification-close",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_open = cast(Callable[[int, str], int], reporting.__dict__["_open_regular_at"])
+    original_close = os.close
+    verification_fds: list[int] = []
+    close_calls: list[int] = []
+
+    def track_verification_fd(directory_fd: int, name: str) -> int:
+        fd = original_open(directory_fd, name)
+        verification_fds.append(fd)
+        return fd
+
+    def fail_every_verification_close(fd: int) -> None:
+        if fd in verification_fds:
+            close_calls.append(fd)
+            raise OSError("fixed persistent verification close failure")
+        original_close(fd)
+
+    with monkeypatch.context() as context:
+        context.setattr(reporting, "_open_regular_at", track_verification_fd)
+        context.setattr(os, "close", fail_every_verification_close)
+        published = write_week3_report(reservation, _report(reservation.run_id))
+
+    assert published.report_json.is_file()
+    assert close_calls == verification_fds
+    assert len(close_calls) == len(set(close_calls))
+    assert reservation.close_unknown
+    assert reservation.closed
+    for fd in verification_fds:
+        original_close(fd)
+
+
+def test_verification_fd_close_error_does_not_mask_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reservation = reserve_week3_report(
+        tmp_path,
+        mode="fixture",
+        run_id="verification-primary-failure",
+        timestamp=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    original_open = cast(Callable[[int, str], int], reporting.__dict__["_open_regular_at"])
+    original_validate = reporting.__dict__["_validate_opened_binding"]
+    original_close = os.close
+    target_fd: int | None = None
+
+    def track_verification_fd(directory_fd: int, name: str) -> int:
+        nonlocal target_fd
+        fd = original_open(directory_fd, name)
+        if name == "report.json" and target_fd is None:
+            target_fd = fd
+        return fd
+
+    def fail_validation(binding: Any, verification_fd: int) -> None:
+        original_validate(binding, verification_fd)
+        if verification_fd == target_fd:
+            raise OSError("fixed validation failure")
+
+    def fail_target_close(fd: int) -> None:
+        if fd == target_fd:
+            raise OSError("fixed verification close failure")
+        original_close(fd)
+
+    with monkeypatch.context() as context:
+        context.setattr(reporting, "_open_regular_at", track_verification_fd)
+        context.setattr(reporting, "_validate_opened_binding", fail_validation)
+        context.setattr(os, "close", fail_target_close)
+        with pytest.raises(OSError, match=r"^fixed validation failure$"):
+            write_week3_report(reservation, _report(reservation.run_id))
+
+    assert reservation.close_unknown
+    assert not reservation.final_dir.exists()
+    assert target_fd is not None
+    original_close(target_fd)
 
 
 def test_cleanup_rechecks_leaf_binding_immediately_before_unlink(
