@@ -1,5 +1,7 @@
 # Golden Questions 优化策略
 
+> 2026-09-07 用途更正：现有 Week1/Week2/Week3 题目（包括已查看的 heldout）属于已见历史/回归材料，不再作为独立最终测试集。后续共同测试集按[固定测试集与隔离评测规则](static-benchmark-policy.md)另行封存；下文的历史分层和成绩保持不变。
+
 ## 目标
 
 现有 `G001`–`G020` 是第 1 周裸 Text-to-SQL 的 core v1。DeepSeek v1/v2 live 已在不修改题目、Oracle 或

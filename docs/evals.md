@@ -52,7 +52,8 @@ USD/CNY 6.7809 快照换算为输入 CNY 2.983596、输出 CNY 8.950788/百万 t
 [模型与价格](https://api-docs.deepseek.com/quick_start/pricing/)和
 [人民币汇率中间价](https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do)。
 
-现有 `G001`–`G020` 冻结为未调优核心集。不要直接往同一准确率中混入安全拒绝和澄清行为；扩展分层及防污染
+现有 `G001`–`G020` 保留为冻结历史/回归核心集；经过分析与诊断，不能再称为未调优测试集。独立最终验收见
+[固定测试集与隔离评测规则](static-benchmark-policy.md)。不要直接往同一准确率中混入安全拒绝和澄清行为；扩展分层及防污染
 规则见 [Golden Questions 优化策略](golden-questions-strategy.md)。live 执行和结果到第 2 周任务的映射见
 [DeepSeek live 基线运行手册](live-baseline-playbook.md)。2026-09-03 的 v1 适配器根因见
 [第 1 周 DeepSeek 裸基线 v1 分析](reports/week-1-deepseek-live-analysis-2026-09-03.md)；v2 正式结果为 5/20、
