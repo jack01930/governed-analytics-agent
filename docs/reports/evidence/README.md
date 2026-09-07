@@ -12,6 +12,14 @@
 - `week-1-live-baselines.json` 是删除生成 SQL 后的第 1 周结构化比较快照，仍保留全部 20 个
   case 的状态、分数、错误类别、tokens、延迟和成本。
 - `week-1-live-baselines.md` 是面向人工审查的第 1 周简表。
+- `week3-live-post-run-health-2026-09-05.json` 是 Week 3 live 事件后的脱敏只读健康检查；
+  它不含凭据或端点，也不代表 live 运行发生时的 Provider 状态。
 
 归档前对运行时目录、归档目录和分析文档执行 credential-like 模式扫描，未发现匹配。归档文件由 Git 提供
 不可变历史；禁止覆盖已有 run，只允许为新 run 新增目录和 manifest 版本。
+
+## 第三周收尾
+
+2026-09-07 的离线门禁、fixture 报告身份、历史哈希核验及本机 HTTP/SSE 验证见
+[收尾证据](week3-closeout-2026-09-07.json) 与 [交付记录](../week-3-closeout-2026-09-07.md)。
+本次没有新增 live；原始报告保留在第三周 worktree 的 `artifacts/evals/` 中。

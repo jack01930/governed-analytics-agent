@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "2e035f98ea8346456555555e3d4b93e7cb97450f3a96386fa7e305a44f935e8c",
+  "result": {
+    "columns": [
+      "stockout_rate"
+    ],
+    "rows": [
+      [
+        "0.04482758620689655172"
+      ]
+    ]
+  }
+}

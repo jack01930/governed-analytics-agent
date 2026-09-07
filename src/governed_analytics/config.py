@@ -1,4 +1,6 @@
 from collections.abc import Mapping
+from decimal import Decimal
+from typing import Literal
 from urllib.parse import unquote, urlsplit
 
 from pydantic import SecretStr, field_validator, model_validator
@@ -12,6 +14,61 @@ class _DatabaseSettingsBase(BaseSettings):
         extra="ignore",
         frozen=True,
     )
+
+
+class AgentRuntimeSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_prefix="AGENT_",
+        extra="ignore",
+        frozen=True,
+    )
+
+    runtime_mode: Literal["fixture", "live"] = "fixture"
+    live_enabled: bool = False
+    max_action_loops: int = 4
+    max_llm_calls: int = 8
+    max_tool_calls: int = 12
+    max_execute_calls: int = 5
+    max_profile_calls: int = 2
+    max_repairs: int = 1
+    timeout_seconds: int = 60
+    soft_cost_cny: Decimal = Decimal("0.20")
+    hard_cost_cny: Decimal = Decimal("0.30")
+    max_concurrent_runs: int = 2
+    run_retention_seconds: int = 3600
+    max_runs: int = 100
+    sse_heartbeat_seconds: int = 15
+
+    @model_validator(mode="after")
+    def validate_agent_limits(self) -> "AgentRuntimeSettings":
+        integer_limits = (
+            self.max_action_loops,
+            self.max_llm_calls,
+            self.max_tool_calls,
+            self.max_execute_calls,
+            self.max_profile_calls,
+            self.max_repairs,
+            self.timeout_seconds,
+            self.max_concurrent_runs,
+            self.run_retention_seconds,
+            self.max_runs,
+            self.sse_heartbeat_seconds,
+        )
+        if any(type(value) is not int or value <= 0 for value in integer_limits):
+            raise ValueError("agent limits must be positive integers")
+        if self.max_execute_calls > self.max_tool_calls:
+            raise ValueError("execute limit cannot exceed tool limit")
+        if self.max_profile_calls > self.max_tool_calls:
+            raise ValueError("profile limit cannot exceed tool limit")
+        if self.max_action_loops + self.max_repairs > self.max_execute_calls:
+            raise ValueError("execute limit must cover action loops and repair")
+        if not Decimal("0") < self.soft_cost_cny < self.hard_cost_cny:
+            raise ValueError("agent cost caps must be positive and ordered")
+        if self.runtime_mode == "live" and not self.live_enabled:
+            raise ValueError("live mode requires live_enabled")
+        return self
 
 
 def _validate_database_url(

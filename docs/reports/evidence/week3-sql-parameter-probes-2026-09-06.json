@@ -1,0 +1,66 @@
+{
+  "base_commit": "7bddae6",
+  "scope": "diagnostic_only_W3K011",
+  "before": [
+    {
+      "diagnostic": "plan_contract",
+      "analysis_type": "simple",
+      "hypothesis_shape_matches": true,
+      "hypothesis_kinds": [
+        "metric_value"
+      ],
+      "hypothesis_ids_match": [
+        true
+      ],
+      "metric_binding_matches": true
+    },
+    {
+      "diagnostic": "sql_parameter_contract",
+      "parameter_count": 2,
+      "missing_cast_count": 2,
+      "original_policy": "invalid_sql",
+      "adding_datetime_cast_policy": "accepted"
+    },
+    {
+      "diagnostic": "terminal",
+      "case_id": "W3K011",
+      "status": "policy_blocked",
+      "reason": "sql_policy_rejected",
+      "llm_calls": 3,
+      "input_tokens": 9183,
+      "output_tokens": 398,
+      "budget_cost_cny": "0.030960775692"
+    }
+  ],
+  "after": [
+    {
+      "diagnostic": "plan_contract",
+      "analysis_type": "simple",
+      "hypothesis_shape_matches": true,
+      "hypothesis_kinds": [
+        "metric_value"
+      ],
+      "hypothesis_ids_match": [
+        true
+      ],
+      "metric_binding_matches": true
+    },
+    {
+      "diagnostic": "sql_parameter_contract",
+      "parameter_count": 2,
+      "missing_cast_count": 0,
+      "original_policy": "accepted",
+      "adding_datetime_cast_policy": "accepted"
+    },
+    {
+      "diagnostic": "terminal",
+      "case_id": "W3K011",
+      "status": "completed",
+      "reason": "answer_complete",
+      "llm_calls": 4,
+      "input_tokens": 10165,
+      "output_tokens": 558,
+      "budget_cost_cny": "0.035322793044"
+    }
+  ]
+}

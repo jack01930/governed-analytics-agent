@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "aa4cd2bc9ddf80d84a14e1022add61ce1dc6963c301a4eab3622881ea483b6ad",
+  "result": {
+    "columns": [
+      "refund_rate"
+    ],
+    "rows": [
+      [
+        "0.01770345140738532367"
+      ]
+    ]
+  }
+}

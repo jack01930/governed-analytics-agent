@@ -1,0 +1,103 @@
+{
+  "implementation_commit": "a4a580c",
+  "scope": "diagnostic_only_W3K026",
+  "observations": [
+    {
+      "diagnostic": "windows",
+      "labels": [
+        "w1",
+        "w2"
+      ],
+      "days": [
+        7,
+        7
+      ],
+      "chronological": true
+    },
+    {
+      "purpose": "confirm_decline",
+      "subtraction_count": 1,
+      "filter_clause_count": 0,
+      "case_expression_count": 0
+    },
+    {
+      "purpose": "region_contribution",
+      "subtraction_count": 1,
+      "filter_clause_count": 0,
+      "case_expression_count": 0
+    },
+    {
+      "purpose": "sku_contribution",
+      "subtraction_count": 1,
+      "filter_clause_count": 0,
+      "case_expression_count": 0
+    },
+    {
+      "purpose": "segment_contribution",
+      "subtraction_count": 1,
+      "filter_clause_count": 0,
+      "case_expression_count": 0
+    },
+    {
+      "terminal": "answer_complete",
+      "llm_calls": 7,
+      "cost_cny": "0.141858055416",
+      "input_tokens": 36665,
+      "output_tokens": 3627
+    },
+    {
+      "purpose": "confirm_decline",
+      "score": {
+        "result_score": "1",
+        "output_contract_conformant": true,
+        "answer_contract_validated": true,
+        "execution_succeeded": true,
+        "possibly_truncated": false,
+        "strict_pass": true
+      }
+    },
+    {
+      "diagnostic": "comparison_values",
+      "both_zero": false,
+      "current_matches": true,
+      "previous_matches": true,
+      "swapped_matches": false,
+      "actual_decreased": true,
+      "rate_null": false,
+      "rate_negative": true
+    },
+    {
+      "purpose": "region_contribution",
+      "score": {
+        "result_score": "0",
+        "output_contract_conformant": true,
+        "answer_contract_validated": true,
+        "execution_succeeded": true,
+        "possibly_truncated": false,
+        "strict_pass": false
+      }
+    },
+    {
+      "purpose": "sku_contribution",
+      "score": {
+        "result_score": "0",
+        "output_contract_conformant": true,
+        "answer_contract_validated": true,
+        "execution_succeeded": true,
+        "possibly_truncated": false,
+        "strict_pass": false
+      }
+    },
+    {
+      "purpose": "segment_contribution",
+      "score": {
+        "result_score": "0",
+        "output_contract_conformant": true,
+        "answer_contract_validated": true,
+        "execution_succeeded": true,
+        "possibly_truncated": false,
+        "strict_pass": false
+      }
+    }
+  ]
+}

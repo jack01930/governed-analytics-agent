@@ -52,7 +52,8 @@ USD/CNY 6.7809 快照换算为输入 CNY 2.983596、输出 CNY 8.950788/百万 t
 [模型与价格](https://api-docs.deepseek.com/quick_start/pricing/)和
 [人民币汇率中间价](https://www.safe.gov.cn/AppStructured/hlw/RMBQuery.do)。
 
-现有 `G001`–`G020` 冻结为未调优核心集。不要直接往同一准确率中混入安全拒绝和澄清行为；扩展分层及防污染
+现有 `G001`–`G020` 保留为冻结历史/回归核心集；经过分析与诊断，不能再称为未调优测试集。独立最终验收见
+[固定测试集与隔离评测规则](static-benchmark-policy.md)。不要直接往同一准确率中混入安全拒绝和澄清行为；扩展分层及防污染
 规则见 [Golden Questions 优化策略](golden-questions-strategy.md)。live 执行和结果到第 2 周任务的映射见
 [DeepSeek live 基线运行手册](live-baseline-playbook.md)。2026-09-03 的 v1 适配器根因见
 [第 1 周 DeepSeek 裸基线 v1 分析](reports/week-1-deepseek-live-analysis-2026-09-03.md)；v2 正式结果为 5/20、
@@ -60,6 +61,46 @@ USD/CNY 6.7809 快照换算为输入 CNY 2.983596、输出 CNY 8.950788/百万 t
 [v2 分析](reports/week-1-deepseek-live-v2-analysis-2026-09-03.md)。可克隆的脱敏原报告、SHA-256 与全部 case
 计量见 [live 证据归档](reports/evidence/README.md)。Week 2 唯一一次获授权的 live 结果及失败模式见
 [Week 2 DeepSeek live 分析](reports/week-2-deepseek-live-analysis-2026-09-04.md)。
+
+## Week 3 Agent 分层评测
+
+Week 3 使用独立的 `week3-agent-evaluation-v1` 协议，不把 Week 2 static safety 或裸 Text-to-SQL 分数混入
+Agent 分母。fixture 固定运行 30 个 known 与 10 个 heldout 用例；live 路径排除 4 个仅用于确定性 fault/policy
+harness 的 known 用例，因此固定为 36 例。正式报告绑定 overall、known、heldout 与按 mode/有序 case ID 派生的
+executed manifest hash，subset 只能作为 `partial_test`，不能冒充正式报告。
+
+指标全部使用自身适用分母：known behavior 10、known simple 15、known attribution 1，heldout 10 独立列示；
+first/final 的 result、alias/output contract、production validation、execution、truncation、strict 分别报告。
+此外独立报告 repair、valid execute、natural refusal、tool order、verified evidence 与 budget 的
+`numerator/denominator/rate`；无适用项时 denominator 为 0、rate 为 N/A，绝不以总 40 例代替。
+
+fixture executor 为每个 case 新建 scripted model session、预算、trace 与 context，但 40 例共享一个调用方拥有的
+只读 PostgreSQL engine/tool registry。非 execute 行为用例无数据库调用；ProfileTool 会通过受控工具边界执行聚合
+SQL。报告只保留受限 trace metadata、验证和 evidence
+引用、计数、成本与安全终态，不包含 question、prompt、SQL、参数、raw rows、payload、endpoint、key 或价格来源。
+fixture 的全绿只证明 harness、tools、数据库治理、预算与 scorer 的一致性，不证明模型质量或语言泛化。
+
+```bash
+make eval-week3-fixture
+```
+
+报告写入不可覆盖目录 `artifacts/evals/week3/fixture/<timestamp>-<run-id>/`；命令另将本次 runner 返回的精确
+`report.json` 绝对路径写入 `artifacts/evals/week3/fixture-report-path.txt`，不搜索历史目录。live 命令已实现但
+本计划未授权执行；它要求 tiny dataset、显式 `--live`、`AGENT_RUNTIME_MODE=live`、
+`AGENT_LIVE_ENABLED=true`、有效模型设置/key 与 requested model 对应的公共价格快照全部通过后，才会创建
+`AsyncOpenAI(max_retries=0)`：
+
+```bash
+uv run governed-eval week3 --dataset tiny --mode live --live
+```
+
+DeepSeek 当前可能把请求别名 `deepseek-v4-flash` 原样写入 `response.model`，而价格快照的 `resolved_model`
+保存官方版本标签 `DeepSeek-V4-Flash-0731`。预算结算只接受价格快照绑定的这两个精确值，不接受任意 alias；
+Week 3 的 `resolved_models` 保留 Provider 实际返回的安全模型名。陌生或同一轮混合模型身份会 fail closed，但仍
+发布不通过的安全报告，避免因报告契约二次失败而丢失本轮结果。
+
+CI 与 Makefile 只包含 fixture 命令，不携带 key、URL、network client 或 live 开关。任何 Week 3 live 都必须在
+审阅本次离线报告后获得新的、单次明确授权。
 
 ## Week 2 活跃评测协议
 

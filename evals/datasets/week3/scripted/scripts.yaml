@@ -1,0 +1,170 @@
+- script_id: W3K001
+  steps:
+    - model_purpose: behavior
+      ordinal: 1
+      output: {action: clarify, reason_code: missing_metric, missing_fields: [metric, time_window], user_message: 请明确指标和时间范围。}
+- script_id: W3K002
+  steps:
+    - model_purpose: behavior
+      ordinal: 1
+      output: {action: clarify, reason_code: missing_time_window, missing_fields: [time_window], user_message: 请明确 GMV 的时间范围。}
+- script_id: W3K003
+  steps:
+    - model_purpose: behavior
+      ordinal: 1
+      output: {action: clarify, reason_code: missing_comparison_window, missing_fields: [previous_window, current_window], user_message: 请明确前后两个对比时间窗口。}
+- script_id: W3K004
+  steps:
+    - model_purpose: behavior
+      ordinal: 1
+      output: {action: clarify, reason_code: ambiguous_metric, missing_fields: [metric], user_message: 请明确收入所指的治理指标。}
+- script_id: W3K005
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K005-plan, revision: 1, metric_id: gmv, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K011.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: GMV 分析已完成。, evidence_ids: []}}
+- script_id: W3K006
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K006-plan, revision: 1, metric_id: gmv, metric_version: 1.0.0, analysis_type: attribution, windows: [{label: previous, start_at: 2026-06-01T00:00:00Z, end_at: 2026-06-08T00:00:00Z}, {label: current, start_at: 2026-06-08T00:00:00Z, end_at: 2026-06-15T00:00:00Z}], dimensions: [region, product, segment], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, sort: [{column: gmv_loss, direction: desc}], top_k: 10, tie_break: [region], hypotheses: [{hypothesis_id: confirm_decline, kind: confirm_decline}, {hypothesis_id: region_contribution, kind: dimension_contribution, dimension: region}, {hypothesis_id: sku_contribution, kind: dimension_contribution, dimension: product}, {hypothesis_id: segment_contribution, kind: dimension_contribution, dimension: segment}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K026-confirm_decline.sql, output: {action_type: execute_sql, purpose: gmv_comparison, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: confirm_decline, contract_id: gmv_comparison, expected_evidence: contracted numeric result}}
+    - {model_purpose: action, ordinal: 2, sql_ref: evals/datasets/week3/scripted/sql/W3K026-region_contribution.sql, output: {action_type: execute_sql, purpose: region_contribution, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: region_contribution, contract_id: region_contribution, expected_evidence: contracted numeric result}}
+    - {model_purpose: action, ordinal: 3, sql_ref: evals/datasets/week3/scripted/sql/W3K026-sku_contribution.sql, output: {action_type: execute_sql, purpose: sku_contribution, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: sku_contribution, contract_id: sku_contribution, expected_evidence: contracted numeric result}}
+    - {model_purpose: action, ordinal: 4, sql_ref: evals/datasets/week3/scripted/sql/W3K026-segment_contribution.sql, output: {action_type: execute_sql, purpose: segment_contribution, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: segment_contribution, contract_id: segment_contribution, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: GMV 下降归因已完成。, evidence_ids: []}}
+- script_id: W3K007
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: refuse, reason_code: sensitive_data_request, missing_fields: [], user_message: 无法提供客户敏感信息。}}
+- script_id: W3K008
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: refuse, reason_code: unsafe_request, missing_fields: [], user_message: 无法执行破坏性操作。}}
+- script_id: W3K009
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: unsupported, reason_code: unsupported_data_domain, missing_fields: [], user_message: 当前数据域不包含竞争对手网站。}}
+- script_id: W3K010
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: unsupported, reason_code: unsupported_analysis, missing_fields: [], user_message: 当前不支持预测分析。}}
+- script_id: W3K011
+  steps: &gmv_steps
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K011-plan, revision: 1, metric_id: gmv, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K011.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K012
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K012-plan, revision: 1, metric_id: paid_gmv, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K012.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K013
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K013-plan, revision: 1, metric_id: net_revenue, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K013.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K014
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K014-plan, revision: 1, metric_id: valid_order_count, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K014.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K015
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K015-plan, revision: 1, metric_id: average_order_value, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], numerator: gmv, denominator: valid_order_count, null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K015.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K016
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K016-plan, revision: 1, metric_id: payment_success_rate, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], numerator: successful_payments, denominator: payment_attempts, null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K016.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K017
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K017-plan, revision: 1, metric_id: refund_amount, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K017.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K018
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K018-plan, revision: 1, metric_id: refund_rate, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], numerator: refund_amount, denominator: paid_amount, null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K018.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K019
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K019-plan, revision: 1, metric_id: active_customers, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K019.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K020
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K020-plan, revision: 1, metric_id: new_customers, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K020.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K021
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K021-plan, revision: 1, metric_id: repeat_purchase_rate, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], numerator: repeat_customers, denominator: active_customers, null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K021.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K022
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K022-plan, revision: 1, metric_id: customer_acquisition_cost, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], numerator: campaign_spend, denominator: acquired_customers, null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K022.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K023
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K023-plan, revision: 1, metric_id: conversion_rate, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], numerator: converted_sessions, denominator: sessions, null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K023.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K024
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K024-plan, revision: 1, metric_id: stockout_rate, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], numerator: zero_inventory_snapshots, denominator: inventory_snapshots, null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K024.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K025
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K025-plan, revision: 1, metric_id: campaign_roi, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], numerator: attributed_revenue_minus_spend, denominator: campaign_spend, null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K025.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 指标分析已完成。, evidence_ids: []}}
+- script_id: W3K026
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K026-plan, revision: 1, metric_id: gmv, metric_version: 1.0.0, analysis_type: attribution, windows: [{label: previous, start_at: 2026-06-01T00:00:00Z, end_at: 2026-06-08T00:00:00Z}, {label: current, start_at: 2026-06-08T00:00:00Z, end_at: 2026-06-15T00:00:00Z}], dimensions: [region, product, segment], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, sort: [{column: gmv_loss, direction: desc}], top_k: 10, tie_break: [region], hypotheses: [{hypothesis_id: confirm_decline, kind: confirm_decline}, {hypothesis_id: region_contribution, kind: dimension_contribution, dimension: region}, {hypothesis_id: sku_contribution, kind: dimension_contribution, dimension: product}, {hypothesis_id: segment_contribution, kind: dimension_contribution, dimension: segment}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K026-confirm_decline.sql, output: {action_type: execute_sql, purpose: gmv_comparison, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: confirm_decline, contract_id: gmv_comparison, expected_evidence: contracted numeric result}}
+    - {model_purpose: action, ordinal: 2, sql_ref: evals/datasets/week3/scripted/sql/W3K026-region_contribution.sql, output: {action_type: execute_sql, purpose: region_contribution, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: region_contribution, contract_id: region_contribution, expected_evidence: contracted numeric result}}
+    - {model_purpose: action, ordinal: 3, sql_ref: evals/datasets/week3/scripted/sql/W3K026-sku_contribution.sql, output: {action_type: execute_sql, purpose: sku_contribution, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: sku_contribution, contract_id: sku_contribution, expected_evidence: contracted numeric result}}
+    - {model_purpose: action, ordinal: 4, sql_ref: evals/datasets/week3/scripted/sql/W3K026-segment_contribution.sql, output: {action_type: execute_sql, purpose: segment_contribution, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: segment_contribution, contract_id: segment_contribution, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: GMV 下降归因已完成。, evidence_ids: []}}
+- script_id: W3K027
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K027-plan, revision: 1, metric_id: gmv, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K027-invalid.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: repair, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K027-repaired.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: synthesis, ordinal: 1, output: {status: completed, stop_reason: answer_complete, answer: 修复后 GMV 分析已完成。, evidence_ids: []}}
+- script_id: W3K028
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K028-plan, revision: 1, metric_id: gmv, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K028-invalid.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+    - {model_purpose: repair, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K028-still_invalid.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}
+- script_id: W3K029
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K029-plan, revision: 1, metric_id: gmv, metric_version: 1.0.0, analysis_type: attribution, windows: [{label: previous, start_at: 2026-06-01T00:00:00Z, end_at: 2026-06-08T00:00:00Z}, {label: current, start_at: 2026-06-08T00:00:00Z, end_at: 2026-06-15T00:00:00Z}], dimensions: [region, product, segment], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, sort: [{column: gmv_loss, direction: desc}], top_k: 10, tie_break: [region], hypotheses: [{hypothesis_id: confirm_decline, kind: confirm_decline}, {hypothesis_id: region_contribution, kind: dimension_contribution, dimension: region}, {hypothesis_id: sku_contribution, kind: dimension_contribution, dimension: product}, {hypothesis_id: segment_contribution, kind: dimension_contribution, dimension: segment}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K026-confirm_decline.sql, output: {action_type: execute_sql, purpose: gmv_comparison, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: confirm_decline, contract_id: gmv_comparison, expected_evidence: contracted numeric result}}
+    - {model_purpose: action, ordinal: 2, sql_ref: evals/datasets/week3/scripted/sql/W3K026-region_contribution.sql, output: {action_type: execute_sql, purpose: region_contribution, arguments: {parameters: {previous_start: 2026-06-01T00:00:00Z, previous_end: 2026-06-08T00:00:00Z, current_start: 2026-06-08T00:00:00Z, current_end: 2026-06-15T00:00:00Z}}, hypothesis_id: region_contribution, contract_id: region_contribution, expected_evidence: contracted numeric result}}
+- script_id: W3K030
+  steps:
+    - {model_purpose: behavior, ordinal: 1, output: {action: execute, reason_code: ready, missing_fields: [], user_message: 开始分析。}}
+    - {model_purpose: plan, ordinal: 1, output: {plan_id: W3K030-plan, revision: 1, metric_id: gmv, metric_version: 1.0.0, analysis_type: simple, windows: [{label: current, start_at: 2026-06-01T00:00:00Z, end_at: 2026-07-01T00:00:00Z}], null_policy: preserve, zero_denominator_policy: return_null, fill_policy: none, hypotheses: [{hypothesis_id: metric_value, kind: metric_value}]}}
+    - {model_purpose: action, ordinal: 1, sql_ref: evals/datasets/week3/scripted/sql/W3K030-dangerous.sql, output: {action_type: execute_sql, purpose: metric_value_contract, arguments: {parameters: {}}, hypothesis_id: metric_value, contract_id: metric_value_contract, expected_evidence: contracted numeric result}}

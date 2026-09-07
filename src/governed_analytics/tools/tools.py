@@ -10,7 +10,6 @@ from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
 
@@ -35,6 +34,7 @@ from .contracts import (
     ToolError,
     ToolResponse,
 )
+from .execution import AsyncEngineSqlExecutionBackend, SqlExecutionBackend
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 _MIGRATION_PATH = _REPOSITORY_ROOT / "migrations/versions/0001_create_ecommerce_schema.py"
@@ -321,8 +321,16 @@ def _profile_query(request: ProfileRequest, table: TableInfo) -> tuple[str, dict
 class ProfileTool:
     """Translate structured requests into fixed, allowlisted query templates."""
 
-    def __init__(self, execute: ProfileExecutor | None = None) -> None:
+    def __init__(
+        self,
+        execute: ProfileExecutor | None = None,
+        *,
+        backend: SqlExecutionBackend | None = None,
+    ) -> None:
+        if execute is not None and backend is not None:
+            raise ValueError("choose execute or backend")
         self._execute = execute
+        self._backend = backend
 
     async def run(self, request: ProfileRequest) -> ToolResponse[ProfileResult]:
         table = _TABLES.get(request.table_name)
@@ -343,9 +351,10 @@ class ProfileTool:
         except ValueError:
             return _error(ErrorCode.INVALID_REQUEST, "invalid profile request")
         try:
-            result = await (
-                self._execute(sql, params) if self._execute is not None else _run_sql(sql, params)
-            )
+            if self._execute is not None:
+                result = await self._execute(sql, params)
+            else:
+                result = await _run_sql(sql, params, backend=self._backend)
         except Exception:
             return _error(ErrorCode.EXECUTION_FAILED, "profile query failed", retryable=True)
         if not result.ok or result.data is None:
@@ -466,25 +475,7 @@ def _ordered_sql_parameters(
 async def _execute(validated: ValidatedSql, params: tuple[object, ...]) -> QueryResult:
     engine = create_async_database_engine(DatabaseSettings())  # type: ignore[call-arg]
     try:
-        async with engine.connect() as connection, connection.begin():
-            await connection.execute(
-                text("set transaction isolation level repeatable read, read only")
-            )
-            await connection.execute(text("set local statement_timeout = '10s'"))
-            await connection.execute(text("set local search_path = public, pg_catalog"))
-            await connection.execute(text("set local time zone 'UTC'"))
-            execution = await connection.exec_driver_sql(
-                validated.driver_sql or validated.sql,
-                params,
-            )
-            rows = tuple(tuple(row) for row in execution.fetchall())
-            return QueryResult(
-                query_id=validated.query_id,
-                columns=tuple(map(str, execution.keys())),
-                rows=rows,
-                row_count=len(rows),
-                possibly_truncated=len(rows) == validated.row_limit,
-            )
+        return await AsyncEngineSqlExecutionBackend(engine).execute(validated, params)
     finally:
         await engine.dispose()
 
@@ -492,6 +483,8 @@ async def _execute(validated: ValidatedSql, params: tuple[object, ...]) -> Query
 async def _run_sql(
     sql: str,
     params: Mapping[str, object] | None = None,
+    *,
+    backend: SqlExecutionBackend | None = None,
 ) -> ToolResponse[QueryResult]:
     try:
         validated = validate_sql(sql)
@@ -505,7 +498,12 @@ async def _run_sql(
     except (TypeError, ValueError):
         return _error(ErrorCode.INVALID_REQUEST, "invalid SQL parameter value")
     try:
-        return ToolResponse(ok=True, data=await _execute(validated, ordered_params))
+        result = await (
+            _execute(validated, ordered_params)
+            if backend is None
+            else backend.execute(validated, ordered_params)
+        )
+        return ToolResponse(ok=True, data=result)
     except Exception as error:
         if _is_timeout(error):
             return _error(ErrorCode.QUERY_TIMEOUT, "query timed out", retryable=True)
@@ -519,5 +517,8 @@ async def _run_sql(
 class ExecuteSqlTool:
     """The only arbitrary read-only SQL entry point for the future agent layer."""
 
+    def __init__(self, backend: SqlExecutionBackend | None = None) -> None:
+        self._backend = backend
+
     async def run(self, request: ExecuteSqlRequest) -> ToolResponse[QueryResult]:
-        return await _run_sql(request.sql, request.parameters)
+        return await _run_sql(request.sql, request.parameters, backend=self._backend)

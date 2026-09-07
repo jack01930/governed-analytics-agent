@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "299befe37cc6b7066f335c91ad36e9e23d6f6e9d7069c1f26349b0c02f8970c9",
+  "result": {
+    "columns": [
+      "valid_order_count"
+    ],
+    "rows": [
+      [
+        243
+      ]
+    ]
+  }
+}

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from governed_analytics.safety.sql_policy import ValidatedSql
 from governed_analytics.tools import (
     ColumnInfo,
     ErrorCode,
@@ -30,6 +31,35 @@ from governed_analytics.tools.tools import _profile_filter_value
 
 class _IntegerEnum(IntEnum):
     VALUE = 1
+
+
+class SpySqlExecutionBackend:
+    def __init__(
+        self,
+        result: QueryResult | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        self.result = result or QueryResult(
+            query_id="a" * 64,
+            columns=("value",),
+            rows=((1,),),
+            row_count=1,
+        )
+        self.error = error
+        self.calls = 0
+        self.disposed = 0
+        self.parameters: list[tuple[object, ...]] = []
+
+    async def execute(
+        self,
+        _validated: ValidatedSql,
+        parameters: tuple[object, ...],
+    ) -> QueryResult:
+        self.calls += 1
+        self.parameters.append(parameters)
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 def test_schema_is_static_and_unknown_tables_are_safe() -> None:
@@ -206,6 +236,152 @@ def test_execute_request_rejects_non_json_or_unbounded_parameter_values(value: o
 
 def test_execute_tool_has_no_public_unvalidated_sql_bypass() -> None:
     assert not hasattr(ExecuteSqlTool(), "run_sql")
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_uses_injected_backend_without_disposing_it() -> None:
+    backend = SpySqlExecutionBackend(
+        result=QueryResult(
+            query_id="a" * 64,
+            columns=("value",),
+            rows=((1,),),
+            row_count=1,
+        )
+    )
+
+    response = await ExecuteSqlTool(backend=backend).run(
+        ExecuteSqlRequest(sql="select 1 as value")
+    )
+
+    assert response.ok
+    assert backend.calls == 1
+    assert backend.disposed == 0
+
+
+def test_profile_rejects_two_execution_injection_paths() -> None:
+    async def execute(
+        _sql: str, _params: Mapping[str, object]
+    ) -> ToolResponse[QueryResult]:
+        raise AssertionError("not called")
+
+    with pytest.raises(ValueError, match="choose execute or backend"):
+        ProfileTool(execute, backend=SpySqlExecutionBackend())
+
+
+@pytest.mark.asyncio
+async def test_injected_backend_receives_typed_parameters_for_execute_and_profile() -> None:
+    backend = SpySqlExecutionBackend()
+
+    execute = await ExecuteSqlTool(backend=backend).run(
+        ExecuteSqlRequest(
+            sql=(
+                "select cast(:amount as numeric(14,2)) as value, "
+                "cast(:ordered_at as timestamptz) as ordered_at"
+            ),
+            parameters={
+                "amount": "10.25",
+                "ordered_at": "2026-06-01T00:00:00Z",
+            },
+        )
+    )
+    profile = await ProfileTool(backend=backend).run(
+        ProfileRequest(
+            table_name="orders",
+            column_name="region",
+            filters=(ProfileFilter(column_name="status", value="paid"),),
+        )
+    )
+
+    assert execute.ok and profile.ok
+    assert backend.calls == 2
+    assert backend.disposed == 0
+    assert backend.parameters[0] == (
+        Decimal("10.25"),
+        datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    assert backend.parameters[1] == ("paid",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sql_request", "expected_code"),
+    [
+        (ExecuteSqlRequest(sql="drop table orders"), ErrorCode.SQL_REJECTED),
+        (
+            ExecuteSqlRequest(
+                sql="select cast(:wanted as integer) as value",
+                parameters={"other": 1},
+            ),
+            ErrorCode.SQL_REJECTED,
+        ),
+        (
+            ExecuteSqlRequest(
+                sql="select cast(:value as integer) as value",
+                parameters={"value": True},
+            ),
+            ErrorCode.INVALID_REQUEST,
+        ),
+    ],
+)
+async def test_shared_and_default_rejections_are_equivalent_and_never_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    sql_request: ExecuteSqlRequest,
+    expected_code: ErrorCode,
+) -> None:
+    default_calls = 0
+
+    async def execute(_validated: ValidatedSql, _params: tuple[object, ...]) -> QueryResult:
+        nonlocal default_calls
+        default_calls += 1
+        raise AssertionError("rejected input must not execute")
+
+    monkeypatch.setattr("governed_analytics.tools.tools._execute", execute)
+    backend = SpySqlExecutionBackend()
+
+    default = await ExecuteSqlTool().run(sql_request)
+    shared = await ExecuteSqlTool(backend=backend).run(sql_request)
+
+    assert default.error is not None and shared.error is not None
+    assert (default.error.code, default.error.retryable) == (
+        shared.error.code,
+        shared.error.retryable,
+    ) == (expected_code, False)
+    assert default_calls == backend.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (TimeoutError("private timeout"), ErrorCode.QUERY_TIMEOUT),
+        (RuntimeError("private database error"), ErrorCode.EXECUTION_FAILED),
+    ],
+)
+async def test_shared_and_default_execution_errors_are_equivalent(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    expected_code: ErrorCode,
+) -> None:
+    default_calls = 0
+
+    async def execute(_validated: ValidatedSql, _params: tuple[object, ...]) -> QueryResult:
+        nonlocal default_calls
+        default_calls += 1
+        raise error
+
+    monkeypatch.setattr("governed_analytics.tools.tools._execute", execute)
+    backend = SpySqlExecutionBackend(error=error)
+    request = ExecuteSqlRequest(sql="select 1 as value")
+
+    default = await ExecuteSqlTool().run(request)
+    shared = await ExecuteSqlTool(backend=backend).run(request)
+
+    assert default.error is not None and shared.error is not None
+    assert (default.error.code, default.error.retryable) == (
+        shared.error.code,
+        shared.error.retryable,
+    ) == (expected_code, True)
+    assert default_calls == backend.calls == 1
 
 
 def test_schema_contract_has_keys_types_nullability_enums_and_foreign_keys() -> None:
@@ -745,6 +921,10 @@ async def test_execute_timeout_is_sanitized_and_retryable(
 async def test_execute_uses_fixed_readonly_runtime_and_disposes_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://analytics_readonly:test@127.0.0.1:5432/test",
+    )
     control_statements: list[str] = []
     driver_calls: list[tuple[str, tuple[object, ...]]] = []
 

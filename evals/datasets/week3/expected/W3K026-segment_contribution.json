@@ -1,0 +1,31 @@
+{
+  "oracle_query_id": "f14d2c73e3f112cd473faecaa4d6302ab7948822eed80a28ec3eee2ea7aedba7",
+  "result": {
+    "columns": [
+      "segment",
+      "previous_gmv",
+      "current_gmv",
+      "delta"
+    ],
+    "rows": [
+      [
+        "regular",
+        "32122.49",
+        "7166.08",
+        "-24956.41"
+      ],
+      [
+        "new",
+        "9243.14",
+        "4543.86",
+        "-4699.28"
+      ],
+      [
+        "vip",
+        "9508.17",
+        "6183.56",
+        "-3324.61"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,154 @@
+{
+  "date": "2026-09-07",
+  "verified_source_commit": "c3cec5e",
+  "new_live_calls": 0,
+  "checks": {
+    "make check": {
+      "ruff": "passed",
+      "mypy_source_files": 158,
+      "unit_passed": 1725
+    },
+    "make test-integration": {
+      "passed": 86
+    },
+    "make data-verify": "tiny verified"
+  },
+  "fixtures": [
+    {
+      "report_json": "artifacts/evals/baseline/fixture/20260907T084306Z-7a6f2215acdf4fd68f026ee038883aac/report.json",
+      "report_sha256": "bf91e12c032bc7c17e2c9a3cfe90e4d51388086e561c7f72671b6092dcd73c3e",
+      "run_id": "7a6f2215acdf4fd68f026ee038883aac",
+      "cases": 20,
+      "mode": "fixture"
+    },
+    {
+      "report_json": "artifacts/evals/week2/fixture/20260907T084307Z-22212c50cdcc45c0ab72f568c55e95ea/report.json",
+      "report_sha256": "b0d83a0cd2bcf35e3451001a5fc0471ab39fda8c5f898cbc800be42a9a9fd5f6",
+      "run_id": "22212c50cdcc45c0ab72f568c55e95ea",
+      "cases": 70,
+      "mode": "fixture"
+    },
+    {
+      "report_json": "artifacts/evals/week3/fixture/20260907T084311Z-week3-20260907T084311Z-b1404e4a/report.json",
+      "report_sha256": "e799aed6dee677d691850a34b225d12ddc39d5593494e2c4584e25297a41f4f7",
+      "run_id": "week3-20260907T084311Z-b1404e4a",
+      "cases": 40,
+      "mode": "fixture"
+    }
+  ],
+  "week3": {
+    "passed_count": 40,
+    "case_count": 40,
+    "simple_strict_passed": 15,
+    "behavior_passed": 10,
+    "budget_conformant_count": 40,
+    "overall_manifest_sha256": "c0ec7ff77b5927210fdeda1648e32ecc71f3819d6724b0eea5092a262bb4e577",
+    "executed_manifest_sha256": "44291f95af7daab1dd0b96cbe6fb1377ed0efbf44cc228a7330bb46779587f53"
+  },
+  "dataset_id": "a18da5f8cb690da17e66774488f932f0f3bee2853de80150d142614b8d53c8b2",
+  "week2_manifest_sha256": "ec5e210d8be4391903904ef65f4c1dcd5b8c7d0898a020f61e4486054ad0277d",
+  "week3_report_checks": [
+    "typed roundtrip including computed fields",
+    "deterministic Markdown",
+    "40 per-case JSON equality",
+    "safe artifact scan",
+    "0600 artifact permissions"
+  ],
+  "history": {
+    "prior_files_unchanged": 116,
+    "iterative_live_reports_unchanged": 6
+  },
+  "api_smoke": {
+    "mode": "fixture",
+    "transport": "real HTTP on loopback via uvicorn",
+    "healthz": 200,
+    "readyz": 200,
+    "cases": [
+      {
+        "run_id": "e3e04053dea54578b78bed36c373f9b8",
+        "final_status": "completed",
+        "events": 11,
+        "event_types": [
+          "run.created",
+          "run.started",
+          "behavior.decided",
+          "context.retrieved",
+          "plan.created",
+          "tool.started",
+          "tool.completed",
+          "observation.validated",
+          "hypothesis.updated",
+          "evidence.assessed",
+          "run.terminal"
+        ],
+        "tool_calls": 3,
+        "evidence_count": 1,
+        "sse_replay_passed": true,
+        "cost_cny": "0"
+      },
+      {
+        "run_id": "c786501546ed4f55bd2aeb25f9cd03ac",
+        "final_status": "completed",
+        "events": 26,
+        "event_types": [
+          "run.created",
+          "run.started",
+          "behavior.decided",
+          "context.retrieved",
+          "plan.created",
+          "tool.started",
+          "tool.completed",
+          "observation.validated",
+          "hypothesis.updated",
+          "evidence.assessed",
+          "tool.started",
+          "tool.completed",
+          "observation.validated",
+          "hypothesis.updated",
+          "evidence.assessed",
+          "tool.started",
+          "tool.completed",
+          "observation.validated",
+          "hypothesis.updated",
+          "evidence.assessed",
+          "tool.started",
+          "tool.completed",
+          "observation.validated",
+          "hypothesis.updated",
+          "evidence.assessed",
+          "run.terminal"
+        ],
+        "tool_calls": 6,
+        "evidence_count": 8,
+        "sse_replay_passed": true,
+        "cost_cny": "0"
+      }
+    ]
+  },
+  "command_logs": {
+    "check": {
+      "path": "/tmp/week3-close-check.log",
+      "sha256": "98f853745438b2e1b2de42078a5e2e4e6eb2793990bb027601fc614b39e3e74e"
+    },
+    "data": {
+      "path": "/tmp/week3-close-data.log",
+      "sha256": "b79345e494da850442e703be34780a91a5aaebd167d09cd11047a177db000986"
+    },
+    "integration": {
+      "path": "/tmp/week3-close-integration.log",
+      "sha256": "603b250f86e5cd827cc9fca4df581b1de7fc9595feecc284e7445346d20fa3b6"
+    },
+    "baseline": {
+      "path": "/tmp/week3-close-baseline.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "week2": {
+      "path": "/tmp/week3-close-week2.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "week3": {
+      "path": "/tmp/week3-close-week3.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}

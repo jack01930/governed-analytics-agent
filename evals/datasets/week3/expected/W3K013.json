@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "86797583b53386bd17d0daa38d765c9a792906db4ca45dde44d86ce07b842c7b",
+  "result": {
+    "columns": [
+      "net_revenue"
+    ],
+    "rows": [
+      [
+        "94298.73"
+      ]
+    ]
+  }
+}

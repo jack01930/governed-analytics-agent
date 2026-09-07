@@ -1,0 +1,17 @@
+{
+  "oracle_query_id": "e588186e930e0c8516844b18062224941ec61c46c0f936a75e810060e90e941b",
+  "result": {
+    "columns": [
+      "current_gmv",
+      "previous_gmv",
+      "change_rate"
+    ],
+    "rows": [
+      [
+        "17893.50",
+        "50873.80",
+        "-0.64827671610927432195"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "dac0b8ac29cf116764cdaeecd64ad16e7cc787cf442471e5ea8a29ea984f43b9",
+  "result": {
+    "columns": [
+      "repeat_purchase_rate"
+    ],
+    "rows": [
+      [
+        "0.98989898989898989899"
+      ]
+    ]
+  }
+}

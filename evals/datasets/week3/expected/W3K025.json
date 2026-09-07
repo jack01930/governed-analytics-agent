@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "a602bf8647ce13f0c572a3f8987e45a51f935e45ea92ecd1dea477c168c8179e",
+  "result": {
+    "columns": [
+      "campaign_roi"
+    ],
+    "rows": [
+      [
+        "-0.85936404966194596499"
+      ]
+    ]
+  }
+}

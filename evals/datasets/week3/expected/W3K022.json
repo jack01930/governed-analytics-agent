@@ -1,0 +1,13 @@
+{
+  "oracle_query_id": "5b94ef146923189d62679b3e132e383cb78887060312bb5d9cdfac704c3b20f8",
+  "result": {
+    "columns": [
+      "customer_acquisition_cost"
+    ],
+    "rows": [
+      [
+        "2628.2076190476190476"
+      ]
+    ]
+  }
+}
