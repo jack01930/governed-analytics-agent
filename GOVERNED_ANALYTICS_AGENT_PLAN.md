@@ -1566,14 +1566,14 @@ Week 2 live 导向（2026-09-04）：
 - 超过轮数和成本能安全停止；
 - API 和 SSE 可测试。
 
-实施同步（2026-09-05）：
+收尾同步（2026-09-07）：
 
-- LangGraph 有界主链路、结构化 Answer Contract、一次修复、四类工具、预算、Trace、FastAPI 与 SSE 已实现。
-- 独立 Week 3 协议冻结 30 个 known 与 10 个 heldout fixture case，并按 behavior、simple、attribution、repair、
-  budget、policy 及 first/final component 分开计分。
-- `governed-eval week3 --dataset tiny --mode fixture`、纯 fixture Make/CI 门禁与精确 report pointer 已接线；
-  fixture 结果只代表 harness/tools/DB/governance/scoring 验证。
-- live 路径仅实现双重授权与资源所有权边界，尚未运行、尚未获准，也不作为本次离线门禁的通过条件。
+- 第三周核心工程已完成：有界 LangGraph、typed plan、Answer Contract、有限修复、四类工具、预算、Trace、FastAPI 与 SSE。
+- 离线 Week3 fixture 40/40；最新完整 live 开发回归 34/36，评分异常为零，调用、usage 与成本证据保全。
+- known/heldout 为历史协议名称，现均属已见回归题；不同周成绩不可直接作为准确率提升曲线。
+- W3K001 漏问时间、W3H007 已有时间却误澄清，作为第四周路由稳定性事项登记，不改历史题目或评分结果。
+- 第三周收尾不新增 live；各候选实现完成后或求职前再建立新固定题集，统一比较模型或系统版本。
+- 最新离线门禁、API/SSE 实机验证、合并检查及已知边界见 `docs/reports/week-3-closeout-2026-09-07.md`。
 
 ## 第 4 周：可投递 MVP
 
